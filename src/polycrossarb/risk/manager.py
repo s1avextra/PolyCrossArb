@@ -1,9 +1,15 @@
-"""Risk management: position limits, exposure tracking, cooldowns."""
+"""Risk management: position limits, exposure tracking, cooldowns.
+
+State is persisted to disk (state.json) so the bot can crash and
+restart without losing track of open positions, P&L, or trade history.
+"""
 from __future__ import annotations
 
+import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from polycrossarb.config import settings
 from polycrossarb.solver.linear import SolverResult, TradeOrder
@@ -52,23 +58,30 @@ class RiskManager:
     This means profits compound and losses reduce exposure automatically.
     """
 
+    STATE_FILE = "state.json"
+
     def __init__(
         self,
         initial_bankroll: float = settings.bankroll_usd,
         exposure_ratio: float = 0.80,
         max_per_market: float = settings.max_position_per_market_usd,
         cooldown_seconds: float = settings.cooldown_seconds,
+        state_dir: str = "logs",
     ):
         self._initial_bankroll = initial_bankroll
         self._exposure_ratio = exposure_ratio
         self.max_per_market = max_per_market
         self.cooldown_seconds = cooldown_seconds
+        self._state_path = Path(state_dir) / self.STATE_FILE
 
-        self._positions: dict[str, Position] = {}  # key: market_id:outcome_idx
+        self._positions: dict[str, Position] = {}
         self._trade_history: list[TradeRecord] = []
-        self._last_trade_time: dict[str, float] = {}  # event_id -> timestamp
+        self._last_trade_time: dict[str, float] = {}
         self._total_pnl: float = 0.0
         self._total_fees_paid: float = 0.0
+
+        # Restore state from disk if available
+        self._load_state()
 
     @property
     def effective_bankroll(self) -> float:
@@ -191,9 +204,12 @@ class RiskManager:
         if event_id:
             self._last_trade_time[event_id] = now
 
+        self.save_state()
+
     def record_pnl(self, amount: float) -> None:
         """Record realised P&L — bankroll adjusts automatically."""
         self._total_pnl += amount
+        self.save_state()
 
     def record_fees(self, amount: float) -> None:
         """Track cumulative fees paid."""
@@ -211,6 +227,7 @@ class RiskManager:
             pnl = (pos.entry_price - exit_price) * pos.size
 
         self._total_pnl += pnl
+        self.save_state()
         return pnl
 
     def mark_to_market(self, current_prices: dict[str, float]) -> float:
@@ -244,3 +261,75 @@ class RiskManager:
             "total_pnl": round(self._total_pnl, 4),
             "total_fees": round(self._total_fees_paid, 4),
         }
+
+    # ── State persistence ─────────────────────────────────────────
+
+    def save_state(self) -> None:
+        """Persist current state to disk. Called after every trade."""
+        state = {
+            "version": 1,
+            "saved_at": time.time(),
+            "total_pnl": self._total_pnl,
+            "total_fees_paid": self._total_fees_paid,
+            "positions": {
+                key: {
+                    "market_condition_id": pos.market_condition_id,
+                    "outcome_idx": pos.outcome_idx,
+                    "side": pos.side,
+                    "size": pos.size,
+                    "entry_price": pos.entry_price,
+                    "entry_time": pos.entry_time,
+                    "event_id": pos.event_id,
+                }
+                for key, pos in self._positions.items()
+            },
+            "last_trade_time": self._last_trade_time,
+            "trade_count": len(self._trade_history),
+        }
+
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Atomic write: write to temp file then rename
+        tmp = self._state_path.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        tmp.rename(self._state_path)
+
+        log.debug("State saved: %d positions, pnl=$%.4f", len(self._positions), self._total_pnl)
+
+    def _load_state(self) -> None:
+        """Restore state from disk on startup."""
+        if not self._state_path.exists():
+            log.info("No saved state found — starting fresh")
+            return
+
+        try:
+            with open(self._state_path) as f:
+                state = json.load(f)
+
+            self._total_pnl = state.get("total_pnl", 0.0)
+            self._total_fees_paid = state.get("total_fees_paid", 0.0)
+            self._last_trade_time = state.get("last_trade_time", {})
+
+            for key, pos_data in state.get("positions", {}).items():
+                self._positions[key] = Position(
+                    market_condition_id=pos_data["market_condition_id"],
+                    outcome_idx=pos_data["outcome_idx"],
+                    side=pos_data["side"],
+                    size=pos_data["size"],
+                    entry_price=pos_data["entry_price"],
+                    entry_time=pos_data["entry_time"],
+                    event_id=pos_data.get("event_id", ""),
+                )
+
+            saved_at = state.get("saved_at", 0)
+            age = time.time() - saved_at if saved_at else 0
+            log.info(
+                "State restored: %d positions, pnl=$%.4f, fees=$%.4f (saved %.0fs ago)",
+                len(self._positions), self._total_pnl, self._total_fees_paid, age,
+            )
+        except Exception:
+            log.exception("Failed to restore state — starting fresh")
+            self._positions.clear()
+            self._total_pnl = 0.0
+            self._total_fees_paid = 0.0
