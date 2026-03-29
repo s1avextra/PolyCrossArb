@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     max_position_usd: float = 20.0
     scan_interval_seconds: float = 30.0
 
-    # Risk — conservative defaults for $100 bankroll
-    bankroll_usd: float = 100.0
+    # Risk — bankroll_usd=0 means auto-detect from wallet USDC.e balance
+    bankroll_usd: float = 0.0
     max_total_exposure_usd: float = 80.0
     max_position_per_market_usd: float = 20.0
     cooldown_seconds: float = 120.0
@@ -35,11 +35,18 @@ class Settings(BaseSettings):
     # Quarter Kelly: ~94% of growth rate, max drawdown ~12%.
     kelly_fraction: float = 0.25
 
-    @field_validator("bankroll_usd", "max_total_exposure_usd", "max_position_per_market_usd")
+    @field_validator("max_total_exposure_usd", "max_position_per_market_usd")
     @classmethod
     def must_be_positive(cls, v: float, info) -> float:
         if v <= 0:
             raise ValueError(f"{info.field_name} must be > 0, got {v}")
+        return v
+
+    @field_validator("bankroll_usd")
+    @classmethod
+    def bankroll_non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"bankroll_usd must be >= 0 (0 = auto-detect from wallet), got {v}")
         return v
 
     @field_validator("kelly_fraction")

@@ -314,15 +314,17 @@ class LiveExecutor:
         import asyncio
 
         try:
+            from py_clob_client.clob_types import OrderArgs
             from py_clob_client.order_builder.constants import BUY, SELL
 
             side = BUY if order.side == "buy" else SELL
-            resp = self._client.create_and_post_order({
-                "tokenID": token_id,
-                "price": order.price,
-                "size": order.size,
-                "side": side,
-            })
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=order.price,
+                size=order.size,
+                side=side,
+            )
+            resp = self._client.create_and_post_order(order_args)
 
             # Validate response — abort if order wasn't placed
             if not resp or isinstance(resp, dict) and resp.get("error"):

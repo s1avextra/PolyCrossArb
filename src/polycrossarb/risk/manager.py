@@ -62,15 +62,20 @@ class RiskManager:
 
     def __init__(
         self,
-        initial_bankroll: float = settings.bankroll_usd,
+        initial_bankroll: float | None = None,
         exposure_ratio: float = 0.80,
         max_per_market: float = settings.max_position_per_market_usd,
         cooldown_seconds: float = settings.cooldown_seconds,
         state_dir: str = "logs",
     ):
+        # Auto-detect bankroll from wallet if not provided
+        if initial_bankroll is None or initial_bankroll <= 0:
+            from polycrossarb.execution.wallet import detect_bankroll
+            initial_bankroll = detect_bankroll()
         self._initial_bankroll = initial_bankroll
         self._exposure_ratio = exposure_ratio
-        self.max_per_market = max_per_market
+        self._max_per_market_ratio = 0.20  # 20% of bankroll per event
+        self._max_per_market_override = max_per_market
         self.cooldown_seconds = cooldown_seconds
         self._state_path = Path(state_dir) / self.STATE_FILE
 
@@ -92,6 +97,14 @@ class RiskManager:
     def max_total_exposure(self) -> float:
         """Dynamic exposure limit based on current bankroll."""
         return self.effective_bankroll * self._exposure_ratio
+
+    @property
+    def max_per_market(self) -> float:
+        """Dynamic per-event cap: 20% of effective bankroll."""
+        return min(
+            self.effective_bankroll * self._max_per_market_ratio,
+            self._max_per_market_override,
+        )
 
     @property
     def total_exposure(self) -> float:

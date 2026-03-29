@@ -30,7 +30,7 @@ from polycrossarb.data.websocket import (
     PolymarketWebSocket,
     PriceUpdate,
 )
-from polycrossarb.execution.executor import ExecutionMode, PaperExecutor
+from polycrossarb.execution.executor import ExecutionMode, LiveExecutor, PaperExecutor
 from polycrossarb.execution.fees import prefetch_fee_rates
 from polycrossarb.graph.dependency import DependencyGraph
 from polycrossarb.graph.screener import EventGroup, find_event_partitions
@@ -55,7 +55,8 @@ class WebSocketPipeline:
         self._client = PolymarketClient()
         self._ws = PolymarketWebSocket()
         self._risk = RiskManager()
-        self._executor = PaperExecutor(self._risk)
+        self._paper_executor = PaperExecutor(self._risk)
+        self._live_executor = LiveExecutor(self._risk)
 
         # Market state
         self._markets: dict[str, Market] = {}  # condition_id -> Market
@@ -293,7 +294,7 @@ class WebSocketPipeline:
         # Solve
         result = solve_partition_arb(
             partition,
-            max_position_usd=min(settings.max_position_per_market_usd, available),
+            max_position_usd=min(self._risk.max_per_market, available),
         )
 
         if not result.is_optimal or result.guaranteed_profit < settings.min_profit_usd:
@@ -309,7 +310,10 @@ class WebSocketPipeline:
                          for o in result.orders
                          if o.market_condition_id in self._markets]
 
-        exec_result = self._executor.execute(result, trade_markets, partition.event_id)
+        if self.mode == ExecutionMode.PAPER:
+            exec_result = self._paper_executor.execute(result, trade_markets, partition.event_id)
+        else:
+            exec_result = await self._live_executor.execute(result, trade_markets, partition.event_id)
 
         if exec_result.all_filled:
             self._trade_count += 1

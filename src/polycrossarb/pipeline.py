@@ -143,7 +143,7 @@ class Pipeline:
 
             results = solve_all_partitions(
                 partitions=arb_partitions,
-                max_position_per_event=settings.max_position_per_market_usd,
+                max_position_per_event=self._risk.max_per_market,
                 max_total_exposure=self._risk.available_capital,
                 min_profit=settings.min_profit_usd,
             )

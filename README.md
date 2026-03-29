@@ -71,10 +71,9 @@ For live trading, see **[docs/SETUP_API_KEYS.md](docs/SETUP_API_KEYS.md)** or ru
 ### Configuration
 
 ```env
-# Capital (adjust to your bankroll)
-BANKROLL_USD=100.0
-MAX_TOTAL_EXPOSURE_USD=80.0       # 80% of bankroll
-MAX_POSITION_PER_MARKET_USD=20.0  # 20% per event
+# Capital — set to 0 to auto-detect from wallet USDC.e balance
+BANKROLL_USD=0
+MAX_POSITION_PER_MARKET_USD=20.0  # cap per event (also scales to 20% of bankroll)
 KELLY_FRACTION=0.25               # Quarter Kelly (safest compounding)
 
 # Detection thresholds
@@ -83,6 +82,11 @@ MIN_PROFIT_USD=0.10               # Skip trades under $0.10
 COOLDOWN_SECONDS=120
 SCAN_INTERVAL_SECONDS=30          # REST pipeline only
 ```
+
+When `BANKROLL_USD=0`, the bot reads your wallet's USDC.e balance at startup and uses that as the initial bankroll. All limits scale dynamically:
+- **Max exposure**: 80% of effective bankroll
+- **Max per event**: 20% of effective bankroll (capped by `MAX_POSITION_PER_MARKET_USD`)
+- **Effective bankroll**: initial balance + realized P&L (compounds automatically)
 
 ## Project structure
 
