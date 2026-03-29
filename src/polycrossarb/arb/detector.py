@@ -240,6 +240,18 @@ def detect_cross_market_arbs(
         if abs(deviation) < min_margin:
             continue
 
+        # Only trade overpriced if configured (avoids buying lottery tickets)
+        if settings.only_overpriced and deviation < 0:
+            continue
+
+        # Tick size check: margin must survive rounding.
+        # With $0.01 ticks and N legs, the tick cost is N × $0.01.
+        # The arb margin must be larger than this or it vanishes in rounding.
+        n_legs = len(yes_prices)
+        tick_cost = n_legs * 0.01
+        if abs(deviation) < tick_cost:
+            continue
+
         # CRITICAL: verify this is a COMPLETE outcome set, not a partial group.
         # An underpriced group (sum < 1.0) could mean:
         #   a) All outcomes present, slightly underpriced → real arb

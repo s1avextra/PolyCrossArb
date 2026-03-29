@@ -41,16 +41,8 @@ class TradeOrder:
 
     @property
     def effective_usdc_cost(self) -> float:
-        """Actual USDC deducted from wallet.
-
-        In neg_risk markets, buying NO at price P only costs (1-P) per share,
-        not P. The neg_risk system handles collateral netting internally.
-        """
-        if self.neg_risk and self.outcome_name == "No" and self.side == "buy":
-            return self.size * (1 - self.price)
-        if self.neg_risk and self.outcome_name == "Yes" and self.side == "sell":
-            return self.size * (1 - self.price)
-        return abs(self.expected_cost)
+        """Actual USDC cost. Simply price × size."""
+        return abs(self.price * self.size)
 
 
 @dataclass
@@ -178,15 +170,10 @@ def solve_partition_arb(
 
         prob += size * profit_per_set, "maximize_profit"
 
-        # Neg_risk collateral: selling YES costs (1-price) per share per outcome.
-        # The effective USDC cost = sum of (1-price) for all legs = n - exec_sum.
-        # But the binding constraint is the max single-leg cost.
-        if is_neg_risk:
-            effective_cost_per_set = sum(1 - p for p in exec_prices)
-            prob += size * effective_cost_per_set <= max_position_usd, "neg_risk_collateral"
-        else:
-            max_collateral = max(1 - p for p in exec_prices)
-            prob += size * max_collateral <= max_position_usd, "collateral_limit"
+        # Selling YES: we receive price per share from the buyer.
+        # Capital needed = what we must post if the outcome wins = (1-price) per share.
+        max_collateral = max(1 - p for p in exec_prices)
+        prob += size * max_collateral <= max_position_usd, "collateral_limit"
 
     else:
         # UNDERPRICED: buy YES on all → pay exec_sum per set, receive 1.0
