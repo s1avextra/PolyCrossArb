@@ -163,17 +163,25 @@ def solve_partition_arb(
     is_neg_risk = any(m.neg_risk for m in group.markets)
 
     if mid_sum > 1.0:
-        # OVERPRICED: sell YES on all → collect exec_sum per set, pay out 1.0
-        profit_per_set = exec_sum - 1.0
+        # OVERPRICED: BUY NO on all outcomes.
+        # For N outcomes: cost = sum(NO prices) = N - sum(YES prices)
+        # Payout: (N-1) × $1.00 (all NOs win except the one that happens)
+        # Profit: (N-1) - (N - sum(YES)) = sum(YES) - 1.0
+        #
+        # We need ASK prices on the NO side (what we pay to buy NO).
+        # NO ask price ≈ 1 - YES bid price.
+        no_ask_prices = [1 - p for p in exec_prices]  # exec_prices are YES bids
+        no_cost_per_set = sum(no_ask_prices)
+        no_payout_per_set = n - 1  # (N-1) NOs always win
+
+        profit_per_set = no_payout_per_set - no_cost_per_set  # = sum(YES) - 1.0
         if profit_per_set <= 0:
             return SolverResult(status="spread_kills_arb", guaranteed_profit=0.0)
 
         prob += size * profit_per_set, "maximize_profit"
 
-        # Selling YES: we receive price per share from the buyer.
-        # Capital needed = what we must post if the outcome wins = (1-price) per share.
-        max_collateral = max(1 - p for p in exec_prices)
-        prob += size * max_collateral <= max_position_usd, "collateral_limit"
+        # Capital needed: buy NO on all outcomes = sum(NO ask prices) per set
+        prob += size * no_cost_per_set <= max_position_usd, "capital_limit"
 
     else:
         # UNDERPRICED: buy YES on all → pay exec_sum per set, receive 1.0
@@ -182,10 +190,6 @@ def solve_partition_arb(
             return SolverResult(status="spread_kills_arb", guaranteed_profit=0.0)
 
         prob += size * profit_per_set, "maximize_profit"
-
-        # Neg_risk effective cost: buying YES at price P costs P per share.
-        # But if the CLOB token is the NO side, effective cost = (1-price).
-        # For underpriced arbs, we buy YES tokens at low prices, so cost = exec_sum.
         prob += size * exec_sum <= max_position_usd, "capital_limit"
 
     # Liquidity constraints: cap at 50% of visible bid depth per leg
@@ -221,28 +225,33 @@ def solve_partition_arb(
 
     for i, market in enumerate(group.markets):
         ep = exec_prices[i]
-        outcome_name = market.outcomes[0].name if market.outcomes else "Yes"
 
         if mid_sum > 1.0:
-            order_cost = -ep * opt_size
+            # BUY NO tokens: NO price = 1 - YES price
+            no_price = 1 - ep
+            order_cost = no_price * opt_size
+            # outcome_idx=1 = NO token
+            no_name = market.outcomes[1].name if len(market.outcomes) > 1 else "No"
             order = TradeOrder(
                 market_condition_id=market.condition_id,
-                outcome_idx=0, side="sell", size=opt_size, price=ep,
+                outcome_idx=1, side="buy", size=opt_size, price=no_price,
                 expected_cost=order_cost, neg_risk=is_neg_risk,
-                outcome_name=outcome_name,
+                outcome_name=no_name,
             )
             orders.append(order)
-            total_rev += order.effective_usdc_cost
+            total_cost += order_cost
         else:
+            # BUY YES tokens
             order_cost = ep * opt_size
+            yes_name = market.outcomes[0].name if market.outcomes else "Yes"
             order = TradeOrder(
                 market_condition_id=market.condition_id,
                 outcome_idx=0, side="buy", size=opt_size, price=ep,
                 expected_cost=order_cost, neg_risk=is_neg_risk,
-                outcome_name=outcome_name,
+                outcome_name=yes_name,
             )
             orders.append(order)
-            total_cost += order.effective_usdc_cost
+            total_cost += order_cost
 
     # ── Calculate all costs ───────────────────────────────────────
     # Trading fees per leg — uses live API when token_id available

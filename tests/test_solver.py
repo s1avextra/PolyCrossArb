@@ -50,7 +50,9 @@ class TestSolvePartition:
         assert result.is_optimal
         assert result.guaranteed_profit > 0
         assert len(result.orders) == 3
-        assert all(o.side == "sell" for o in result.orders)
+        # Overpriced = buy NO on all outcomes
+        assert all(o.side == "buy" for o in result.orders)
+        assert all(o.outcome_idx == 1 for o in result.orders)  # NO tokens
 
     def test_underpriced_partition_profitable(self):
         # sum = 0.7, profit = 0.3 per set
