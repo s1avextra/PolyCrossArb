@@ -191,7 +191,7 @@ class LiveExecutor:
 
         try:
             from eth_account import Account
-            from py_clob_client.client import ClobClient
+            from py_clob_client.client import ClobClient  # noqa: F811
 
             funder = Account.from_key(settings.private_key).address
             self._client = ClobClient(
@@ -316,17 +316,32 @@ class LiveExecutor:
         import asyncio
 
         try:
-            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
             from py_clob_client.order_builder.constants import BUY, SELL
 
             side = BUY if order.side == "buy" else SELL
+
+            # Detect neg_risk and tick_size from order book
+            neg_risk = False
+            tick_size = "0.01"
+            try:
+                book = self._client.get_order_book(token_id)
+                neg_risk = bool(book.neg_risk)
+                tick_size = str(book.tick_size) if book.tick_size else "0.01"
+            except Exception:
+                pass
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=order.price,
                 size=order.size,
                 side=side,
             )
-            resp = self._client.create_and_post_order(order_args)
+            options = PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+            )
+            resp = self._client.create_and_post_order(order_args, options)
 
             # Validate response — abort if order wasn't placed
             if not resp or isinstance(resp, dict) and resp.get("error"):

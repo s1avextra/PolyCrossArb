@@ -288,6 +288,19 @@ class WebSocketPipeline:
         if margin < settings.min_arb_margin:
             return
 
+        # Skip events that resolve too far out — capital gets locked
+        from datetime import datetime, timezone
+        max_days = settings.max_resolution_days
+        for m in partition.markets:
+            if m.end_date:
+                try:
+                    end = datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
+                    days = (end - datetime.now(timezone.utc)).total_seconds() / 86400
+                    if days > max_days:
+                        return  # too far out, skip
+                except (ValueError, TypeError):
+                    pass
+
         # Check available capital before solving
         available = self._risk.available_capital
         if available < 1.0:

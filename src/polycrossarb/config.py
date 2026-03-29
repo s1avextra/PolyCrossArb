@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     max_position_per_market_usd: float = 20.0
     cooldown_seconds: float = 120.0
 
+    # Max days until resolution — skip events that lock capital too long
+    max_resolution_days: float = 3.0
+
     # Kelly fraction: 0.25 = quarter Kelly (academic optimal for prediction markets)
     # Full Kelly maximises growth but has 50% chance of 50% drawdown.
     # Quarter Kelly: ~94% of growth rate, max drawdown ~12%.
