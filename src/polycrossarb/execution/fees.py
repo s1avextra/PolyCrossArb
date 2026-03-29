@@ -266,11 +266,11 @@ def calculate_taker_fee(
     if token_id and token_id in _fee_cache:
         cached_fee, cached_at = _fee_cache[token_id]
         if time.time() - cached_at < _CACHE_TTL:
-            if cached_fee == 0:
+            if cached_fee <= 0:
                 return 0.0
             p = max(0.001, min(0.999, price))
             fee = shares * p * cached_fee * (p * (1 - p))
-            fee = round(fee, 4)
+            fee = max(0.0, round(fee, 4))  # never negative
             if 0 < fee < 0.0001:
                 fee = 0.0001
             return fee

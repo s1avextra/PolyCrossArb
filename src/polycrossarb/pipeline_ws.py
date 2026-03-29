@@ -72,6 +72,9 @@ class WebSocketPipeline:
         self._last_eval: dict[str, float] = {}
         self._EVAL_DEBOUNCE = 1.0
 
+        # Lock per event to prevent duplicate concurrent evaluations
+        self._eval_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
         # Periodic refresh interval for REST data
         self._REFRESH_INTERVAL = 300  # 5 minutes
         self._last_refresh = 0.0
@@ -201,6 +204,12 @@ class WebSocketPipeline:
                         o.price = (update.best_bid + update.best_ask) / 2
                     break
 
+        # Debounce: skip if we just evaluated this event
+        now = time.time()
+        if event_id in self._last_eval and now - self._last_eval[event_id] < self._EVAL_DEBOUNCE:
+            return
+        self._last_eval[event_id] = now
+
         # Check early exits — if arb margin has shrunk, close positions to free capital
         current_prices = {
             f"{m.condition_id}:0": m.outcomes[0].price
@@ -214,18 +223,18 @@ class WebSocketPipeline:
                 log.info("ws_pipeline.early_exit", position=key[:20], pnl=f"${pnl:.4f}",
                          bankroll=f"${self._risk.effective_bankroll:.2f}")
 
-        # Debounce: skip if we just evaluated this event
-        now = time.time()
-        if event_id in self._last_eval and now - self._last_eval[event_id] < self._EVAL_DEBOUNCE:
-            return
-        self._last_eval[event_id] = now
-
-        # Evaluate arb for this partition
+        # Evaluate arb — use lock to prevent duplicate concurrent evaluations
         partition = self._partitions.get(event_id)
         if partition:
-            asyncio.get_event_loop().call_soon(
-                lambda: asyncio.ensure_future(self._evaluate_arb(partition))
-            )
+            asyncio.ensure_future(self._locked_evaluate(event_id, partition))
+
+    async def _locked_evaluate(self, event_id: str, partition: EventGroup) -> None:
+        """Serialize arb evaluation per event to prevent duplicate trades."""
+        lock = self._eval_locks[event_id]
+        if lock.locked():
+            return  # another evaluation is already running for this event
+        async with lock:
+            await self._evaluate_arb(partition)
 
     def _on_book_update(self, asset_id: str, book: OrderBook) -> None:
         """Handle order book snapshot — update cached market data."""
@@ -250,7 +259,8 @@ class WebSocketPipeline:
         )
 
         # Close any positions in this market
-        for key in list(self._risk._positions.keys()):
+        for pos in list(self._risk.positions):
+            key = f"{pos.market_condition_id}:{pos.outcome_idx}"
             if key.startswith(resolution.market_condition_id):
                 if resolution.winning_asset_id and key.endswith(":0"):
                     # YES position resolved
@@ -275,13 +285,15 @@ class WebSocketPipeline:
         if margin < settings.min_arb_margin:
             return
 
+        # Check available capital before solving
+        available = self._risk.available_capital
+        if available < 1.0:
+            return
+
         # Solve
         result = solve_partition_arb(
             partition,
-            max_position_usd=min(
-                settings.max_position_per_market_usd,
-                self._risk.available_capital,
-            ),
+            max_position_usd=min(settings.max_position_per_market_usd, available),
         )
 
         if not result.is_optimal or result.guaranteed_profit < settings.min_profit_usd:

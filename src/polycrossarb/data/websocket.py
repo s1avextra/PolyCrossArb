@@ -243,14 +243,23 @@ class PolymarketWebSocket:
         if not asset_id:
             return
 
-        bids = [
-            OrderBookLevel(price=float(b["price"]), size=float(b["size"]))
-            for b in msg.get("bids", [])
-        ]
-        asks = [
-            OrderBookLevel(price=float(a["price"]), size=float(a["size"]))
-            for a in msg.get("asks", [])
-        ]
+        bids: list[OrderBookLevel] = []
+        for b in msg.get("bids", []):
+            try:
+                p, s = float(b.get("price", 0)), float(b.get("size", 0))
+                if 0 < p <= 1 and s > 0:
+                    bids.append(OrderBookLevel(price=p, size=s))
+            except (ValueError, TypeError, AttributeError):
+                continue
+
+        asks: list[OrderBookLevel] = []
+        for a in msg.get("asks", []):
+            try:
+                p, s = float(a.get("price", 0)), float(a.get("size", 0))
+                if 0 < p <= 1 and s > 0:
+                    asks.append(OrderBookLevel(price=p, size=s))
+            except (ValueError, TypeError, AttributeError):
+                continue
         bids.sort(key=lambda x: x.price, reverse=True)
         asks.sort(key=lambda x: x.price)
 
@@ -270,9 +279,14 @@ class PolymarketWebSocket:
 
         for change in changes:
             asset_id = change.get("asset_id", "")
-            price = float(change.get("price", 0))
+            try:
+                price = float(change.get("price", 0))
+                size = float(change.get("size", 0))
+            except (ValueError, TypeError):
+                continue
+            if price < 0 or price > 1 or size < 0:
+                continue
             side = change.get("side", "")
-            size = float(change.get("size", 0))
 
             # Update cached book incrementally
             if asset_id in self._books:

@@ -9,5 +9,6 @@ build/
 .pytest_cache/
 logs/
 snapshots/
+snapshots*/
 *.pdf
 state.json

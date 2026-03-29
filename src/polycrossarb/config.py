@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -33,6 +34,27 @@ class Settings(BaseSettings):
     # Full Kelly maximises growth but has 50% chance of 50% drawdown.
     # Quarter Kelly: ~94% of growth rate, max drawdown ~12%.
     kelly_fraction: float = 0.25
+
+    @field_validator("bankroll_usd", "max_total_exposure_usd", "max_position_per_market_usd")
+    @classmethod
+    def must_be_positive(cls, v: float, info) -> float:
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be > 0, got {v}")
+        return v
+
+    @field_validator("kelly_fraction")
+    @classmethod
+    def kelly_range(cls, v: float) -> float:
+        if not 0 < v <= 1.0:
+            raise ValueError(f"kelly_fraction must be in (0, 1], got {v}")
+        return v
+
+    @field_validator("min_arb_margin", "min_profit_usd", "cooldown_seconds", "scan_interval_seconds")
+    @classmethod
+    def must_be_non_negative(cls, v: float, info) -> float:
+        if v < 0:
+            raise ValueError(f"{info.field_name} must be >= 0, got {v}")
+        return v
 
 
 settings = Settings()

@@ -157,10 +157,29 @@ Trades are scored by **profit per dollar per day**, not just total profit. Faste
 
 Position sizing uses quarter-Kelly. Full Kelly maximises growth but has 50% chance of 50% drawdown. At 0.25x Kelly, growth rate is ~94% of full Kelly but max drawdown drops to ~12%.
 
+### Early exit
+
+When an arb corrects (prices converge back to sum=1.0), all positions in that event are closed automatically to free capital for new opportunities. Without this, capital can be locked for months waiting for event resolution.
+
+### Portfolio-aware allocation
+
+If a new arb shares market outcomes with existing positions, its allocation is halved to prevent correlated risk concentration.
+
+### Crash recovery
+
+All state (positions, P&L, fees, cooldowns) is persisted to `logs/state.json` after every trade. On restart, state is restored automatically — no trades lost.
+
+### Live execution safety
+
+- Leg-by-leg with abort: if any leg fails to fill (95%+ required), all remaining orders are cancelled
+- Order ID validation: rejects trades if exchange doesn't return a valid order ID
+- Fill polling with timeout: 30s per leg, cancels on timeout
+- Input validation: config values, WebSocket data, API responses all validated
+
 ## Testing
 
 ```bash
-.venv/bin/pytest tests/ -v   # 45 tests
+.venv/bin/pytest tests/ -v   # 45 tests, ~2s
 ```
 
 Covers: arb detection, polytope constraints, KL projection, LP solver, Kelly sizing, execution probability.
