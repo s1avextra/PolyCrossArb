@@ -51,11 +51,18 @@ class ExecutionResult:
 
 
 class PaperExecutor:
-    """Simulates trade execution against order book snapshots."""
+    """Realistic paper trading — mirrors ALL live execution constraints.
+
+    Paper mode must reject the same trades that live would reject.
+    Otherwise paper P&L is fiction and can't predict live performance.
+    """
+
+    POLYMARKET_MIN_ORDER_USD = 1.0
 
     def __init__(self, risk_manager: RiskManager):
         self.risk_manager = risk_manager
         self._execution_log: list[ExecutionResult] = []
+        self._simulated_balance: float | None = None  # tracks simulated USDC balance
 
     @property
     def execution_log(self) -> list[ExecutionResult]:
@@ -67,10 +74,12 @@ class PaperExecutor:
         markets: list[Market],
         event_id: str = "",
     ) -> ExecutionResult:
-        """Paper-execute all orders from a solver result.
+        """Paper-execute with same constraints as live.
 
-        Simulates fills using order book data if available,
-        otherwise assumes fill at the order price.
+        ALL-OR-NOTHING: same as LiveExecutor.
+          1. Pre-flight: balance, $1 min, bid liquidity, order book depth
+          2. Simulate all fills against order books
+          3. If ANY leg can't fill → reject entire trade
         """
         # Check risk controls
         allowed, reason = self.risk_manager.check_trade(solver_result, event_id)
@@ -79,15 +88,46 @@ class PaperExecutor:
             return ExecutionResult(all_filled=False)
 
         market_lookup = {m.condition_id: m for m in markets}
+        now = time.time()
+
+        # Initialize simulated balance from wallet on first use
+        if self._simulated_balance is None:
+            self._simulated_balance = self.risk_manager.effective_bankroll
+
+        # ── PRE-FLIGHT (same checks as live) ──────────────────────
+
+        # 1. Total cost must fit in simulated balance
+        total_order_cost = sum(o.price * o.size for o in solver_result.orders)
+        if total_order_cost > self._simulated_balance * 0.95:
+            log.info("Paper pre-flight: cost $%.2f > balance $%.2f — rejected",
+                     total_order_cost, self._simulated_balance)
+            return ExecutionResult(all_filled=False)
+
+        # 2. Check each leg
+        for order in solver_result.orders:
+            # Minimum order size
+            order_value = order.price * order.size
+            if order_value < self.POLYMARKET_MIN_ORDER_USD:
+                log.info("Paper pre-flight: leg $%.2f < $1 min — rejected", order_value)
+                return ExecutionResult(all_filled=False)
+
+            # Must have order book with bids (exitable)
+            market = market_lookup.get(order.market_condition_id)
+            if market and order.outcome_idx < len(market.outcomes):
+                book = market.outcomes[order.outcome_idx].order_book
+                if book is not None and not book.bids:
+                    log.info("Paper pre-flight: no bids for %s — rejected", order.var_key[:20])
+                    return ExecutionResult(all_filled=False)
+
+        # ── SIMULATE ALL FILLS ────────────────────────────────────
+
         fills: list[FillResult] = []
         total_cost = 0.0
         total_slippage = 0.0
         all_filled = True
-        now = time.time()
 
         for order in solver_result.orders:
             market = market_lookup.get(order.market_condition_id)
-
             fill = self._simulate_fill(order, market, now)
             fills.append(fill)
 
@@ -97,11 +137,17 @@ class PaperExecutor:
             else:
                 all_filled = False
 
-        if all_filled:
-            # Record trades in risk manager
-            self.risk_manager.record_trade(
-                solver_result.orders, event_id=event_id, paper=True,
-            )
+        # ALL-OR-NOTHING: if any leg fails, reject entire trade
+        if not all_filled:
+            log.info("Paper: %d/%d legs failed — entire trade rejected",
+                     sum(1 for f in fills if not f.success), len(fills))
+            return ExecutionResult(all_filled=False)
+
+        # Record trade and update simulated balance
+        self.risk_manager.record_trade(
+            solver_result.orders, event_id=event_id, paper=True,
+        )
+        self._simulated_balance -= total_order_cost
 
         actual_profit = solver_result.guaranteed_profit - total_slippage
 
@@ -109,17 +155,16 @@ class PaperExecutor:
             fills=fills,
             total_cost=total_cost,
             total_slippage=total_slippage,
-            all_filled=all_filled,
+            all_filled=True,
             guaranteed_profit=solver_result.guaranteed_profit,
             actual_profit_estimate=actual_profit,
         )
         self._execution_log.append(result)
 
         log.info(
-            "Paper execution: %d/%d filled, gross $%.4f, fees $%.4f, slippage $%.4f, net $%.4f",
-            result.n_filled, len(fills),
-            solver_result.gross_profit, solver_result.total_fees,
-            total_slippage, actual_profit,
+            "Paper ALL %d legs filled: gross $%.4f, fees $%.4f, slippage $%.4f, net $%.4f, balance $%.2f",
+            len(fills), solver_result.gross_profit, solver_result.total_fees,
+            total_slippage, actual_profit, self._simulated_balance,
         )
         return result
 
@@ -129,13 +174,25 @@ class PaperExecutor:
         market: Market | None,
         timestamp: float,
     ) -> FillResult:
-        """Simulate a single order fill."""
-        # Try to use order book for realistic fill
+        """Simulate a single order fill — FAIL if no liquidity."""
         if market and order.outcome_idx < len(market.outcomes):
             outcome = market.outcomes[order.outcome_idx]
             book = outcome.order_book
             if book:
                 side = "bid" if order.side == "sell" else "ask"
+
+                # Check if order book has enough depth
+                levels = book.asks if side == "ask" else book.bids
+                total_depth = sum(float(lvl.size) for lvl in levels) if levels else 0
+
+                if total_depth < order.size * 0.5:
+                    # Not enough depth — would fail in live
+                    return FillResult(
+                        order=order, filled_size=0, fill_price=order.price,
+                        fill_cost=0, slippage=0, timestamp=timestamp,
+                        success=False, error=f"Insufficient depth: {total_depth:.0f} < {order.size:.0f}",
+                    )
+
                 vwap = book.vwap(side, order.size)
                 if vwap is not None:
                     slippage = abs(vwap - order.price)
@@ -148,16 +205,19 @@ class PaperExecutor:
                         timestamp=timestamp,
                         success=True,
                     )
+                else:
+                    # VWAP failed = not enough liquidity
+                    return FillResult(
+                        order=order, filled_size=0, fill_price=order.price,
+                        fill_cost=0, slippage=0, timestamp=timestamp,
+                        success=False, error="VWAP failed — insufficient liquidity",
+                    )
 
-        # Fall back to order price (optimistic)
+        # No order book = can't verify fill — REJECT (not assume success)
         return FillResult(
-            order=order,
-            filled_size=order.size,
-            fill_price=order.price,
-            fill_cost=order.expected_cost,
-            slippage=0.0,
-            timestamp=timestamp,
-            success=True,
+            order=order, filled_size=0, fill_price=order.price,
+            fill_cost=0, slippage=0, timestamp=timestamp,
+            success=False, error="No order book data — can't verify fill",
         )
 
 
