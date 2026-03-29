@@ -75,6 +75,8 @@ class WebSocketPipeline:
 
         # Lock per event to prevent duplicate concurrent evaluations
         self._eval_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Global execution lock — only ONE live trade in-flight at a time
+        self._execution_lock = asyncio.Lock()
 
         # Periodic refresh interval for REST data
         self._REFRESH_INTERVAL = 300  # 5 minutes
@@ -305,15 +307,25 @@ class WebSocketPipeline:
         if not allowed:
             return
 
-        # Execute
+        # Verify all token IDs are present before attempting live execution
         trade_markets = [self._markets[o.market_condition_id]
                          for o in result.orders
                          if o.market_condition_id in self._markets]
 
+        if len(trade_markets) != len(result.orders):
+            log.warning("Missing markets for some legs — skipping")
+            return
+
         if self.mode == ExecutionMode.PAPER:
             exec_result = self._paper_executor.execute(result, trade_markets, partition.event_id)
         else:
-            exec_result = await self._live_executor.execute(result, trade_markets, partition.event_id)
+            # Live mode: global lock ensures only ONE trade executes at a time
+            # This prevents multiple arbs from racing for the same USDC balance
+            if self._execution_lock.locked():
+                return  # another trade is in-flight
+            async with self._execution_lock:
+                self._risk._last_trade_time[partition.event_id] = time.time()
+                exec_result = await self._live_executor.execute(result, trade_markets, partition.event_id)
 
         if exec_result.all_filled:
             self._trade_count += 1

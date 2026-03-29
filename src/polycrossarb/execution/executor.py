@@ -190,14 +190,16 @@ class LiveExecutor:
             return False
 
         try:
+            from eth_account import Account
             from py_clob_client.client import ClobClient
 
+            funder = Account.from_key(settings.private_key).address
             self._client = ClobClient(
                 host=settings.poly_base_url,
                 key=settings.private_key,
                 chain_id=137,
                 signature_type=0,  # EOA wallet
-                funder=None,  # derived from private key
+                funder=funder,
             )
             # Set API credentials
             from py_clob_client.clob_types import ApiCreds
