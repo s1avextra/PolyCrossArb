@@ -32,10 +32,25 @@ class TradeOrder:
     size: float  # number of shares/contracts
     price: float  # limit price
     expected_cost: float  # price * size (negative if selling)
+    neg_risk: bool = False  # is this a neg_risk market?
+    outcome_name: str = ""  # "Yes" or "No"
 
     @property
     def var_key(self) -> str:
         return f"{self.market_condition_id}:{self.outcome_idx}"
+
+    @property
+    def effective_usdc_cost(self) -> float:
+        """Actual USDC deducted from wallet.
+
+        In neg_risk markets, buying NO at price P only costs (1-P) per share,
+        not P. The neg_risk system handles collateral netting internally.
+        """
+        if self.neg_risk and self.outcome_name == "No" and self.side == "buy":
+            return self.size * (1 - self.price)
+        if self.neg_risk and self.outcome_name == "Yes" and self.side == "sell":
+            return self.size * (1 - self.price)
+        return abs(self.expected_cost)
 
 
 @dataclass
@@ -152,31 +167,38 @@ def solve_partition_arb(
     # Enforce minimum size so every leg meets the $1 order minimum
     size = pulp.LpVariable("set_size", lowBound=min_size_for_cheapest)
 
+    # Determine if this is a neg_risk event
+    is_neg_risk = any(m.neg_risk for m in group.markets)
+
     if mid_sum > 1.0:
         # OVERPRICED: sell YES on all → collect exec_sum per set, pay out 1.0
-        # Use executable bid prices (what we actually receive)
         profit_per_set = exec_sum - 1.0
         if profit_per_set <= 0:
             return SolverResult(status="spread_kills_arb", guaranteed_profit=0.0)
 
         prob += size * profit_per_set, "maximize_profit"
 
-        # Neg_risk collateral: selling YES requires (1 - price) per share per outcome.
-        # The binding constraint is the outcome with the HIGHEST collateral requirement.
-        # Total collateral needed = size * max(1 - price_i for all i)
-        max_collateral_per_share = max(1 - p for p in exec_prices)
-        prob += size * max_collateral_per_share <= max_position_usd, "collateral_limit"
+        # Neg_risk collateral: selling YES costs (1-price) per share per outcome.
+        # The effective USDC cost = sum of (1-price) for all legs = n - exec_sum.
+        # But the binding constraint is the max single-leg cost.
+        if is_neg_risk:
+            effective_cost_per_set = sum(1 - p for p in exec_prices)
+            prob += size * effective_cost_per_set <= max_position_usd, "neg_risk_collateral"
+        else:
+            max_collateral = max(1 - p for p in exec_prices)
+            prob += size * max_collateral <= max_position_usd, "collateral_limit"
 
     else:
         # UNDERPRICED: buy YES on all → pay exec_sum per set, receive 1.0
-        # Use executable ask prices (what we actually pay)
         profit_per_set = 1.0 - exec_sum
         if profit_per_set <= 0:
             return SolverResult(status="spread_kills_arb", guaranteed_profit=0.0)
 
         prob += size * profit_per_set, "maximize_profit"
 
-        # Buying costs exec_sum per set
+        # Neg_risk effective cost: buying YES at price P costs P per share.
+        # But if the CLOB token is the NO side, effective cost = (1-price).
+        # For underpriced arbs, we buy YES tokens at low prices, so cost = exec_sum.
         prob += size * exec_sum <= max_position_usd, "capital_limit"
 
     # Liquidity constraints: cap at 50% of visible bid depth per leg
@@ -212,28 +234,28 @@ def solve_partition_arb(
 
     for i, market in enumerate(group.markets):
         ep = exec_prices[i]
+        outcome_name = market.outcomes[0].name if market.outcomes else "Yes"
+
         if mid_sum > 1.0:
             order_cost = -ep * opt_size
-            orders.append(TradeOrder(
+            order = TradeOrder(
                 market_condition_id=market.condition_id,
-                outcome_idx=0,
-                side="sell",
-                size=opt_size,
-                price=ep,
-                expected_cost=order_cost,
-            ))
-            total_rev += ep * opt_size
+                outcome_idx=0, side="sell", size=opt_size, price=ep,
+                expected_cost=order_cost, neg_risk=is_neg_risk,
+                outcome_name=outcome_name,
+            )
+            orders.append(order)
+            total_rev += order.effective_usdc_cost
         else:
             order_cost = ep * opt_size
-            orders.append(TradeOrder(
+            order = TradeOrder(
                 market_condition_id=market.condition_id,
-                outcome_idx=0,
-                side="buy",
-                size=opt_size,
-                price=ep,
-                expected_cost=order_cost,
-            ))
-            total_cost += order_cost
+                outcome_idx=0, side="buy", size=opt_size, price=ep,
+                expected_cost=order_cost, neg_risk=is_neg_risk,
+                outcome_name=outcome_name,
+            )
+            orders.append(order)
+            total_cost += order.effective_usdc_cost
 
     # ── Calculate all costs ───────────────────────────────────────
     # Trading fees per leg — uses live API when token_id available

@@ -96,8 +96,8 @@ class PaperExecutor:
 
         # ── PRE-FLIGHT (same checks as live) ──────────────────────
 
-        # 1. Total cost must fit in simulated balance
-        total_order_cost = sum(o.price * o.size for o in solver_result.orders)
+        # 1. Total EFFECTIVE cost must fit in simulated balance
+        total_order_cost = sum(o.effective_usdc_cost for o in solver_result.orders)
         if total_order_cost > self._simulated_balance * 0.95:
             log.info("Paper pre-flight: cost $%.2f > balance $%.2f — rejected",
                      total_order_cost, self._simulated_balance)
@@ -106,7 +106,7 @@ class PaperExecutor:
         # 2. Check each leg
         for order in solver_result.orders:
             # Minimum order size
-            order_value = order.price * order.size
+            order_value = order.effective_usdc_cost
             if order_value < self.POLYMARKET_MIN_ORDER_USD:
                 log.info("Paper pre-flight: leg $%.2f < $1 min — rejected", order_value)
                 return ExecutionResult(all_filled=False)
@@ -331,9 +331,9 @@ class LiveExecutor:
             log.warning("Pre-flight: can't check balance — aborting")
             return ExecutionResult(all_filled=False)
 
-        total_order_cost = sum(o.price * o.size for o in solver_result.orders)
+        total_order_cost = sum(o.effective_usdc_cost for o in solver_result.orders)
         if total_order_cost > usdc_balance * 0.95:  # 5% safety margin
-            log.warning("Pre-flight: total cost $%.2f > balance $%.2f — aborting",
+            log.warning("Pre-flight: total effective cost $%.2f > balance $%.2f — aborting",
                         total_order_cost, usdc_balance)
             return ExecutionResult(all_filled=False)
 
