@@ -201,6 +201,19 @@ class WebSocketPipeline:
                         o.price = (update.best_bid + update.best_ask) / 2
                     break
 
+        # Check early exits — if arb margin has shrunk, close positions to free capital
+        current_prices = {
+            f"{m.condition_id}:0": m.outcomes[0].price
+            for m in self._markets.values()
+            if m.outcomes and m.outcomes[0].price > 0
+        }
+        exits = self._risk.check_early_exits(current_prices)
+        for key, exit_price in exits:
+            pnl = self._risk.close_position(key, exit_price)
+            if abs(pnl) > 0.001:
+                log.info("ws_pipeline.early_exit", position=key[:20], pnl=f"${pnl:.4f}",
+                         bankroll=f"${self._risk.effective_bankroll:.2f}")
+
         # Debounce: skip if we just evaluated this event
         now = time.time()
         if event_id in self._last_eval and now - self._last_eval[event_id] < self._EVAL_DEBOUNCE:

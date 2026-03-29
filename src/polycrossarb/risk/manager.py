@@ -230,6 +230,59 @@ class RiskManager:
         self.save_state()
         return pnl
 
+    def check_early_exits(
+        self,
+        current_prices: dict[str, float],
+        exit_threshold: float = 0.005,
+    ) -> list[tuple[str, float]]:
+        """Check positions that should be closed early to free capital.
+
+        A position should exit early when the arb margin it was based on
+        has shrunk below exit_threshold — holding it locks capital for a
+        small/no reward. Better to free the capital for new arbs.
+
+        Groups positions by event_id and checks if the partition's YES
+        price sum has corrected back toward 1.0.
+
+        Args:
+            current_prices: {condition_id:outcome_idx -> current_price}
+            exit_threshold: close if remaining margin < this (default 0.5%)
+
+        Returns:
+            List of (position_key, exit_price) to close.
+        """
+        # Group positions by event
+        by_event: dict[str, list[tuple[str, Position]]] = {}
+        for key, pos in self._positions.items():
+            eid = pos.event_id or key
+            by_event.setdefault(eid, []).append((key, pos))
+
+        exits: list[tuple[str, float]] = []
+
+        for event_id, positions in by_event.items():
+            # Calculate current YES price sum for this event's positions
+            price_sum = 0.0
+            all_have_prices = True
+            for key, pos in positions:
+                current = current_prices.get(key)
+                if current is None:
+                    all_have_prices = False
+                    break
+                price_sum += current
+
+            if not all_have_prices or len(positions) < 2:
+                continue
+
+            remaining_margin = abs(price_sum - 1.0)
+
+            if remaining_margin < exit_threshold:
+                # Arb has corrected — close all positions in this event
+                for key, pos in positions:
+                    current = current_prices.get(key, pos.entry_price)
+                    exits.append((key, current))
+
+        return exits
+
     def mark_to_market(self, current_prices: dict[str, float]) -> float:
         """Compute unrealized P&L based on current market prices.
 

@@ -297,25 +297,53 @@ def solve_all_partitions(
         reverse=True,
     )
 
-    # Greedy capital allocation
+    # Portfolio-aware greedy allocation:
+    # Track which market condition_ids we already have exposure to.
+    # If a new arb shares outcomes with an existing position, halve
+    # the allocation to avoid correlated risk concentration.
     results: list[SolverResult] = []
     remaining_capital = max_total_exposure
+    exposed_markets: set[str] = set()  # condition_ids already in portfolio
 
     for group, result in candidates:
+        # Check for overlap with existing positions
+        group_cids = {m.condition_id for m in group.markets}
+        overlap = group_cids & exposed_markets
+        correlation_factor = 0.5 if overlap else 1.0
+
+        effective_max = min(
+            max_position_per_event * correlation_factor,
+            remaining_capital,
+        )
+
+        if effective_max < 1.0:
+            continue
+
+        # Re-solve with adjusted capital if correlation found
+        if correlation_factor < 1.0 or result.total_cost > effective_max:
+            result = solve_partition_arb(
+                group,
+                max_position_usd=effective_max,
+                liquidity_caps=liquidity_caps,
+            )
+            if not result.is_optimal or result.guaranteed_profit < min_profit:
+                continue
+
         cost = max(result.total_cost, result.total_revenue)
         if cost <= remaining_capital:
             results.append(result)
             remaining_capital -= cost
-        else:
-            # Re-solve with reduced capital
+            exposed_markets.update(group_cids)
+        elif remaining_capital > 1.0:
             scaled = solve_partition_arb(
                 group,
-                max_position_usd=min(remaining_capital, max_position_per_event),
+                max_position_usd=min(remaining_capital, effective_max),
                 liquidity_caps=liquidity_caps,
             )
             if scaled.is_optimal and scaled.guaranteed_profit >= min_profit:
                 results.append(scaled)
                 remaining_capital -= max(scaled.total_cost, scaled.total_revenue)
+                exposed_markets.update(group_cids)
 
         if remaining_capital <= 0:
             break

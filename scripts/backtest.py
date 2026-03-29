@@ -115,11 +115,29 @@ def replay_snapshots(snapshot_dir: str, min_margin: float, max_position: float):
     opportunities_seen = 0
 
     total_fees = 0.0
+    total_exits = 0
+    total_exit_pnl = 0.0
     bankroll = 100.0  # simulate dynamic bankroll
+
+    # Track positions across snapshots for early exit simulation
+    from polycrossarb.risk.manager import RiskManager
+    risk = RiskManager(initial_bankroll=100.0, state_dir="/tmp/backtest_state")
 
     for snap_file in files:
         ts, markets = load_snapshot(snap_file)
         time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+        # Check early exits on existing positions before new trades
+        current_prices = {
+            f"{m.condition_id}:0": m.outcomes[0].price
+            for m in markets if m.outcomes and m.outcomes[0].price > 0
+        }
+        exits = risk.check_early_exits(current_prices)
+        for key, exit_price in exits:
+            pnl = risk.close_position(key, exit_price)
+            total_exit_pnl += pnl
+            total_exits += 1
+            bankroll = risk.effective_bankroll
 
         # Detect arbs
         opps = detect_cross_market_arbs(markets, min_margin=min_margin, exclusive_only=True)
@@ -135,13 +153,20 @@ def replay_snapshots(snapshot_dir: str, min_margin: float, max_position: float):
         partitions = find_event_partitions(markets)
         neg_risk = [p for p in partitions if p.is_neg_risk and p.event_id in arb_event_ids]
 
-        exposure = bankroll * 0.8
+        available = risk.available_capital
         results = solve_all_partitions(
             partitions=neg_risk,
-            max_position_per_event=min(max_position, bankroll * 0.2),
-            max_total_exposure=exposure,
+            max_position_per_event=min(max_position, risk.effective_bankroll * 0.2),
+            max_total_exposure=available,
             min_profit=0.10,
         )
+
+        # Record trades in risk manager
+        for r in results:
+            allowed, _ = risk.check_trade(r, "")
+            if allowed:
+                risk.record_trade(r.orders, paper=True)
+                risk.record_fees(r.total_fees)
 
         snap_profit = sum(r.guaranteed_profit for r in results)
         snap_fees = sum(r.total_fees for r in results)
@@ -149,21 +174,27 @@ def replay_snapshots(snapshot_dir: str, min_margin: float, max_position: float):
         total_profit += snap_profit
         total_fees += snap_fees
         total_trades += snap_trades
+        bankroll = risk.effective_bankroll
 
-        # Compound bankroll
-        bankroll += snap_profit
-
-        if snap_trades > 0:
+        if snap_trades > 0 or total_exits > 0:
             log.info(
-                "[%s] %d opps, %d trades, profit $%.2f, fees $%.4f, bankroll $%.2f",
-                time_str, len(opps), snap_trades, snap_profit, snap_fees, bankroll,
+                "[%s] %d opps, %d trades, %d exits, profit $%.2f, bankroll $%.2f",
+                time_str, len(opps), snap_trades, len(exits), snap_profit, bankroll,
             )
+
+    # Clean up temp state
+    import os
+    try:
+        os.remove("/tmp/backtest_state/state.json")
+    except FileNotFoundError:
+        pass
 
     print(f"\n{'='*60}")
     print(f"  Backtest Results")
     print(f"  Snapshots: {len(files)}")
     print(f"  Opportunities seen: {opportunities_seen}")
     print(f"  Trades executed: {total_trades}")
+    print(f"  Early exits: {total_exits} (P&L: ${total_exit_pnl:.2f})")
     print(f"  Starting bankroll: $100.00")
     print(f"  Final bankroll: ${bankroll:.2f}")
     print(f"  Net profit: ${total_profit:.2f}")

@@ -246,15 +246,15 @@ def calculate_taker_fee(
 ) -> float:
     """Calculate taker fee for a single order.
 
-    Priority:
-      1. Live API fee rate (if token_id provided)
-      2. Fallback formula (category-based)
+    Uses cached live rate if available (no API calls from here).
+    Falls back to hardcoded schedule if cache miss.
+    Call prefetch_fee_rates() before solving to warm the cache.
 
     Args:
         shares: Number of shares traded
         price: Share price (0 to 1)
         category: Market category (for fallback)
-        token_id: Outcome token ID (for live API lookup)
+        token_id: Outcome token ID (for cache lookup)
 
     Returns:
         Fee in USD, rounded to 4 decimal places.
@@ -262,22 +262,20 @@ def calculate_taker_fee(
     if shares <= 0:
         return 0.0
 
-    # Try live API first
-    if token_id:
-        live_rate = get_live_fee_rate(token_id)
-        if live_rate is not None:
-            # base_fee from API is the flat rate multiplier
-            # Apply to shares * price to get fee
-            if live_rate == 0:
+    # Check cache only — never make API calls from inside the solver
+    if token_id and token_id in _fee_cache:
+        cached_fee, cached_at = _fee_cache[token_id]
+        if time.time() - cached_at < _CACHE_TTL:
+            if cached_fee == 0:
                 return 0.0
             p = max(0.001, min(0.999, price))
-            fee = shares * p * live_rate * (p * (1 - p))
+            fee = shares * p * cached_fee * (p * (1 - p))
             fee = round(fee, 4)
             if 0 < fee < 0.0001:
                 fee = 0.0001
             return fee
 
-    # Fallback to hardcoded schedule
+    # Fallback to hardcoded schedule (no network call)
     return _fallback_fee(shares, price, category)
 
 
