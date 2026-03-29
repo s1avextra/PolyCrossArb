@@ -368,6 +368,16 @@ class LiveExecutor:
         log.info("Pre-flight passed: %d legs, total cost $%.2f, balance $%.2f",
                  len(leg_details), total_order_cost, usdc_balance)
 
+        # ── PROBE EXIT: buy tiny amount on first leg, try to sell back ──
+        # This verifies we can actually exit positions on this market.
+        # Cost: ~spread on $1 order = $0.01-0.05 per probe.
+        probe_leg = leg_details[0]
+        probe_ok = await self._probe_exitability(probe_leg[0], probe_leg[1], probe_leg[2], probe_leg[3])
+        if not probe_ok:
+            log.warning("Exit probe FAILED — positions on this market are NOT sellable. Aborting.")
+            return ExecutionResult(all_filled=False)
+        log.info("Exit probe passed — positions are sellable")
+
         # ── PLACE ALL ORDERS AT ONCE ──────────────────────────────
 
         order_ids: list[str] = []
@@ -626,6 +636,92 @@ class LiveExecutor:
                 fill_cost=0, slippage=0, timestamp=timestamp,
                 success=False, error=str(e),
             )
+
+    async def _probe_exitability(
+        self,
+        order: TradeOrder,
+        token_id: str,
+        neg_risk: bool,
+        tick_size: str,
+    ) -> bool:
+        """Probe whether a position can be exited by doing a tiny buy+sell.
+
+        Buys minimum amount ($1 worth), then immediately sells it back.
+        If the sell succeeds, the position is exitable. If it fails
+        (e.g. neg_risk tokens trapped in contract), we know to abort.
+
+        Cost: spread on ~$1 order ≈ $0.01-0.05.
+        """
+        import asyncio
+        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        try:
+            book = self._client.get_order_book(token_id)
+            if not book.asks or not book.bids:
+                return False
+
+            best_ask = float(book.asks[0].price)
+            best_bid = float(book.bids[0].price)
+            if best_ask <= 0 or best_bid <= 0:
+                return False
+
+            # Buy minimum amount at best ask
+            probe_size = max(1.0, round(1.5 / best_ask, 1))  # ~$1.50 worth
+            opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+
+            log.info("Probe BUY %.1f @ %.4f on %s...", probe_size, best_ask, token_id[:16])
+            buy_args = OrderArgs(token_id=token_id, price=best_ask, size=probe_size, side=BUY)
+            buy_resp = self._client.create_and_post_order(buy_args, opts)
+            buy_oid = buy_resp.get("orderID") or buy_resp.get("id") or ""
+
+            if not buy_oid:
+                log.warning("Probe buy: no order ID returned")
+                return False
+
+            # Wait for buy to fill
+            await asyncio.sleep(3)
+            try:
+                status = self._client.get_order(buy_oid)
+                filled = float(status.get("size_matched", 0))
+                if filled < probe_size * 0.5:
+                    self._client.cancel(buy_oid)
+                    log.warning("Probe buy didn't fill (%.1f/%.1f)", filled, probe_size)
+                    return False
+            except Exception:
+                self._client.cancel(buy_oid)
+                return False
+
+            # Now try to sell it back at best bid
+            log.info("Probe SELL %.1f @ %.4f...", filled, best_bid)
+            sell_args = OrderArgs(token_id=token_id, price=best_bid, size=round(filled, 1), side=SELL)
+            try:
+                sell_resp = self._client.create_and_post_order(sell_args, opts)
+                sell_oid = sell_resp.get("orderID") or sell_resp.get("id") or ""
+                if sell_oid:
+                    # Sell order accepted — position IS exitable
+                    # Wait briefly for fill, then cancel if unfilled (we don't need it to fill)
+                    await asyncio.sleep(2)
+                    try:
+                        self._client.cancel(sell_oid)
+                    except Exception:
+                        pass  # may have already filled — that's fine
+                    log.info("Probe SELL accepted — exit confirmed")
+                    return True
+                else:
+                    log.warning("Probe sell: no order ID — exit may not work")
+                    return False
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "not enough balance" in error_msg or "allowance" in error_msg:
+                    log.warning("Probe SELL FAILED: %s — tokens trapped in contract", str(e)[:80])
+                    return False
+                log.warning("Probe sell error: %s", str(e)[:80])
+                return False
+
+        except Exception as e:
+            log.warning("Probe failed: %s", str(e)[:80])
+            return False
 
     async def _cancel_orders(self, order_ids: list[str]) -> None:
         """Cancel all unfilled orders (emergency abort)."""
