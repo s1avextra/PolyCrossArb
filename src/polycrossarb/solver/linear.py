@@ -111,6 +111,8 @@ def solve_partition_arb(
 
     Accounts for: trading fees, gas fees, spread costs.
     """
+    POLYMARKET_MIN_ORDER_USD = 1.0  # Polymarket rejects orders below $1
+
     if not group.markets:
         return SolverResult(status="empty", guaranteed_profit=0.0)
 
@@ -125,8 +127,23 @@ def solve_partition_arb(
     exec_prices, spreads, spread_cost = _get_executable_prices(group)
     exec_sum = sum(exec_prices)
 
+    # Check bid-side liquidity: every leg must have bids (sellable/exitable)
+    for i, market in enumerate(group.markets):
+        book = market.outcomes[0].order_book if market.outcomes else None
+        if book is not None and not book.bids:
+            return SolverResult(status="no_exit_liquidity", guaranteed_profit=0.0)
+
+    # Check minimum order size: price * size must be >= $1 per leg
+    # Calculate the minimum size that satisfies $1 on the cheapest leg
+    min_price = min(exec_prices)
+    if min_price > 0:
+        min_size_for_cheapest = POLYMARKET_MIN_ORDER_USD / min_price
+    else:
+        return SolverResult(status="zero_price_leg", guaranteed_profit=0.0)
+
     prob = pulp.LpProblem("partition_arb", pulp.LpMaximize)
-    size = pulp.LpVariable("set_size", lowBound=0)
+    # Enforce minimum size so every leg meets the $1 order minimum
+    size = pulp.LpVariable("set_size", lowBound=min_size_for_cheapest)
 
     if mid_sum > 1.0:
         # OVERPRICED: sell YES on all → collect exec_sum per set, pay out 1.0
@@ -155,7 +172,16 @@ def solve_partition_arb(
         # Buying costs exec_sum per set
         prob += size * exec_sum <= max_position_usd, "capital_limit"
 
-    # Liquidity constraints per outcome
+    # Liquidity constraints: cap at 50% of visible bid depth per leg
+    for i, market in enumerate(group.markets):
+        book = market.outcomes[0].order_book if market.outcomes else None
+        if book is not None and book.bids:
+            total_bid_depth = sum(float(b.size) for b in book.bids)
+            depth_cap = total_bid_depth * 0.5  # don't take more than 50% of depth
+            if depth_cap > 0:
+                prob += size <= depth_cap, f"depth_{i}"
+
+    # Additional liquidity constraints if provided
     if liquidity_caps:
         for i, market in enumerate(group.markets):
             cap = liquidity_caps.get(market.condition_id, float("inf"))

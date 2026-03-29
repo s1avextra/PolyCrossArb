@@ -337,10 +337,11 @@ class WebSocketPipeline:
             if self._execution_lock.locked():
                 return  # another trade is in-flight
             async with self._execution_lock:
-                self._risk._last_trade_time[partition.event_id] = time.time()
                 exec_result = await self._live_executor.execute(result, trade_markets, partition.event_id)
 
         if exec_result.all_filled:
+            # Set cooldown ONLY after successful execution
+            self._risk._last_trade_time[partition.event_id] = time.time()
             self._trade_count += 1
             self._risk.record_fees(result.total_fees)
 

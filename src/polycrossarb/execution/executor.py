@@ -254,6 +254,29 @@ class LiveExecutor:
                     key = f"{m.condition_id}:{m.outcomes.index(o)}"
                     token_lookup[key] = o.token_id
 
+        # Pre-flight checks for every leg
+        for order in solver_result.orders:
+            token_id = token_lookup.get(order.var_key, "")
+            if not token_id:
+                log.warning("Pre-flight: no token_id for %s — aborting", order.var_key)
+                return ExecutionResult(all_filled=False)
+
+            # Check minimum order size ($1)
+            order_value = order.price * order.size
+            if order_value < 1.0:
+                log.warning("Pre-flight: order too small $%.2f < $1 for %s — aborting", order_value, order.var_key)
+                return ExecutionResult(all_filled=False)
+
+            # Check order book has bids (can exit later)
+            try:
+                book = self._client.get_order_book(token_id)
+                if not book.bids:
+                    log.warning("Pre-flight: no bids for %s — can't exit, aborting", order.var_key)
+                    return ExecutionResult(all_filled=False)
+            except Exception:
+                log.warning("Pre-flight: can't read book for %s — aborting", order.var_key)
+                return ExecutionResult(all_filled=False)
+
         for order in solver_result.orders:
             token_id = token_lookup.get(order.var_key, "")
             if not token_id:
@@ -284,6 +307,26 @@ class LiveExecutor:
             await self._cancel_orders(placed_order_ids)
 
         if all_filled:
+            # Post-trade: verify we hold tokens (can exit if needed)
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            for order in solver_result.orders:
+                token_id = token_lookup.get(order.var_key, "")
+                if token_id:
+                    try:
+                        params = BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL,
+                            token_id=token_id,
+                            signature_type=0,
+                        )
+                        bal = self._client.get_balance_allowance(params)
+                        raw = int(bal.get("balance", 0))
+                        if raw > 0:
+                            log.info("Position verified: %s balance=%d", order.var_key[:20], raw)
+                        else:
+                            log.warning("Position NOT verified: %s balance=0 — may be in neg_risk contract", order.var_key[:20])
+                    except Exception:
+                        pass
+
             self.risk_manager.record_trade(
                 solver_result.orders, event_id=event_id, paper=False,
             )
