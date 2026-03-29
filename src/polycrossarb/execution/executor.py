@@ -222,14 +222,17 @@ class LiveExecutor:
         markets: list | None = None,
         event_id: str = "",
     ) -> ExecutionResult:
-        """Execute trades via Polymarket CLOB API with leg-by-leg abort.
+        """Execute trades via Polymarket CLOB API — ALL-OR-NOTHING.
+
+        The arb only works if ALL legs execute. A partial fill means
+        we hold unhedged directional bets, not an arb.
 
         Strategy:
-          1. Check risk controls
-          2. Place each leg as a limit order
-          3. Wait for fill (with timeout per leg)
-          4. If any leg fails → cancel all unfilled orders
-          5. Record fills in risk manager
+          1. Pre-flight: validate ALL legs can execute (balance, min size, liquidity)
+          2. Place ALL orders simultaneously (not sequentially)
+          3. Wait for ALL to fill (with timeout)
+          4. If ANY leg fails → cancel ALL orders immediately
+          5. Only record trade if 100% of legs filled
         """
         allowed, reason = self.risk_manager.check_trade(solver_result, event_id)
         if not allowed:
@@ -239,11 +242,6 @@ class LiveExecutor:
         if not self._ensure_client():
             return ExecutionResult(all_filled=False)
 
-        fills: list[FillResult] = []
-        placed_order_ids: list[str] = []
-        all_filled = True
-        total_cost = 0.0
-        total_slippage = 0.0
         now = time.time()
 
         # Build token_id lookup from markets
@@ -254,22 +252,50 @@ class LiveExecutor:
                     key = f"{m.condition_id}:{m.outcomes.index(o)}"
                     token_lookup[key] = o.token_id
 
-        # Pre-flight checks for every leg
+        # ── PRE-FLIGHT: verify ALL legs before placing ANY orders ──
+
+        # 1. Check total cost fits in balance
+        from py_clob_client.clob_types import (
+            AssetType,
+            BalanceAllowanceParams,
+            OrderArgs,
+            PartialCreateOrderOptions,
+        )
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        try:
+            bal_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=0)
+            bal_data = self._client.get_balance_allowance(bal_params)
+            usdc_balance = int(bal_data.get("balance", 0)) / 1e6
+        except Exception:
+            log.warning("Pre-flight: can't check balance — aborting")
+            return ExecutionResult(all_filled=False)
+
+        total_order_cost = sum(o.price * o.size for o in solver_result.orders)
+        if total_order_cost > usdc_balance * 0.95:  # 5% safety margin
+            log.warning("Pre-flight: total cost $%.2f > balance $%.2f — aborting",
+                        total_order_cost, usdc_balance)
+            return ExecutionResult(all_filled=False)
+
+        # 2. Check each leg: token_id exists, order >= $1, has bids
+        leg_details: list[tuple[TradeOrder, str, bool, str]] = []  # (order, token_id, neg_risk, tick_size)
+
         for order in solver_result.orders:
             token_id = token_lookup.get(order.var_key, "")
             if not token_id:
                 log.warning("Pre-flight: no token_id for %s — aborting", order.var_key)
                 return ExecutionResult(all_filled=False)
 
-            # Check minimum order size ($1)
             order_value = order.price * order.size
             if order_value < 1.0:
-                log.warning("Pre-flight: order too small $%.2f < $1 for %s — aborting", order_value, order.var_key)
+                log.warning("Pre-flight: order $%.2f < $1 min for %s — aborting",
+                            order_value, order.var_key)
                 return ExecutionResult(all_filled=False)
 
-            # Check order book has bids (can exit later)
             try:
                 book = self._client.get_order_book(token_id)
+                neg_risk = bool(book.neg_risk)
+                tick_size = str(book.tick_size) if book.tick_size else "0.01"
                 if not book.bids:
                     log.warning("Pre-flight: no bids for %s — can't exit, aborting", order.var_key)
                     return ExecutionResult(all_filled=False)
@@ -277,75 +303,146 @@ class LiveExecutor:
                 log.warning("Pre-flight: can't read book for %s — aborting", order.var_key)
                 return ExecutionResult(all_filled=False)
 
-        for order in solver_result.orders:
-            token_id = token_lookup.get(order.var_key, "")
-            if not token_id:
-                log.error("No token_id for %s — aborting", order.var_key)
-                all_filled = False
-                break
+            leg_details.append((order, token_id, neg_risk, tick_size))
 
+        log.info("Pre-flight passed: %d legs, total cost $%.2f, balance $%.2f",
+                 len(leg_details), total_order_cost, usdc_balance)
+
+        # ── PLACE ALL ORDERS AT ONCE ──────────────────────────────
+
+        order_ids: list[str] = []
+        placement_failed = False
+
+        for order, token_id, neg_risk, tick_size in leg_details:
+            side = BUY if order.side == "buy" else SELL
             try:
-                fill = await self._place_and_wait(order, token_id, now)
-                fills.append(fill)
+                args = OrderArgs(
+                    token_id=token_id,
+                    price=order.price,
+                    size=order.size,
+                    side=side,
+                )
+                opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+                resp = self._client.create_and_post_order(args, opts)
 
-                if fill.success:
-                    total_cost += fill.fill_cost
-                    total_slippage += abs(fill.slippage) * fill.filled_size
-                    placed_order_ids.append(getattr(fill, '_order_id', ''))
-                else:
-                    all_filled = False
-                    log.warning("Leg failed: %s — aborting remaining", order.var_key)
+                # Validate response
+                if not resp or (isinstance(resp, dict) and resp.get("error")):
+                    error_msg = resp.get("error", "unknown") if isinstance(resp, dict) else "empty"
+                    log.error("Order placement failed for %s: %s", order.var_key, error_msg)
+                    placement_failed = True
                     break
 
-            except Exception:
-                log.exception("Order placement failed for %s", order.var_key)
-                all_filled = False
+                oid = resp.get("orderID") or resp.get("id") or ""
+                if not oid:
+                    log.error("No order ID for %s — aborting all", order.var_key)
+                    placement_failed = True
+                    break
+
+                order_ids.append(oid)
+                log.info("Placed: %s %s %.1f@%.4f id=%s",
+                         order.side, token_id[:16], order.size, order.price, oid[:16])
+
+            except Exception as e:
+                log.error("Order failed for %s: %s", order.var_key, str(e)[:100])
+                placement_failed = True
                 break
 
-        # If any leg failed, cancel all placed orders
-        if not all_filled and placed_order_ids:
-            await self._cancel_orders(placed_order_ids)
+        # If ANY placement failed, cancel ALL placed orders immediately
+        if placement_failed:
+            log.warning("Placement failed — cancelling %d placed orders", len(order_ids))
+            await self._cancel_orders(order_ids)
+            return ExecutionResult(all_filled=False)
 
-        if all_filled:
-            # Post-trade: verify we hold tokens (can exit if needed)
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-            for order in solver_result.orders:
-                token_id = token_lookup.get(order.var_key, "")
-                if token_id:
-                    try:
-                        params = BalanceAllowanceParams(
-                            asset_type=AssetType.CONDITIONAL,
-                            token_id=token_id,
-                            signature_type=0,
-                        )
-                        bal = self._client.get_balance_allowance(params)
-                        raw = int(bal.get("balance", 0))
-                        if raw > 0:
-                            log.info("Position verified: %s balance=%d", order.var_key[:20], raw)
-                        else:
-                            log.warning("Position NOT verified: %s balance=0 — may be in neg_risk contract", order.var_key[:20])
-                    except Exception:
-                        pass
+        # ── WAIT FOR ALL FILLS ────────────────────────────────────
 
-            self.risk_manager.record_trade(
-                solver_result.orders, event_id=event_id, paper=False,
+        import asyncio
+        fills: list[FillResult] = []
+        total_cost = 0.0
+        total_slippage = 0.0
+        all_filled = True
+        deadline = time.time() + self.FILL_TIMEOUT
+
+        while time.time() < deadline:
+            await asyncio.sleep(self.FILL_POLL_INTERVAL)
+
+            filled_count = 0
+            for i, oid in enumerate(order_ids):
+                try:
+                    status = self._client.get_order(oid)
+                    matched = float(status.get("size_matched", 0))
+                    target = solver_result.orders[i].size
+                    if matched >= target * 0.95:
+                        filled_count += 1
+                except Exception:
+                    pass
+
+            if filled_count == len(order_ids):
+                break  # all filled
+
+        # Check final fill status for each leg
+        for i, oid in enumerate(order_ids):
+            order = solver_result.orders[i]
+            try:
+                status = self._client.get_order(oid)
+                matched = float(status.get("size_matched", 0))
+                trades_list = status.get("associate_trades") or []
+
+                if matched >= order.size * 0.95:
+                    fill_price = order.price
+                    if trades_list and isinstance(trades_list, list) and len(trades_list) > 0:
+                        try:
+                            fill_price = float(trades_list[0].get("price", order.price))
+                        except (ValueError, TypeError):
+                            pass
+
+                    slippage = abs(fill_price - order.price)
+                    cost = fill_price * matched * (-1 if order.side == "sell" else 1)
+                    total_cost += cost
+                    total_slippage += slippage * matched
+
+                    fills.append(FillResult(
+                        order=order, filled_size=matched, fill_price=fill_price,
+                        fill_cost=cost, slippage=slippage, timestamp=now, success=True,
+                    ))
+                else:
+                    all_filled = False
+                    fills.append(FillResult(
+                        order=order, filled_size=matched, fill_price=order.price,
+                        fill_cost=0, slippage=0, timestamp=now, success=False,
+                        error=f"Only {matched:.1f}/{order.size:.1f} filled",
+                    ))
+            except Exception as e:
+                all_filled = False
+                fills.append(FillResult(
+                    order=order, filled_size=0, fill_price=order.price,
+                    fill_cost=0, slippage=0, timestamp=now, success=False, error=str(e),
+                ))
+
+        # If NOT all filled → cancel everything (all-or-nothing)
+        if not all_filled:
+            log.warning("Not all legs filled — cancelling ALL %d orders", len(order_ids))
+            await self._cancel_orders(order_ids)
+            return ExecutionResult(
+                fills=fills, total_cost=0, total_slippage=0,
+                all_filled=False, guaranteed_profit=0, actual_profit_estimate=0,
             )
 
-        actual_profit = solver_result.guaranteed_profit - total_slippage
+        # ALL legs filled — record the trade
+        self.risk_manager.record_trade(
+            solver_result.orders, event_id=event_id, paper=False,
+        )
 
+        actual_profit = solver_result.guaranteed_profit - total_slippage
         result = ExecutionResult(
-            fills=fills,
-            total_cost=total_cost,
-            total_slippage=total_slippage,
-            all_filled=all_filled,
-            guaranteed_profit=solver_result.guaranteed_profit,
+            fills=fills, total_cost=total_cost, total_slippage=total_slippage,
+            all_filled=True, guaranteed_profit=solver_result.guaranteed_profit,
             actual_profit_estimate=actual_profit,
         )
 
         log.info(
-            "Live execution: %d/%d filled, gross $%.4f, fees $%.4f, net $%.4f",
-            result.n_filled, len(solver_result.orders),
-            solver_result.gross_profit, solver_result.total_fees, actual_profit,
+            "ALL %d legs filled! gross $%.4f, fees $%.4f, slippage $%.4f, net $%.4f",
+            len(fills), solver_result.gross_profit, solver_result.total_fees,
+            total_slippage, actual_profit,
         )
         return result
 
