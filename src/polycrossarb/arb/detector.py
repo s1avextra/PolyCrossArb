@@ -235,6 +235,21 @@ def detect_cross_market_arbs(
         if abs(deviation) < min_margin:
             continue
 
+        # CRITICAL: verify this is a COMPLETE outcome set, not a partial group.
+        # An underpriced group (sum < 1.0) could mean:
+        #   a) All outcomes present, slightly underpriced → real arb
+        #   b) Missing outcomes → NOT an arb, just incomplete data
+        #
+        # For underpriced: only accept if sum > 0.85 (at most 15% "missing").
+        # Below that, outcomes are clearly missing.
+        # For overpriced: sum > 1.0 is always a valid arb if all outcomes are present.
+        # But if sum >> 1.0 (like 1.6), some outcomes may overlap — also suspicious.
+        if deviation < 0 and price_sum < 0.85:
+            continue  # too much missing — incomplete group, not an arb
+
+        if deviation > 0 and price_sum > 1.5:
+            continue  # sum way too high — likely overlapping/duplicate outcomes
+
         event_title = group[0].event_title or group[0].event_slug or event_id
         neg_risk = any(m.neg_risk for m in group)
 
