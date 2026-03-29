@@ -1,5 +1,5 @@
 """Tests for LP solver and position sizing."""
-from polycrossarb.data.models import Market, Outcome
+from polycrossarb.data.models import Market, OrderBook, OrderBookLevel, Outcome
 from polycrossarb.execution.sizing import (
     calculate_position_size,
     estimate_execution_probability,
@@ -7,6 +7,14 @@ from polycrossarb.execution.sizing import (
 )
 from polycrossarb.graph.screener import EventGroup
 from polycrossarb.solver.linear import solve_all_partitions, solve_partition_arb
+
+
+def _make_book(price: float, depth: float = 500.0) -> OrderBook:
+    """Create a realistic order book around a price."""
+    return OrderBook(
+        bids=[OrderBookLevel(price=max(0.001, price - 0.01), size=depth)],
+        asks=[OrderBookLevel(price=min(0.999, price + 0.01), size=depth)],
+    )
 
 
 def _make_partition(prices: list[float], event_id: str = "e1") -> EventGroup:
@@ -17,7 +25,8 @@ def _make_partition(prices: list[float], event_id: str = "e1") -> EventGroup:
             question=f"Outcome {i}?",
             slug=f"m{i}",
             outcomes=[
-                Outcome(token_id=f"t{i}_yes", name="Yes", price=p),
+                Outcome(token_id=f"t{i}_yes", name="Yes", price=p,
+                        order_book=_make_book(p)),
                 Outcome(token_id=f"t{i}_no", name="No", price=1 - p),
             ],
             event_id=event_id,

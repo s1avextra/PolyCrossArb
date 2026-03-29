@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # Max days until resolution — skip events that lock capital too long
     max_resolution_days: float = 3.0
 
+    # Strategy safety limits
+    max_legs_per_trade: int = 4        # max outcomes per arb (2-4 realistic)
+    min_leg_probability: float = 0.05  # skip outcomes below 5% (illiquid lottery tickets)
+    min_leg_bid_depth_usd: float = 50  # each leg must have $50+ bid depth (exitable)
+    min_leg_value_usd: float = 5.0     # each leg order must be >= $5 (not dust)
+
     # Kelly fraction: 0.25 = quarter Kelly (academic optimal for prediction markets)
     # Full Kelly maximises growth but has 50% chance of 50% drawdown.
     # Quarter Kelly: ~94% of growth rate, max drawdown ~12%.

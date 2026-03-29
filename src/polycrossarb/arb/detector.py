@@ -206,13 +206,25 @@ def detect_cross_market_arbs(
     opportunities: list[ArbOpportunity] = []
 
     for event_id, group in event_groups.items():
+        # FILTER: max legs — arbs with 10+ legs almost never execute atomically
+        if len(group) > settings.max_legs_per_trade:
+            continue
+
         yes_prices: list[tuple[Market, float]] = []
         skip = False
         for m in group:
             if not m.outcomes or m.outcomes[0].price == 0:
                 skip = True
                 break
-            yes_prices.append((m, m.outcomes[0].price))
+
+            price = m.outcomes[0].price
+
+            # FILTER: skip legs with probability below threshold (illiquid)
+            if price < settings.min_leg_probability:
+                skip = True
+                break
+
+            yes_prices.append((m, price))
 
         if skip or len(yes_prices) < 2:
             continue

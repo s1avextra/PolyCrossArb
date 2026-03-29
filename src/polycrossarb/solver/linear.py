@@ -127,19 +127,26 @@ def solve_partition_arb(
     exec_prices, spreads, spread_cost = _get_executable_prices(group)
     exec_sum = sum(exec_prices)
 
-    # Check bid-side liquidity: every leg must have bids (sellable/exitable)
+    # Check bid-side liquidity: every leg must have sufficient depth to exit
+    from polycrossarb.config import settings as cfg
     for i, market in enumerate(group.markets):
         book = market.outcomes[0].order_book if market.outcomes else None
-        if book is not None and not book.bids:
+        if book is None:
+            return SolverResult(status="no_book", guaranteed_profit=0.0)
+        if not book.bids:
             return SolverResult(status="no_exit_liquidity", guaranteed_profit=0.0)
+        # Check minimum bid depth in USD
+        bid_depth_usd = sum(float(b.price) * float(b.size) for b in book.bids)
+        if bid_depth_usd < cfg.min_leg_bid_depth_usd:
+            return SolverResult(status="insufficient_depth", guaranteed_profit=0.0)
 
-    # Check minimum order size: price * size must be >= $1 per leg
-    # Calculate the minimum size that satisfies $1 on the cheapest leg
+    # Check minimum order size per leg
+    # Each leg must produce an order >= min_leg_value_usd (default $5)
+    # This prevents tiny lottery-ticket legs
     min_price = min(exec_prices)
-    if min_price > 0:
-        min_size_for_cheapest = POLYMARKET_MIN_ORDER_USD / min_price
-    else:
+    if min_price <= 0:
         return SolverResult(status="zero_price_leg", guaranteed_profit=0.0)
+    min_size_for_cheapest = cfg.min_leg_value_usd / min_price
 
     prob = pulp.LpProblem("partition_arb", pulp.LpMaximize)
     # Enforce minimum size so every leg meets the $1 order minimum
