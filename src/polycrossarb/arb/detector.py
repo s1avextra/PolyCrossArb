@@ -224,6 +224,11 @@ def detect_cross_market_arbs(
                 skip = True
                 break
 
+            # FILTER: skip legs with no real trading activity
+            if m.volume < settings.min_leg_volume_usd:
+                skip = True
+                break
+
             yes_prices.append((m, price))
 
         if skip or len(yes_prices) < 2:

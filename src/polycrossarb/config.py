@@ -36,8 +36,9 @@ class Settings(BaseSettings):
     # Strategy safety limits
     max_legs_per_trade: int = 4        # max outcomes per arb (2-4 realistic)
     min_leg_probability: float = 0.05  # skip outcomes below 5% (illiquid lottery tickets)
-    min_leg_bid_depth_usd: float = 50  # each leg must have $50+ bid depth (exitable)
+    min_leg_bid_depth_usd: float = 50   # each leg must have $50+ bid depth (exitable)
     min_leg_value_usd: float = 5.0     # each leg order must be >= $5 (not dust)
+    min_leg_volume_usd: float = 500    # each leg must have $500+ volume (real trading activity)
 
     # Kelly fraction: 0.25 = quarter Kelly (academic optimal for prediction markets)
     # Full Kelly maximises growth but has 50% chance of 50% drawdown.
