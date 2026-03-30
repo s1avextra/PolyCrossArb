@@ -308,9 +308,8 @@ class LiveExecutor:
         token_lookup: dict[str, str] = {}
         if markets:
             for m in markets:
-                for o in m.outcomes:
-                    key = f"{m.condition_id}:{m.outcomes.index(o)}"
-                    token_lookup[key] = o.token_id
+                for idx, o in enumerate(m.outcomes):
+                    token_lookup[f"{m.condition_id}:{idx}"] = o.token_id
 
         # ── PRE-FLIGHT: verify ALL legs before placing ANY orders ──
 
@@ -515,127 +514,6 @@ class LiveExecutor:
             total_slippage, actual_profit,
         )
         return result
-
-    async def _place_and_wait(
-        self,
-        order: TradeOrder,
-        token_id: str,
-        timestamp: float,
-    ) -> FillResult:
-        """Place a single limit order and wait for fill."""
-        import asyncio
-
-        try:
-            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-            from py_clob_client.order_builder.constants import BUY, SELL
-
-            side = BUY if order.side == "buy" else SELL
-
-            # Detect neg_risk and tick_size from order book
-            neg_risk = False
-            tick_size = "0.01"
-            try:
-                book = self._client.get_order_book(token_id)
-                neg_risk = bool(book.neg_risk)
-                tick_size = str(book.tick_size) if book.tick_size else "0.01"
-            except Exception:
-                pass
-
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=order.price,
-                size=order.size,
-                side=side,
-            )
-            options = PartialCreateOrderOptions(
-                tick_size=tick_size,
-                neg_risk=neg_risk,
-            )
-            resp = self._client.create_and_post_order(order_args, options)
-
-            # Validate response — abort if order wasn't placed
-            if not resp or isinstance(resp, dict) and resp.get("error"):
-                error_msg = resp.get("error", "unknown") if isinstance(resp, dict) else "empty response"
-                log.error("Order placement failed: %s", error_msg)
-                return FillResult(
-                    order=order, filled_size=0, fill_price=order.price,
-                    fill_cost=0, slippage=0, timestamp=timestamp,
-                    success=False, error=f"Placement failed: {error_msg}",
-                )
-
-            order_id = resp.get("orderID") or resp.get("id") or ""
-            if not order_id:
-                log.error("No order ID returned — cannot track order")
-                return FillResult(
-                    order=order, filled_size=0, fill_price=order.price,
-                    fill_cost=0, slippage=0, timestamp=timestamp,
-                    success=False, error="No order ID in response",
-                )
-
-            log.info("Order placed: %s %s %.2f@%.4f id=%s",
-                     order.side, token_id[:16], order.size, order.price, order_id[:16])
-
-            # Poll for fill — require 95%+ fill for success
-            filled_size = 0.0
-            fill_price = order.price
-            poll_failures = 0
-            deadline = time.time() + self.FILL_TIMEOUT
-
-            while time.time() < deadline:
-                await asyncio.sleep(self.FILL_POLL_INTERVAL)
-                try:
-                    status = self._client.get_order(order_id)
-                    filled = float(status.get("size_matched", 0))
-                    if filled >= order.size * 0.95:
-                        filled_size = filled
-                        # Safely extract fill price
-                        trades = status.get("associate_trades") or []
-                        if trades and isinstance(trades, list) and len(trades) > 0:
-                            try:
-                                fill_price = float(trades[0].get("price", order.price))
-                            except (ValueError, TypeError, AttributeError):
-                                fill_price = order.price
-                        break
-                except Exception as e:
-                    poll_failures += 1
-                    log.debug("Poll failed (%d): %s", poll_failures, e)
-                    if poll_failures >= 5:
-                        log.warning("Too many poll failures — treating as timeout")
-                        break
-
-            if filled_size < order.size * 0.95:
-                # Not enough filled — cancel and report failure
-                try:
-                    self._client.cancel(order_id)
-                    log.info("Cancelled unfilled order %s", order_id[:16])
-                except Exception:
-                    log.warning("Failed to cancel order %s — MAY BE ORPHANED", order_id[:16])
-
-                return FillResult(
-                    order=order, filled_size=filled_size,
-                    fill_price=fill_price, fill_cost=0,
-                    slippage=0, timestamp=timestamp, success=False,
-                    error=f"Insufficient fill: {filled_size:.2f}/{order.size:.2f}",
-                )
-
-            slippage = abs(fill_price - order.price)
-            cost = fill_price * filled_size * (-1 if order.side == "sell" else 1)
-
-            result = FillResult(
-                order=order, filled_size=filled_size,
-                fill_price=fill_price, fill_cost=cost,
-                slippage=slippage, timestamp=timestamp, success=True,
-            )
-            result._order_id = order_id  # type: ignore[attr-defined]
-            return result
-
-        except Exception as e:
-            log.exception("Order execution error for %s", order.var_key)
-            return FillResult(
-                order=order, filled_size=0, fill_price=order.price,
-                fill_cost=0, slippage=0, timestamp=timestamp,
-                success=False, error=str(e),
-            )
 
     async def _probe_exitability(
         self,

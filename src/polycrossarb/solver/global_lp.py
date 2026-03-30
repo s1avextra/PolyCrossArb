@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import pulp
 
 from polycrossarb.data.models import Market
-from polycrossarb.execution.fees import calculate_taker_fee, estimate_gas_cost
+from polycrossarb.execution.fees import estimate_gas_cost
 from polycrossarb.graph.screener import EventGroup
 
 log = logging.getLogger(__name__)

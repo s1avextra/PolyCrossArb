@@ -8,12 +8,13 @@ Uses PuLP + CBC (free) to solve the integer-linear program:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
-import numpy as np
 import pulp
 
-from polycrossarb.arb.polytope import PolytopeConstraints
+from polycrossarb.config import settings as cfg
 from polycrossarb.execution.fees import (
     calculate_taker_fee,
     estimate_gas_cost,
@@ -135,7 +136,7 @@ def solve_partition_arb(
     exec_sum = sum(exec_prices)
 
     # Check bid-side liquidity: every leg must have sufficient depth to exit
-    from polycrossarb.config import settings as cfg
+    # cfg imported at module level
     for i, market in enumerate(group.markets):
         book = market.outcomes[0].order_book if market.outcomes else None
         if book is None:
@@ -288,16 +289,13 @@ def _capital_turnover_score(group: EventGroup, result: SolverResult) -> float:
 
     This maximises bankroll compound growth rate.
     """
-    cost = max(result.total_cost, result.total_revenue, 0.01)
+    cost = max(result.total_cost, 0.01)
     profit_ratio = result.guaranteed_profit / cost
 
-    # Estimate days until resolution from end_date
-    import time
-    days_to_resolve = 365.0  # default if no end date
+    days_to_resolve = 365.0
     for m in group.markets:
         if m.end_date:
             try:
-                from datetime import datetime
                 end = datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
                 delta = (end - datetime.now(end.tzinfo)).total_seconds() / 86400
                 if 0 < delta < days_to_resolve:
@@ -380,7 +378,7 @@ def solve_all_partitions(
             if not result.is_optimal or result.guaranteed_profit < min_profit:
                 continue
 
-        cost = max(result.total_cost, result.total_revenue)
+        cost = result.total_cost
         if cost <= remaining_capital:
             results.append(result)
             remaining_capital -= cost
@@ -393,7 +391,7 @@ def solve_all_partitions(
             )
             if scaled.is_optimal and scaled.guaranteed_profit >= min_profit:
                 results.append(scaled)
-                remaining_capital -= max(scaled.total_cost, scaled.total_revenue)
+                remaining_capital -= scaled.total_cost
                 exposed_markets.update(group_cids)
 
         if remaining_capital <= 0:

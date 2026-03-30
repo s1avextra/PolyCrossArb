@@ -126,7 +126,6 @@ def generate_mm_quotes(
         if our_sell_price <= our_buy_price:
             continue
 
-        our_spread = our_sell_price - our_buy_price
         size = min(quote_size, max_inventory_per_outcome)
 
         buy_quotes.append(MMQuote(

@@ -17,6 +17,7 @@ import json
 import logging
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
@@ -213,18 +214,20 @@ class WebSocketPipeline:
             return
         self._last_eval[event_id] = now
 
-        # Check early exits — if arb margin has shrunk, close positions to free capital
-        current_prices = {
-            f"{m.condition_id}:0": m.outcomes[0].price
-            for m in self._markets.values()
-            if m.outcomes and m.outcomes[0].price > 0
-        }
-        exits = self._risk.check_early_exits(current_prices)
-        for key, exit_price in exits:
-            pnl = self._risk.close_position(key, exit_price)
-            if abs(pnl) > 0.001:
-                log.info("ws_pipeline.early_exit", position=key[:20], pnl=f"${pnl:.4f}",
-                         bankroll=f"${self._risk.effective_bankroll:.2f}")
+        # Check early exits — only scan markets we have positions in (not all 25k)
+        if self._risk.positions:
+            pos_cids = {p.market_condition_id for p in self._risk.positions}
+            current_prices = {
+                f"{m.condition_id}:0": m.outcomes[0].price
+                for m in self._markets.values()
+                if m.condition_id in pos_cids and m.outcomes and m.outcomes[0].price > 0
+            }
+            exits = self._risk.check_early_exits(current_prices)
+            for key, exit_price in exits:
+                pnl = self._risk.close_position(key, exit_price)
+                if abs(pnl) > 0.001:
+                    log.info("ws_pipeline.early_exit", position=key[:20], pnl=f"${pnl:.4f}",
+                             bankroll=f"${self._risk.effective_bankroll:.2f}")
 
         # Evaluate arb — use lock to prevent duplicate concurrent evaluations
         partition = self._partitions.get(event_id)
@@ -288,8 +291,6 @@ class WebSocketPipeline:
         if margin < settings.min_arb_margin:
             return
 
-        # Skip events that resolve too far out — capital gets locked
-        from datetime import datetime, timezone
         max_days = settings.max_resolution_days
         for m in partition.markets:
             if m.end_date:
