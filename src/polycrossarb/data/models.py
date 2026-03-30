@@ -82,6 +82,7 @@ class Market:
     event_title: str = ""
     group_slug: str = ""
     neg_risk: bool = False
+    neg_risk_augmented: bool = False  # True = outcomes may be incomplete (has placeholders)
 
     @property
     def outcome_price_sum(self) -> float:

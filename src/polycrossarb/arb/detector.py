@@ -206,6 +206,12 @@ def detect_cross_market_arbs(
     opportunities: list[ArbOpportunity] = []
 
     for event_id, group in event_groups.items():
+        # FILTER: skip augmented neg_risk events (outcomes may be incomplete)
+        # Augmented events have placeholders and "Other" that can change definitions.
+        # Trading them assumes all outcomes are listed, which isn't guaranteed.
+        if any(m.neg_risk_augmented for m in group):
+            continue
+
         # FILTER: max legs — arbs with 10+ legs almost never execute atomically
         if len(group) > settings.max_legs_per_trade:
             continue

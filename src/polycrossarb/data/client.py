@@ -176,11 +176,13 @@ class PolymarketClient:
             event_slug = ""
             event_id = ""
             event_title = ""
+            neg_risk_augmented = False
             if isinstance(events_list, list) and events_list:
                 ev = events_list[0]
                 event_slug = ev.get("slug", "")
                 event_id = str(ev.get("id", ""))
                 event_title = ev.get("title", "")
+                neg_risk_augmented = bool(ev.get("negRiskAugmented", False))
 
             return Market(
                 condition_id=condition_id,
@@ -199,6 +201,7 @@ class PolymarketClient:
                 event_title=event_title,
                 group_slug=raw.get("groupSlug") or raw.get("group_slug", ""),
                 neg_risk=bool(raw.get("negRisk", False)),
+                neg_risk_augmented=neg_risk_augmented,
             )
         except Exception:
             log.debug("Failed to parse market: %s", raw.get("question", "?"), exc_info=True)
