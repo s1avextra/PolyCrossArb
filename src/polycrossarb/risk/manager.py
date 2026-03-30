@@ -68,8 +68,10 @@ class RiskManager:
         cooldown_seconds: float = settings.cooldown_seconds,
         state_dir: str = "logs",
     ):
-        # Auto-detect bankroll from wallet if not provided
-        if initial_bankroll is None or initial_bankroll <= 0:
+        # Use config bankroll if set, otherwise auto-detect from wallet
+        if initial_bankroll is None:
+            initial_bankroll = settings.bankroll_usd
+        if initial_bankroll <= 0:
             from polycrossarb.execution.wallet import detect_bankroll
             initial_bankroll = detect_bankroll()
         self._initial_bankroll = initial_bankroll

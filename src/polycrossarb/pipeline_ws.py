@@ -37,6 +37,7 @@ from polycrossarb.graph.dependency import DependencyGraph
 from polycrossarb.graph.screener import EventGroup, find_event_partitions
 from polycrossarb.risk.manager import RiskManager
 from polycrossarb.solver.linear import solve_partition_arb
+from polycrossarb.solver.market_maker import evaluate_mm_opportunities, MMStrategy, MMQuote
 
 log = structlog.get_logger(__name__)
 
@@ -83,6 +84,12 @@ class WebSocketPipeline:
         self._REFRESH_INTERVAL = 300  # 5 minutes
         self._last_refresh = 0.0
 
+        # Market-making state
+        self._mm_strategies: list[MMStrategy] = []
+        self._mm_active_orders: dict[str, str] = {}  # var_key -> order_id
+        self._mm_last_refresh = 0.0
+        self._MM_REFRESH_INTERVAL = 60  # refresh MM quotes every 60s
+
         self._running = False
 
     async def run(self) -> None:
@@ -104,11 +111,12 @@ class WebSocketPipeline:
         self._ws.on_resolution = self._on_resolution
         self._ws.set_asset_market_map(self._asset_to_market)
 
-        # Step 3: Run WebSocket and periodic refresh concurrently
+        # Step 3: Run WebSocket, periodic refresh, and MM quote manager concurrently
         try:
             await asyncio.gather(
                 self._ws.run(),
                 self._periodic_refresh(),
+                self._mm_quote_manager(),
             )
         except asyncio.CancelledError:
             pass
@@ -376,6 +384,148 @@ class WebSocketPipeline:
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
+    # ── Market-Making ──────────────────────────────────────────────
+
+    async def _mm_quote_manager(self) -> None:
+        """Periodically evaluate and place market-making quotes.
+
+        Runs alongside the arb pipeline. Every 60s:
+        1. Evaluate overpriced events for MM opportunities
+        2. Cancel stale quotes
+        3. Place new quotes (buy NO at patient prices)
+        """
+        while self._running:
+            await asyncio.sleep(self._MM_REFRESH_INTERVAL)
+            if not self._running:
+                break
+            try:
+                await self._refresh_mm_quotes()
+            except Exception:
+                log.exception("mm.error")
+
+    async def _refresh_mm_quotes(self) -> None:
+        """Refresh market-making quotes on overpriced events."""
+        # Get current overpriced partitions with order books
+        partitions_with_books = []
+        for eid, p in self._partitions.items():
+            if not p.is_neg_risk:
+                continue
+            yes_sum = sum(p.yes_prices)
+            if yes_sum <= 1.02:  # only MM on events with 2%+ edge
+                continue
+            # Check all markets have books
+            if all(m.outcomes[0].order_book for m in p.markets if m.outcomes):
+                partitions_with_books.append(p)
+
+        if not partitions_with_books:
+            return
+
+        # Determine quote size based on available capital
+        available = self._risk.available_capital
+        if available < 5:
+            return
+
+        quote_size = min(15.0, available * 0.10)  # 10% of available per quote
+
+        # Evaluate MM strategies
+        strategies = evaluate_mm_opportunities(
+            partitions_with_books,
+            bankroll=self._risk.effective_bankroll,
+            quote_size=quote_size,
+        )
+
+        if not strategies:
+            return
+
+        self._mm_strategies = strategies
+
+        # Cancel existing MM orders
+        if self._mm_active_orders:
+            await self._cancel_mm_orders()
+
+        # Place new quotes (paper mode logs, live mode places orders)
+        placed = 0
+        for strategy in strategies:
+            for quote in strategy.buy_quotes:
+                if self.mode == ExecutionMode.PAPER:
+                    log.info(
+                        "mm.quote.paper",
+                        event_name=strategy.event_title[:30],
+                        side=quote.side,
+                        price=f"${quote.price:.3f}",
+                        size=f"{quote.size:.0f}",
+                        edge=f"{strategy.edge:.3f}",
+                    )
+                    placed += 1
+                else:
+                    order_id = await self._place_mm_order(quote)
+                    if order_id:
+                        self._mm_active_orders[quote.var_key] = order_id
+                        placed += 1
+
+        if placed > 0:
+            total_cost = sum(q.price * q.size for s in strategies for q in s.buy_quotes)
+            total_edge_profit = sum(s.expected_profit_if_complete for s in strategies)
+            log.info(
+                "mm.refresh",
+                events=len(strategies),
+                quotes=placed,
+                cost=f"${total_cost:.2f}",
+                edge_profit=f"${total_edge_profit:.2f}",
+            )
+
+    async def _place_mm_order(self, quote: MMQuote) -> str | None:
+        """Place a single market-making limit order."""
+        if not self._live_executor._ensure_client():
+            return None
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            # Get token_id for the NO outcome
+            market = self._markets.get(quote.market_condition_id)
+            if not market or len(market.outcomes) < 2:
+                return None
+            token_id = market.outcomes[quote.outcome_idx].token_id
+            if not token_id:
+                return None
+
+            # Get book for neg_risk and tick_size
+            book = self._live_executor._client.get_order_book(token_id)
+
+            side = BUY if quote.side == "buy" else SELL
+            args = OrderArgs(
+                token_id=token_id,
+                price=quote.price,
+                size=quote.size,
+                side=side,
+            )
+            opts = PartialCreateOrderOptions(
+                tick_size=str(book.tick_size) if book.tick_size else "0.01",
+                neg_risk=bool(book.neg_risk),
+            )
+            resp = self._live_executor._client.create_and_post_order(args, opts)
+            order_id = resp.get("orderID") or resp.get("id") or ""
+            if order_id:
+                log.info("mm.order.placed", side=quote.side, price=f"${quote.price:.3f}",
+                         size=f"{quote.size:.0f}", order_id=order_id[:16])
+                return order_id
+        except Exception as e:
+            log.debug("mm.order.failed: %s", str(e)[:60])
+        return None
+
+    async def _cancel_mm_orders(self) -> None:
+        """Cancel all active market-making orders."""
+        if not self._live_executor._ensure_client():
+            return
+        for var_key, oid in list(self._mm_active_orders.items()):
+            try:
+                self._live_executor._client.cancel(oid)
+            except Exception:
+                pass
+        self._mm_active_orders.clear()
+
     def status(self) -> dict:
         """Return current pipeline status."""
         return {
@@ -384,5 +534,7 @@ class WebSocketPipeline:
             "ws_stats": self._ws.stats,
             "arb_checks": self._arb_checks,
             "trade_count": self._trade_count,
+            "mm_strategies": len(self._mm_strategies),
+            "mm_active_orders": len(self._mm_active_orders),
             **self._risk.summary(),
         }
