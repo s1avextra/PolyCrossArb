@@ -195,18 +195,24 @@ class CryptoPipeline:
                     best_fair = fv.fair_price
 
             # Log best opportunity every 10 cycles
-            if self._cycles % 10 == 0 and best_contract:
-                log.info(
-                    "crypto.scan",
-                    cycle=self._cycles,
-                    btc=f"${btc:,.0f}",
-                    vol=f"{vol:.1%}",
-                    best_edge=f"{best_edge:+.2%}",
-                    contract=best_contract.market.question[:50],
-                    market_price=f"${best_contract.yes_price:.3f}",
-                    fair=f"${best_fair:.3f}",
-                    latency=f"{self._price_feed.age_ms:.0f}ms",
-                )
+            if self._cycles % 10 == 0:
+                agg = self._price_feed.get_aggregated()
+                log_data = {
+                    "cycle": self._cycles,
+                    "btc": f"${btc:,.0f}",
+                    "sources": agg.n_sources,
+                    "spread": f"${agg.spread:.2f}",
+                    "vol": f"{vol:.1%}",
+                    "latency": f"{agg.staleness_ms:.0f}ms",
+                }
+                if best_contract:
+                    log_data.update({
+                        "best_edge": f"{best_edge:+.2%}",
+                        "contract": best_contract.market.question[:45],
+                        "mkt": f"${best_contract.yes_price:.3f}",
+                        "fair": f"${best_fair:.3f}",
+                    })
+                log.info("crypto.scan", **log_data)
 
             # Execute if edge exceeds threshold
             if best_contract and abs(best_edge) >= self._min_edge:

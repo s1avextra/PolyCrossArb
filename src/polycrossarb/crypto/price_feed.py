@@ -1,12 +1,19 @@
-"""Real-time BTC price feed from multiple exchanges.
+"""Real-time BTC price feed from 4 exchanges via WebSocket.
 
-Aggregates spot prices from free WebSocket/REST APIs:
-  - Binance (primary, ~100ms updates via WebSocket)
-  - CoinGecko (backup, REST, rate-limited)
-  - Kraken (secondary, WebSocket)
+Aggregates spot prices from:
+  - Binance  (wss://stream.binance.com, ~100ms updates)
+  - Bybit    (wss://stream.bybit.com, ~100ms updates)
+  - OKX      (wss://ws.okx.com, ~100ms updates)
+  - MEXC     (wss://wbs.mexc.com, ~200ms updates)
 
-Provides a weighted mid-price and tracks volatility for
-fair-value calculations.
+All WebSocket feeds are free and require no API keys for public market data.
+API keys are only needed for trading — not for price feeds.
+
+The aggregator computes:
+  - Weighted mid-price across all sources
+  - Cross-exchange spread (max price - min price)
+  - Rolling volatility for fair-value calculations
+  - Price staleness detection
 """
 from __future__ import annotations
 
@@ -16,9 +23,8 @@ import logging
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-import httpx
 import websockets
 
 log = logging.getLogger(__name__)
@@ -34,48 +40,84 @@ class PriceSnapshot:
     ask: float = 0.0
 
 
-class CryptoPriceFeed:
-    """Aggregated real-time BTC price feed.
+@dataclass
+class AggregatedPrice:
+    """Cross-exchange aggregated price."""
+    mid: float                  # weighted average across exchanges
+    spread: float               # max - min across exchanges (cross-exchange spread)
+    n_sources: int              # how many exchanges are live
+    staleness_ms: float         # ms since most recent update
+    sources: dict[str, float]   # exchange -> price
 
-    Connects to Binance WebSocket for ~100ms updates.
-    Falls back to REST polling if WebSocket fails.
-    Tracks rolling volatility for options pricing.
+
+class CryptoPriceFeed:
+    """Aggregated real-time BTC price from 4 exchanges.
+
+    All feeds are free public WebSocket streams — no API keys needed.
     """
 
+    STALE_THRESHOLD = 10.0  # seconds — mark source as stale after this
+
     def __init__(self):
-        self._prices: dict[str, PriceSnapshot] = {}  # source -> latest
-        self._price_history: deque[tuple[float, float]] = deque(maxlen=1000)  # (timestamp, price)
+        self._prices: dict[str, PriceSnapshot] = {}
+        self._price_history: deque[tuple[float, float]] = deque(maxlen=2000)
         self._running = False
         self._mid_price: float = 0.0
         self._volatility_24h: float = 0.50  # annualized, default 50%
         self._last_update: float = 0.0
+        self._update_count: int = 0
 
     @property
     def btc_price(self) -> float:
-        """Current best BTC/USD price."""
         return self._mid_price
 
     @property
     def volatility(self) -> float:
-        """Annualized volatility estimate."""
         return self._volatility_24h
 
     @property
     def age_ms(self) -> float:
-        """Milliseconds since last price update."""
-        return (time.time() - self._last_update) * 1000
+        return (time.time() - self._last_update) * 1000 if self._last_update else 99999
 
     @property
     def sources(self) -> dict[str, float]:
-        """Current price from each source."""
-        return {s: p.price for s, p in self._prices.items()}
+        now = time.time()
+        return {
+            s: p.price for s, p in self._prices.items()
+            if now - p.timestamp < self.STALE_THRESHOLD
+        }
+
+    @property
+    def n_live_sources(self) -> int:
+        return len(self.sources)
+
+    @property
+    def cross_exchange_spread(self) -> float:
+        """Price difference between highest and lowest exchange."""
+        prices = list(self.sources.values())
+        if len(prices) < 2:
+            return 0.0
+        return max(prices) - min(prices)
+
+    def get_aggregated(self) -> AggregatedPrice:
+        """Get current aggregated price snapshot."""
+        src = self.sources
+        return AggregatedPrice(
+            mid=self._mid_price,
+            spread=self.cross_exchange_spread,
+            n_sources=len(src),
+            staleness_ms=self.age_ms,
+            sources=src,
+        )
 
     async def start(self) -> None:
-        """Start all price feeds concurrently."""
+        """Start all 4 exchange feeds concurrently."""
         self._running = True
         await asyncio.gather(
             self._binance_ws(),
-            self._rest_poller(),
+            self._bybit_ws(),
+            self._okx_ws(),
+            self._mexc_ws(),
             return_exceptions=True,
         )
 
@@ -84,50 +126,54 @@ class CryptoPriceFeed:
 
     def _update_price(self, source: str, price: float, bid: float = 0, ask: float = 0):
         """Update price from a source and recalculate aggregate."""
+        if price <= 0:
+            return
+
         now = time.time()
         self._prices[source] = PriceSnapshot(
             price=price, source=source, timestamp=now, bid=bid, ask=ask,
         )
         self._last_update = now
+        self._update_count += 1
         self._price_history.append((now, price))
 
-        # Weighted mid: average across all sources (simple for now)
-        prices = [p.price for p in self._prices.values() if now - p.timestamp < 30]
-        if prices:
-            self._mid_price = sum(prices) / len(prices)
+        # Weighted mid: average across all live sources
+        live = {s: p.price for s, p in self._prices.items() if now - p.timestamp < self.STALE_THRESHOLD}
+        if live:
+            self._mid_price = sum(live.values()) / len(live)
 
-        # Update volatility estimate every 100 ticks
-        if len(self._price_history) % 100 == 0:
+        # Recalculate volatility every 200 ticks
+        if self._update_count % 200 == 0:
             self._recalc_volatility()
 
     def _recalc_volatility(self):
         """Estimate annualized volatility from recent price history."""
-        if len(self._price_history) < 20:
+        if len(self._price_history) < 50:
             return
 
-        returns = []
         items = list(self._price_history)
+        returns = []
         for i in range(1, len(items)):
             dt = items[i][0] - items[i - 1][0]
             if dt > 0 and items[i - 1][1] > 0:
                 log_return = math.log(items[i][1] / items[i - 1][1])
                 returns.append((log_return, dt))
 
-        if len(returns) < 10:
+        if len(returns) < 20:
             return
 
-        # Variance of returns, annualized
         avg_dt = sum(dt for _, dt in returns) / len(returns)
         mean_r = sum(r for r, _ in returns) / len(returns)
         var_r = sum((r - mean_r) ** 2 for r, _ in returns) / len(returns)
 
-        # Annualize: sqrt(var_per_second * seconds_per_year)
         if avg_dt > 0:
             var_per_second = var_r / avg_dt
-            self._volatility_24h = math.sqrt(var_per_second * 365.25 * 86400)
+            self._volatility_24h = min(5.0, math.sqrt(var_per_second * 365.25 * 86400))
+
+    # ── Exchange WebSocket Feeds ──────────────────────────────────
 
     async def _binance_ws(self):
-        """Binance BTC/USDT WebSocket feed (free, ~100ms updates)."""
+        """Binance BTC/USDT ticker (free, ~100ms)."""
         url = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
         while self._running:
             try:
@@ -137,32 +183,97 @@ class CryptoPriceFeed:
                         if not self._running:
                             break
                         try:
-                            data = json.loads(msg)
-                            price = float(data.get("c", 0))  # last price
-                            bid = float(data.get("b", 0))
-                            ask = float(data.get("a", 0))
-                            if price > 0:
-                                self._update_price("binance", price, bid, ask)
-                        except (json.JSONDecodeError, ValueError):
+                            d = json.loads(msg)
+                            self._update_price(
+                                "binance",
+                                float(d.get("c", 0)),
+                                float(d.get("b", 0)),
+                                float(d.get("a", 0)),
+                            )
+                        except (json.JSONDecodeError, ValueError, TypeError):
                             pass
             except Exception as e:
                 if self._running:
-                    log.warning("Binance WS error: %s, reconnecting...", e)
-                    await asyncio.sleep(5)
+                    log.debug("Binance WS: %s", e)
+                    await asyncio.sleep(3)
 
-    async def _rest_poller(self):
-        """REST fallback: poll CoinGecko every 10s."""
-        async with httpx.AsyncClient(timeout=10) as client:
-            while self._running:
-                try:
-                    resp = await client.get(
-                        "https://api.coingecko.com/api/v3/simple/price",
-                        params={"ids": "bitcoin", "vs_currencies": "usd"},
-                    )
-                    if resp.status_code == 200:
-                        price = resp.json().get("bitcoin", {}).get("usd", 0)
-                        if price > 0:
-                            self._update_price("coingecko", price)
-                except Exception:
-                    pass
-                await asyncio.sleep(10)
+    async def _bybit_ws(self):
+        """Bybit BTC/USDT ticker (free, ~100ms)."""
+        url = "wss://stream.bybit.com/v5/public/spot"
+        sub = {"op": "subscribe", "args": ["tickers.BTCUSDT"]}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("Bybit WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            d = json.loads(msg)
+                            data = d.get("data", {})
+                            price = float(data.get("lastPrice", 0))
+                            bid = float(data.get("bid1Price", 0))
+                            ask = float(data.get("ask1Price", 0))
+                            if price > 0:
+                                self._update_price("bybit", price, bid, ask)
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("Bybit WS: %s", e)
+                    await asyncio.sleep(3)
+
+    async def _okx_ws(self):
+        """OKX BTC/USDT ticker (free, ~100ms)."""
+        url = "wss://ws.okx.com:8443/ws/v5/public"
+        sub = {"op": "subscribe", "args": [{"channel": "tickers", "instId": "BTC-USDT"}]}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("OKX WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            d = json.loads(msg)
+                            data_list = d.get("data", [])
+                            if data_list and isinstance(data_list, list):
+                                data = data_list[0]
+                                price = float(data.get("last", 0))
+                                bid = float(data.get("bidPx", 0))
+                                ask = float(data.get("askPx", 0))
+                                if price > 0:
+                                    self._update_price("okx", price, bid, ask)
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("OKX WS: %s", e)
+                    await asyncio.sleep(3)
+
+    async def _mexc_ws(self):
+        """MEXC BTC/USDT ticker (free, ~200ms)."""
+        url = "wss://wbs.mexc.com/ws"
+        sub = {"method": "SUBSCRIPTION", "params": ["spot@public.miniTicker.v3.api@BTCUSDT@UTC+8"]}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("MEXC WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            d = json.loads(msg)
+                            data = d.get("d", {})
+                            price = float(data.get("c", 0))  # close/last price
+                            if price > 0:
+                                self._update_price("mexc", price)
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("MEXC WS: %s", e)
+                    await asyncio.sleep(3)
