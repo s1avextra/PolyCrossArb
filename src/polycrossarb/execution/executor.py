@@ -611,3 +611,232 @@ class LiveExecutor:
                 log.info("Cancelled order %s", oid[:16])
             except Exception:
                 log.warning("FAILED to cancel order %s — CHECK EXCHANGE MANUALLY", oid[:16])
+
+
+# ── Single-Leg Executor ──────────────────────────────────────────
+
+
+@dataclass
+class SingleLegResult:
+    """Result of a single-leg trade."""
+    success: bool
+    order_id: str = ""
+    filled_size: float = 0.0
+    fill_price: float = 0.0
+    cost: float = 0.0
+    fee: float = 0.0
+    slippage: float = 0.0
+    error: str = ""
+
+
+class SingleLegExecutor:
+    """Simplified executor for single-token trades.
+
+    Used by weather and crypto strategies where we buy ONE token
+    (not multi-leg arb). No all-or-nothing coordination needed.
+
+    Pre-flight: check balance, order book depth, minimum order.
+    Execute: place limit order, poll for fill, record in RiskManager.
+    Hold to resolution — no exit needed.
+    """
+
+    FILL_TIMEOUT = 30
+    FILL_POLL_INTERVAL = 2
+    MIN_ORDER_USD = 1.0
+    MIN_DEPTH_USD = 5.0
+
+    def __init__(self, risk_manager: RiskManager):
+        self.risk_manager = risk_manager
+        self._client = None
+        self._initialized = False
+
+    def _ensure_client(self) -> bool:
+        """Lazy-init the CLOB client. Same logic as LiveExecutor."""
+        if self._initialized:
+            return self._client is not None
+
+        from polycrossarb.config import settings
+        if not settings.poly_api_key or not settings.private_key:
+            log.error("SingleLeg: API keys not configured")
+            self._initialized = True
+            return False
+
+        try:
+            from eth_account import Account
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+
+            funder = Account.from_key(settings.private_key).address
+            self._client = ClobClient(
+                host=settings.poly_base_url,
+                key=settings.private_key,
+                chain_id=137,
+                signature_type=0,
+                funder=funder,
+            )
+            self._client.set_api_creds(ApiCreds(
+                api_key=settings.poly_api_key,
+                api_secret=settings.poly_api_secret,
+                api_passphrase=settings.poly_api_passphrase,
+            ))
+            self._initialized = True
+            log.info("SingleLeg CLOB client initialized")
+            return True
+        except Exception:
+            log.exception("SingleLeg: failed to init CLOB client")
+            self._initialized = True
+            return False
+
+    async def execute_single(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        neg_risk: bool = True,
+        event_id: str = "",
+    ) -> SingleLegResult:
+        """Execute a single-token trade.
+
+        Args:
+            token_id: The outcome token to buy/sell.
+            side: "buy" only (we hold to resolution).
+            price: Limit price.
+            size: Number of shares.
+            neg_risk: Whether this is a neg_risk market.
+            event_id: For cooldown and risk tracking.
+        """
+        import asyncio
+
+        if not self._ensure_client():
+            return SingleLegResult(success=False, error="CLOB client not configured")
+
+        # ── Pre-flight ────────────────────────────────────────────
+
+        order_value = price * size
+        if order_value < self.MIN_ORDER_USD:
+            return SingleLegResult(success=False, error=f"Order ${order_value:.2f} < ${self.MIN_ORDER_USD} minimum")
+
+        # Check balance
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            bal_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=0)
+            bal_data = self._client.get_balance_allowance(bal_params)
+            usdc_balance = int(bal_data.get("balance", 0)) / 1e6
+            if order_value > usdc_balance * 0.95:
+                return SingleLegResult(success=False, error=f"Order ${order_value:.2f} > balance ${usdc_balance:.2f}")
+        except Exception as e:
+            return SingleLegResult(success=False, error=f"Balance check failed: {e}")
+
+        # Check order book
+        try:
+            book = self._client.get_order_book(token_id)
+            neg_risk = bool(book.neg_risk)
+            tick_size = str(book.tick_size) if book.tick_size else "0.01"
+
+            # Must have ask depth (we're buying)
+            if not book.asks:
+                return SingleLegResult(success=False, error="No asks — can't buy")
+            ask_depth = sum(float(a.price) * float(a.size) for a in book.asks)
+            if ask_depth < self.MIN_DEPTH_USD:
+                return SingleLegResult(success=False, error=f"Ask depth ${ask_depth:.2f} < ${self.MIN_DEPTH_USD}")
+
+            # Must have bids (exitability — can sell if needed)
+            if not book.bids:
+                return SingleLegResult(success=False, error="No bids — can't exit")
+        except Exception as e:
+            return SingleLegResult(success=False, error=f"Book check failed: {e}")
+
+        # ── Place order ───────────────────────────────────────────
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+            from py_clob_client.order_builder.constants import BUY
+
+            args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side=BUY,
+            )
+            opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+            resp = self._client.create_and_post_order(args, opts)
+
+            if not resp or (isinstance(resp, dict) and resp.get("error")):
+                error_msg = resp.get("error", "unknown") if isinstance(resp, dict) else "empty"
+                return SingleLegResult(success=False, error=f"Order rejected: {error_msg}")
+
+            order_id = resp.get("orderID") or resp.get("id") or ""
+            if not order_id:
+                return SingleLegResult(success=False, error="No order ID returned")
+
+            log.info("SingleLeg: placed %s %.1f @ $%.4f id=%s", side, size, price, order_id[:16])
+
+        except Exception as e:
+            return SingleLegResult(success=False, error=f"Order failed: {str(e)[:80]}")
+
+        # ── Wait for fill ─────────────────────────────────────────
+
+        filled_size = 0.0
+        fill_price = price
+        deadline = time.time() + self.FILL_TIMEOUT
+
+        while time.time() < deadline:
+            await asyncio.sleep(self.FILL_POLL_INTERVAL)
+            try:
+                status = self._client.get_order(order_id)
+                matched = float(status.get("size_matched", 0))
+                if matched >= size * 0.95:
+                    filled_size = matched
+                    trades = status.get("associate_trades") or []
+                    if trades and isinstance(trades, list) and len(trades) > 0:
+                        try:
+                            fill_price = float(trades[0].get("price", price))
+                        except (ValueError, TypeError):
+                            pass
+                    break
+            except Exception:
+                pass
+
+        if filled_size < size * 0.50:
+            # Not enough filled — cancel
+            try:
+                self._client.cancel(order_id)
+            except Exception:
+                log.warning("SingleLeg: failed to cancel %s", order_id[:16])
+            return SingleLegResult(
+                success=False, order_id=order_id,
+                filled_size=filled_size, fill_price=fill_price,
+                error=f"Timeout: {filled_size:.1f}/{size:.1f} filled",
+            )
+
+        # ── Record trade ──────────────────────────────────────────
+
+        slippage = abs(fill_price - price)
+        cost = fill_price * filled_size
+
+        # Record in risk manager using a TradeOrder wrapper
+        trade_order = TradeOrder(
+            market_condition_id=event_id or token_id[:20],
+            outcome_idx=0,
+            side=side,
+            size=filled_size,
+            price=fill_price,
+            expected_cost=cost,
+            neg_risk=neg_risk,
+        )
+        self.risk_manager.record_trade([trade_order], event_id=event_id, paper=False)
+
+        log.info(
+            "SingleLeg: FILLED %.1f @ $%.4f (slippage $%.4f, cost $%.2f)",
+            filled_size, fill_price, slippage, cost,
+        )
+
+        return SingleLegResult(
+            success=True,
+            order_id=order_id,
+            filled_size=filled_size,
+            fill_price=fill_price,
+            cost=cost,
+            slippage=slippage,
+        )

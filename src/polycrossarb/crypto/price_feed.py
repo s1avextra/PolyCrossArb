@@ -64,6 +64,7 @@ class CryptoPriceFeed:
         self._running = False
         self._mid_price: float = 0.0
         self._volatility_24h: float = 0.50  # annualized, default 50%
+        self._implied_vol: float | None = None  # from Deribit
         self._last_update: float = 0.0
         self._update_count: int = 0
 
@@ -74,6 +75,11 @@ class CryptoPriceFeed:
     @property
     def volatility(self) -> float:
         return self._volatility_24h
+
+    @property
+    def implied_volatility(self) -> float:
+        """Deribit implied vol when available, else realized vol."""
+        return self._implied_vol if self._implied_vol else self._volatility_24h
 
     @property
     def age_ms(self) -> float:
@@ -111,13 +117,14 @@ class CryptoPriceFeed:
         )
 
     async def start(self) -> None:
-        """Start all 4 exchange feeds concurrently."""
+        """Start all 4 exchange feeds + Deribit IV concurrently."""
         self._running = True
         await asyncio.gather(
             self._binance_ws(),
             self._bybit_ws(),
             self._okx_ws(),
             self._mexc_ws(),
+            self._deribit_iv_loop(),
             return_exceptions=True,
         )
 
@@ -169,6 +176,18 @@ class CryptoPriceFeed:
         if avg_dt > 0:
             var_per_second = var_r / avg_dt
             self._volatility_24h = min(5.0, math.sqrt(var_per_second * 365.25 * 86400))
+
+    async def _deribit_iv_loop(self):
+        """Fetch Deribit implied volatility every 60s."""
+        from polycrossarb.crypto.deribit_vol import fetch_btc_implied_vol
+        while self._running:
+            try:
+                iv = await fetch_btc_implied_vol()
+                if iv and iv > 0:
+                    self._implied_vol = iv
+            except Exception:
+                pass
+            await asyncio.sleep(60)
 
     # ── Exchange WebSocket Feeds ──────────────────────────────────
 

@@ -40,16 +40,23 @@ class CryptoPipeline:
         self,
         mode: ExecutionMode = ExecutionMode.PAPER,
         log_dir: str = "logs",
-        min_edge: float = 0.02,     # 2% minimum edge to trade
-        scan_interval: float = 1.0,  # re-evaluate every 1 second
+        min_edge: float = 0.02,
+        scan_interval: float = 1.0,
+        risk_manager: RiskManager | None = None,
     ):
         self.mode = mode
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
 
         self._client = PolymarketClient()
-        self._risk = RiskManager()
+        self._risk = risk_manager or RiskManager()
         self._price_feed = CryptoPriceFeed()
+
+        if mode == ExecutionMode.LIVE:
+            from polycrossarb.execution.executor import SingleLegExecutor
+            self._executor = SingleLegExecutor(self._risk)
+        else:
+            self._executor = None
 
         self._contracts: list[CryptoContract] = []
         self._min_edge = min_edge
@@ -126,7 +133,7 @@ class CryptoPipeline:
         while self._running:
             self._cycles += 1
             btc = self._price_feed.btc_price
-            vol = self._price_feed.volatility
+            vol = self._price_feed.implied_volatility
 
             if btc <= 0:
                 await asyncio.sleep(self._scan_interval)
@@ -295,9 +302,32 @@ class CryptoPipeline:
             self._total_profit += expected_profit
             self._traded.add(contract.market.condition_id)
         else:
-            # Live: wire to executor (TODO)
-            log.info("crypto.trade.live", contract=contract.market.question[:45])
-            self._traded.add(contract.market.condition_id)
+            if not self._executor:
+                log.error("crypto: no executor for live mode")
+                return
+
+            # Determine token_id based on direction
+            token_id = contract.token_id  # YES token
+            if side == "buy_no" and len(contract.market.outcomes) > 1:
+                token_id = contract.market.outcomes[1].token_id
+
+            result = await self._executor.execute_single(
+                token_id=token_id,
+                side="buy",
+                price=price,
+                size=round(shares, 1),
+                neg_risk=contract.market.neg_risk,
+                event_id=contract.event_id,
+            )
+
+            if result.success:
+                self._trade_count += 1
+                self._total_profit += expected_profit
+                self._traded.add(contract.market.condition_id)
+                log.info("crypto.trade.filled", contract=contract.market.question[:40],
+                         fill_price=f"${result.fill_price:.4f}", cost=f"${result.cost:.2f}")
+            else:
+                log.warning("crypto.trade.failed", error=result.error)
 
         # Log to file
         entry = {

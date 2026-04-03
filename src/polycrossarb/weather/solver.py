@@ -110,6 +110,7 @@ def size_weather_trade(
         date=prediction.event.date,
         bracket=bracket.info.bracket_label,
         event_id=prediction.event.event_id,
+        neg_risk=bracket.market.neg_risk,
         token_id=bracket.token_id,
     )
 

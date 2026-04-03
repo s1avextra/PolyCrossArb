@@ -40,13 +40,21 @@ class WeatherPipeline:
         self,
         mode: ExecutionMode = ExecutionMode.PAPER,
         log_dir: str = "logs",
+        risk_manager: RiskManager | None = None,
     ):
         self.mode = mode
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
 
         self._client = PolymarketClient()
-        self._risk = RiskManager()
+        self._risk = risk_manager or RiskManager()
+
+        # Live executor for single-leg trades
+        if mode == ExecutionMode.LIVE:
+            from polycrossarb.execution.executor import SingleLegExecutor
+            self._executor = SingleLegExecutor(self._risk)
+        else:
+            self._executor = None
         self._weather = WeatherAggregator(
             owm_api_key=getattr(settings, 'openweathermap_api_key', ''),
         )
@@ -216,21 +224,36 @@ class WeatherPipeline:
             self._traded_events.add(event.event_id)
 
         else:
-            # Live: use existing executor infrastructure
-            log.info(
-                "weather.trade.live",
-                city=event.city,
-                date=event.date,
-                bracket=order.bracket,
-                confidence=f"{order.confidence:.0%}",
-                price=f"${order.price:.3f}",
-                size=f"{order.size:.0f}",
+            # Live: execute via SingleLegExecutor
+            if not self._executor:
+                log.error("weather: no executor configured for live mode")
+                return
+
+            result = await self._executor.execute_single(
+                token_id=order.token_id,
+                side="buy",
+                price=order.price,
+                size=order.size,
+                neg_risk=order.neg_risk,
+                event_id=event.event_id,
             )
-            # TODO: Wire to LiveExecutor for actual order placement
-            # For now, log as paper trade
-            self._trade_count += 1
-            self._total_profit += order.expected_profit
-            self._traded_events.add(event.event_id)
+
+            if result.success:
+                self._trade_count += 1
+                self._total_profit += order.expected_profit
+                self._traded_events.add(event.event_id)
+                log.info(
+                    "weather.trade.filled",
+                    city=event.city,
+                    bracket=order.bracket,
+                    fill_price=f"${result.fill_price:.4f}",
+                    slippage=f"${result.slippage:.4f}",
+                    cost=f"${result.cost:.2f}",
+                    confidence=f"{order.confidence:.0%}",
+                )
+            else:
+                log.warning("weather.trade.failed", city=event.city,
+                            bracket=order.bracket, error=result.error)
 
         # Log to file
         self._log_trade(event, prediction, order)

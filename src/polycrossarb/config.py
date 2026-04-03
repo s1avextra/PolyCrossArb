@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # Quarter Kelly: ~94% of growth rate, max drawdown ~12%.
     kelly_fraction: float = 0.25
 
+    # Weather strategy
+    min_weather_confidence: float = 0.80
+    max_weather_position_pct: float = 0.15
+
+    # Crypto strategy
+    min_crypto_edge: float = 0.03
+    max_crypto_position_pct: float = 0.10
+
     @field_validator("max_total_exposure_usd", "max_position_per_market_usd")
     @classmethod
     def must_be_positive(cls, v: float, info) -> float:
