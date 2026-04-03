@@ -141,6 +141,14 @@ class CryptoPipeline:
                 if contract.market.condition_id in self._traded:
                     continue
 
+                # FILTER: skip low volume (no liquidity, can't exit)
+                if contract.volume < 500:
+                    continue
+
+                # FILTER: skip contracts priced at extremes (stale/resolved)
+                if contract.yes_price < 0.02 or contract.yes_price > 0.98:
+                    continue
+
                 # Calculate days to expiry
                 try:
                     if contract.market.end_date:
@@ -149,9 +157,28 @@ class CryptoPipeline:
                         )
                         days = max(0.01, (end - now).total_seconds() / 86400)
                     else:
-                        days = 30  # default
+                        days = 30
                 except (ValueError, TypeError):
                     days = 30
+
+                # FILTER: skip expired or about-to-expire (< 1 hour)
+                if days < 0.04:  # ~1 hour
+                    continue
+
+                # FILTER: only trade contracts where strike is within
+                # reasonable range of current price (not "ETH to $10k")
+                if contract.asset == "BTC":
+                    price_ratio = contract.strike / btc if btc > 0 else 999
+                elif contract.asset == "ETH":
+                    # Rough ETH price — we don't have a feed for it yet
+                    # Skip ETH contracts for now unless we add an ETH feed
+                    continue
+                else:
+                    continue
+
+                # Only trade contracts where strike is within 20% of current price
+                if price_ratio > 1.20 or price_ratio < 0.80:
+                    continue
 
                 # Compute fair value
                 fv = compute_fair_value(

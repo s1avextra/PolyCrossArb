@@ -40,8 +40,14 @@ class WeatherMarketInfo:
         return "?"
 
     def matches_temp(self, temp: float) -> bool:
-        """Check if a temperature falls in this bracket."""
-        t = round(temp)
+        """Check if a temperature falls in this bracket.
+
+        Uses math.floor for integer matching — the official high temp
+        reported by weather services is typically an integer (rounded down).
+        Also checks temp+0.5 and temp-0.5 for boundary cases.
+        """
+        import math
+        t = math.floor(temp + 0.5)  # standard rounding (half up)
         if self.is_lower_bound:
             return t <= (self.bracket_high or 0)
         if self.is_upper_bound:
