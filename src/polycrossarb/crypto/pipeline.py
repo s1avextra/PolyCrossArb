@@ -40,8 +40,8 @@ class CryptoPipeline:
         self,
         mode: ExecutionMode = ExecutionMode.PAPER,
         log_dir: str = "logs",
-        min_edge: float = 0.03,     # 3% minimum edge to trade
-        scan_interval: float = 2.0,  # re-evaluate every 2 seconds
+        min_edge: float = 0.02,     # 2% minimum edge to trade
+        scan_interval: float = 1.0,  # re-evaluate every 1 second
     ):
         self.mode = mode
         self.log_dir = Path(log_dir)
@@ -141,53 +141,81 @@ class CryptoPipeline:
                 if contract.market.condition_id in self._traded:
                     continue
 
-                # FILTER: skip low volume (no liquidity, can't exit)
-                if contract.volume < 500:
+                # FILTER: skip low volume
+                if contract.volume < 100:
                     continue
 
-                # FILTER: skip contracts priced at extremes (stale/resolved)
-                if contract.yes_price < 0.02 or contract.yes_price > 0.98:
-                    continue
-
-                # Calculate days to expiry
+                # Calculate time to expiry
                 try:
                     if contract.market.end_date:
                         end = datetime.fromisoformat(
                             contract.market.end_date.replace("Z", "+00:00")
                         )
-                        days = max(0.01, (end - now).total_seconds() / 86400)
+                        hours_left = (end - now).total_seconds() / 3600
+                        days = max(0.001, hours_left / 24)
                     else:
-                        days = 30
+                        continue  # no expiry = skip
                 except (ValueError, TypeError):
-                    days = 30
-
-                # FILTER: skip expired or about-to-expire (< 1 hour)
-                if days < 0.04:  # ~1 hour
                     continue
 
-                # FILTER: only trade contracts where strike is within
-                # reasonable range of current price (not "ETH to $10k")
-                if contract.asset == "BTC":
-                    price_ratio = contract.strike / btc if btc > 0 else 999
-                elif contract.asset == "ETH":
-                    # Rough ETH price — we don't have a feed for it yet
-                    # Skip ETH contracts for now unless we add an ETH feed
-                    continue
-                else:
+                # CORE FILTER: only trade contracts resolving within 24 hours
+                # This is where the edge lives — fast capital turnover
+                if hours_left > 24 or hours_left < 0.1:  # skip >24h and <6min
                     continue
 
-                # Only trade contracts where strike is within 20% of current price
-                if price_ratio > 1.20 or price_ratio < 0.80:
+                # Only BTC for now (we have the price feed)
+                if contract.asset != "BTC":
                     continue
+
+                strike = contract.strike
+                price_ratio = strike / btc if btc > 0 else 999
+
+                # STRATEGY: buy near-certain outcomes that the market underprices
+                #
+                # BTC at $66,666. Contract: "BTC above $60,000 in 4 hours?"
+                # Fair value: ~99% (BTC won't drop 10% in 4 hours)
+                # Market price: maybe 92-95% (stale or risk-adjusted)
+                # Edge: 4-7% on a near-certain outcome
+                #
+                # We ONLY buy contracts where:
+                #   - BTC is already well above the strike (ratio < 0.95)
+                #   - OR BTC is well below the strike and we buy NO (ratio > 1.05)
+                # These are the "obvious" outcomes the market is slow to price
+
+                if contract.direction == "above":
+                    if price_ratio < 0.95:
+                        # BTC is 5%+ above strike — very likely to stay above
+                        # Fair value is high (90-99%)
+                        pass  # eligible
+                    elif price_ratio > 1.05:
+                        # BTC is 5%+ below strike — unlikely to reach it
+                        # Fair value is low — buy NO if market overprices YES
+                        pass  # eligible
+                    else:
+                        # Strike is near current price — coin flip, skip
+                        continue
 
                 # Compute fair value
                 fv = compute_fair_value(
                     btc_price=btc,
-                    strike=contract.strike,
+                    strike=strike,
                     days_to_expiry=days,
                     volatility=vol,
                     market_price=contract.yes_price,
                 )
+
+                # FILTER: skip if fair value is in the uncertain zone (30-70%)
+                # We only want near-certain outcomes
+                if 0.30 < fv.fair_price < 0.70:
+                    continue
+
+                # FILTER: minimum edge 2%
+                if abs(fv.edge_pct) < self._min_edge:
+                    continue
+
+                # FILTER: skip stale extremes (already priced in)
+                if contract.yes_price < 0.02 or contract.yes_price > 0.98:
+                    continue
 
                 if abs(fv.edge_pct) > abs(best_edge):
                     best_edge = fv.edge_pct

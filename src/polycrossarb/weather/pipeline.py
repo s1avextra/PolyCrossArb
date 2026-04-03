@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
@@ -144,12 +145,20 @@ class WeatherPipeline:
         """Evaluate all active weather events for trading opportunities."""
         priority = get_trading_priority(self._events)
 
-        for event in priority[:20]:  # top 20 by urgency
+        for event in priority[:20]:
             if event.event_id in self._traded_events:
-                continue  # already traded this one
+                continue
 
             if not event.city_config:
                 continue
+
+            # ONLY trade events resolving within 12 hours
+            # This is where the edge lives — we know the temperature,
+            # the market is slow to update, capital returns fast
+            if event.resolution_utc:
+                hours_left = (event.resolution_utc - datetime.now(timezone.utc)).total_seconds() / 3600
+                if hours_left > 12 or hours_left < 0:
+                    continue
 
             # Get latest temperature reading
             reading = await self._weather.fetch(event.city_config)
