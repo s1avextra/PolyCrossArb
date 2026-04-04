@@ -12,3 +12,4 @@ snapshots/
 snapshots*/
 *.pdf
 state.json
+rust_engine/target/
