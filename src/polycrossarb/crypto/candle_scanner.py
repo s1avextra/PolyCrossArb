@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 # Patterns for candle markets
 _CANDLE_RE = re.compile(
-    r"(?:Bitcoin|BTC)\s+Up or Down\s*[-–—]\s*(.+?)(?:\?|$)",
+    r"(?:Bitcoin|BTC|Ethereum|ETH|Solana|SOL)\s+Up or Down\s*[-–—]\s*(.+?)(?:\?|$)",
     re.IGNORECASE,
 )
 

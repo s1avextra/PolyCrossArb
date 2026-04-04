@@ -63,14 +63,35 @@ class CryptoPriceFeed:
         self._price_history: deque[tuple[float, float]] = deque(maxlen=2000)
         self._running = False
         self._mid_price: float = 0.0
-        self._volatility_24h: float = 0.50  # annualized, default 50%
-        self._implied_vol: float | None = None  # from Deribit
+        self._volatility_24h: float = 0.50
+        self._implied_vol: float | None = None
         self._last_update: float = 0.0
         self._update_count: int = 0
+
+        # Multi-asset price tracking
+        self._asset_prices: dict[str, dict[str, float]] = {}  # asset -> {source: price}
+        self._asset_mid: dict[str, float] = {}  # asset -> mid price
 
     @property
     def btc_price(self) -> float:
         return self._mid_price
+
+    def get_price(self, asset: str) -> float:
+        """Get mid price for any tracked asset (BTC, ETH, SOL)."""
+        if asset.upper() == "BTC":
+            return self._mid_price
+        return self._asset_mid.get(asset.upper(), 0.0)
+
+    def _update_asset_price(self, asset: str, source: str, price: float):
+        """Update price for any tracked asset."""
+        if price <= 0:
+            return
+        asset = asset.upper()
+        if asset not in self._asset_prices:
+            self._asset_prices[asset] = {}
+        self._asset_prices[asset][source] = price
+        prices = list(self._asset_prices[asset].values())
+        self._asset_mid[asset] = sum(prices) / len(prices)
 
     @property
     def volatility(self) -> float:
@@ -192,8 +213,8 @@ class CryptoPriceFeed:
     # ── Exchange WebSocket Feeds ──────────────────────────────────
 
     async def _binance_ws(self):
-        """Binance BTC/USDT ticker (free, ~100ms)."""
-        url = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
+        """Binance BTC+ETH+SOL/USDT tickers (free, ~100ms)."""
+        url = "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker"
         while self._running:
             try:
                 async with websockets.connect(url, ping_interval=20) as ws:
@@ -203,12 +224,17 @@ class CryptoPriceFeed:
                             break
                         try:
                             d = json.loads(msg)
-                            self._update_price(
-                                "binance",
-                                float(d.get("c", 0)),
-                                float(d.get("b", 0)),
-                                float(d.get("a", 0)),
-                            )
+                            data = d.get("data", d)
+                            symbol = data.get("s", "").upper()
+                            price = float(data.get("c", 0))
+                            bid = float(data.get("b", 0))
+                            ask = float(data.get("a", 0))
+                            if symbol == "BTCUSDT":
+                                self._update_price("binance", price, bid, ask)
+                            elif symbol == "ETHUSDT":
+                                self._update_asset_price("ETH", "binance", price)
+                            elif symbol == "SOLUSDT":
+                                self._update_asset_price("SOL", "binance", price)
                         except (json.JSONDecodeError, ValueError, TypeError):
                             pass
             except Exception as e:

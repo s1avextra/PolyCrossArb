@@ -59,7 +59,9 @@ async def main(mode: str, duration: int | None):
     print(f"  BTC: ${s['btc_price']:,.2f} | Sources: {s['sources']}")
     print(f"  Contracts: {s['contracts']}")
     print(f"  Trades: {s['trades']}")
-    print(f"  Profit: ${s['total_profit']:.2f}")
+    print(f"  Expected: ${s.get('expected_profit', 0):.2f}")
+    print(f"  Realized: ${s.get('realized_profit', 0):.2f}")
+    print(f"  Win Rate: {s.get('win_rate', '?')}")
     print(f"{'='*50}")
 
 
