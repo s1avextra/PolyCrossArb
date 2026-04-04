@@ -68,6 +68,10 @@ class CandlePipeline:
         self._wins = 0
         self._losses = 0
         self._total_profit = 0.0
+        self._realized_profit = 0.0  # actual resolved P&L
+
+        # Paper resolution tracking: {contract_id -> {direction, entry_price, size, open_btc, end_time}}
+        self._paper_positions: dict[str, dict] = {}
         self._min_confidence = min_confidence
         self._min_edge = min_edge
         self._running = False
@@ -86,6 +90,7 @@ class CandlePipeline:
                 self._price_feed.start(),
                 self._scan_loop(),
                 self._contract_refresh_loop(),
+                self._paper_resolution_loop(),
             )
         except asyncio.CancelledError:
             pass
@@ -106,6 +111,70 @@ class CandlePipeline:
         markets = await self._client.fetch_all_active_markets(min_liquidity=0)
         self._contracts = scan_candle_markets(markets, max_hours=1.0, min_liquidity=50)
         log.info("candle.scan", contracts=len(self._contracts))
+
+    async def _paper_resolution_loop(self):
+        """Resolve paper positions when their candle window expires.
+
+        Checks every 10 seconds if any paper positions have passed
+        their end time. If so, compares the open BTC price to the
+        current BTC price to determine if "Up" or "Down" won.
+        """
+        while self._running:
+            await asyncio.sleep(10)
+            if not self._paper_positions:
+                continue
+
+            now_ts = time.time()
+            btc = self._price_feed.btc_price
+            if btc <= 0:
+                continue
+
+            resolved = []
+            for cid, pos in list(self._paper_positions.items()):
+                if now_ts < pos["end_time"]:
+                    continue  # not yet resolved
+
+                # Determine actual outcome
+                open_btc = pos["open_btc"]
+                actual_direction = "up" if btc >= open_btc else "down"
+                predicted = pos["direction"]
+                won = actual_direction == predicted
+
+                entry_price = pos["entry_price"]
+                size = pos["size"]
+
+                if won:
+                    # Token resolves to $1.00
+                    pnl = (1.0 - entry_price) * size
+                    self._wins += 1
+                else:
+                    # Token resolves to $0.00
+                    pnl = -entry_price * size
+                    self._losses += 1
+
+                self._realized_profit += pnl
+
+                # Free up capital in risk manager
+                key = f"{cid}:0"
+                self._risk.close_position(key, 1.0 if won else 0.0)
+
+                log.info(
+                    "candle.resolved",
+                    direction=predicted,
+                    actual=actual_direction,
+                    won=won,
+                    pnl=f"${pnl:+.2f}",
+                    open_btc=f"${open_btc:,.0f}",
+                    close_btc=f"${btc:,.0f}",
+                    total_wins=self._wins,
+                    total_losses=self._losses,
+                    realized=f"${self._realized_profit:.2f}",
+                )
+
+                resolved.append(cid)
+
+            for cid in resolved:
+                del self._paper_positions[cid]
 
     async def _contract_refresh_loop(self):
         """Refresh every 2 minutes to catch new candle windows."""
@@ -285,6 +354,19 @@ class CandlePipeline:
             self._total_profit += expected_profit
             self._traded.add(contract.market.condition_id)
 
+            # Track for paper resolution
+            try:
+                end = datetime.fromisoformat(contract.end_date.replace("Z", "+00:00"))
+                self._paper_positions[contract.market.condition_id] = {
+                    "direction": signal.direction,
+                    "entry_price": market_price,
+                    "size": shares,
+                    "open_btc": signal.open_price,
+                    "end_time": end.timestamp(),
+                }
+            except (ValueError, TypeError):
+                pass
+
         elif self._executor:
             result = await self._executor.execute_single(
                 token_id=token_id,
@@ -324,11 +406,17 @@ class CandlePipeline:
             f.write(json.dumps(entry) + "\n")
 
     def status(self) -> dict:
+        win_rate = self._wins / max(self._wins + self._losses, 1)
         return {
             "mode": self.mode,
             "contracts": len(self._contracts),
             "trades": self._trade_count,
-            "total_profit": round(self._total_profit, 2),
+            "expected_profit": round(self._total_profit, 2),
+            "realized_profit": round(self._realized_profit, 2),
+            "wins": self._wins,
+            "losses": self._losses,
+            "win_rate": f"{win_rate:.0%}",
+            "open_positions": len(self._paper_positions),
             "btc_price": self._price_feed.btc_price,
             "sources": self._price_feed.n_live_sources,
         }

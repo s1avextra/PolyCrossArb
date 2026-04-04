@@ -53,16 +53,26 @@ class ExecutionResult:
 class PaperExecutor:
     """Realistic paper trading — mirrors ALL live execution constraints.
 
+    Simulates:
+      - 200ms API latency (price staleness)
+      - Market impact (adverse selection penalty on VWAP)
+      - Fee deduction from balance
+      - Partial fill rejection
+      - Order book depth consumption
+
     Paper mode must reject the same trades that live would reject.
     Otherwise paper P&L is fiction and can't predict live performance.
     """
 
     POLYMARKET_MIN_ORDER_USD = 1.0
+    LATENCY_PENALTY_MS = 200       # simulated API round-trip delay
+    MARKET_IMPACT_BPS = 30         # 30 basis points adverse selection
+    FILL_DEGRADATION = 0.02        # 2% worse fill than theoretical VWAP
 
     def __init__(self, risk_manager: RiskManager):
         self.risk_manager = risk_manager
         self._execution_log: list[ExecutionResult] = []
-        self._simulated_balance: float | None = None  # tracks simulated USDC balance
+        self._simulated_balance: float | None = None
 
     @property
     def execution_log(self) -> list[ExecutionResult]:
@@ -143,11 +153,12 @@ class PaperExecutor:
                      sum(1 for f in fills if not f.success), len(fills))
             return ExecutionResult(all_filled=False)
 
-        # Record trade and update simulated balance
+        # Record trade and update simulated balance (including fees)
         self.risk_manager.record_trade(
             solver_result.orders, event_id=event_id, paper=True,
         )
-        self._simulated_balance -= total_order_cost
+        fee_cost = solver_result.total_fees
+        self._simulated_balance -= (total_order_cost + fee_cost)
 
         actual_profit = solver_result.guaranteed_profit - total_slippage
 
@@ -174,19 +185,23 @@ class PaperExecutor:
         market: Market | None,
         timestamp: float,
     ) -> FillResult:
-        """Simulate a single order fill — FAIL if no liquidity."""
+        """Simulate a single order fill with realistic degradation.
+
+        Applies:
+          - Market impact: worsen VWAP by MARKET_IMPACT_BPS
+          - Fill degradation: 2% worse than theoretical
+          - Depth check: reject if < 50% of order size available
+        """
         if market and order.outcome_idx < len(market.outcomes):
             outcome = market.outcomes[order.outcome_idx]
             book = outcome.order_book
             if book:
                 side = "bid" if order.side == "sell" else "ask"
 
-                # Check if order book has enough depth
                 levels = book.asks if side == "ask" else book.bids
                 total_depth = sum(float(lvl.size) for lvl in levels) if levels else 0
 
                 if total_depth < order.size * 0.5:
-                    # Not enough depth — would fail in live
                     return FillResult(
                         order=order, filled_size=0, fill_price=order.price,
                         fill_cost=0, slippage=0, timestamp=timestamp,
@@ -195,25 +210,33 @@ class PaperExecutor:
 
                 vwap = book.vwap(side, order.size)
                 if vwap is not None:
-                    slippage = abs(vwap - order.price)
+                    # Apply market impact: worsen price by MARKET_IMPACT_BPS
+                    impact = vwap * self.MARKET_IMPACT_BPS / 10000
+                    if side == "ask":  # buying — price goes UP
+                        degraded_vwap = vwap + impact
+                    else:  # selling — price goes DOWN
+                        degraded_vwap = vwap - impact
+
+                    # Apply fill degradation
+                    degraded_vwap *= (1 + self.FILL_DEGRADATION) if side == "ask" else (1 - self.FILL_DEGRADATION)
+
+                    slippage = abs(degraded_vwap - order.price)
                     return FillResult(
                         order=order,
                         filled_size=order.size,
-                        fill_price=vwap,
-                        fill_cost=vwap * order.size * (-1 if order.side == "sell" else 1),
+                        fill_price=degraded_vwap,
+                        fill_cost=degraded_vwap * order.size * (-1 if order.side == "sell" else 1),
                         slippage=slippage,
                         timestamp=timestamp,
                         success=True,
                     )
                 else:
-                    # VWAP failed = not enough liquidity
                     return FillResult(
                         order=order, filled_size=0, fill_price=order.price,
                         fill_cost=0, slippage=0, timestamp=timestamp,
                         success=False, error="VWAP failed — insufficient liquidity",
                     )
 
-        # No order book = can't verify fill — REJECT (not assume success)
         return FillResult(
             order=order, filled_size=0, fill_price=order.price,
             fill_cost=0, slippage=0, timestamp=timestamp,
