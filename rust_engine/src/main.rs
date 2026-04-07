@@ -15,6 +15,7 @@
 //!   Rust → stdout:  JSON lines with trade signals (LatencySignal)
 //!   Rust → stderr:  Latency reports + diagnostics
 
+mod clob;
 mod exchange;
 mod fair_value;
 mod latency;
@@ -177,6 +178,29 @@ async fn main() {
             ps.mid_price, ps.n_live_sources(), ps.spread);
     }
 
+    // CLOB client for direct order placement (hot path)
+    let clob_enabled = std::env::var("CLOB_DIRECT").unwrap_or_default() == "1";
+    let clob_client = if clob_enabled {
+        let base_url = std::env::var("POLY_BASE_URL")
+            .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
+        let api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
+        let api_secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
+        let api_passphrase = std::env::var("POLY_API_PASSPHRASE").unwrap_or_default();
+        if api_key.is_empty() {
+            eprintln!("CLOB_DIRECT=1 but POLY_API_KEY not set — falling back to signal-only mode");
+            None
+        } else {
+            let client = clob::create_shared_client(&base_url, &api_key, &api_secret, &api_passphrase);
+            // Pre-warm connection pool
+            client.write().await.warm_connection().await;
+            eprintln!("CLOB direct order placement ENABLED (0% maker fees)");
+            Some(client)
+        }
+    } else {
+        eprintln!("CLOB direct placement disabled (set CLOB_DIRECT=1 to enable)");
+        None
+    };
+
     // Edge accumulator with default config
     let mut accumulator = edge::EdgeAccumulator::new(edge::EdgeConfig::default());
 
@@ -312,10 +336,35 @@ async fn main() {
                 tick_ns,
                 ds,
             ) {
-                // Output signal as JSON line to stdout
+                // Output signal as JSON line to stdout (always, for Python monitoring)
                 if let Ok(json) = serde_json::to_string(&signal) {
                     println!("{}", json);
                 }
+
+                // Direct CLOB order placement (hot path — bypasses Python)
+                if let Some(ref clob) = clob_client {
+                    let clob = clob.clone();
+                    let sig = signal.clone();
+                    tokio::spawn(async move {
+                        let mut client = clob.write().await;
+                        // Place maker order (GTC = 0% fee + rebate)
+                        // Price: use MM's stale ask (we're buying at their old price)
+                        let tick = 0.01_f64;
+                        let price = (sig.mm_price / tick).round() * tick;
+                        let size = (sig.size_usd / price).round().max(1.0);
+                        match client.place_maker_order(
+                            &sig.token_id,
+                            price,
+                            size,
+                            "BUY",
+                        ).await {
+                            Ok(oid) => eprintln!("CLOB order OK: {} edge={:.1}% id={}",
+                                sig.direction, sig.edge * 100.0, &oid[..16.min(oid.len())]),
+                            Err(e) => eprintln!("CLOB order FAIL: {}", &e[..80.min(e.len())]),
+                        }
+                    });
+                }
+
                 tick_signals += 1;
                 if debug_mode {
                     debug_stats.signals_emitted += 1;

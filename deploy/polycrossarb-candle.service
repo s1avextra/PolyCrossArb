@@ -1,0 +1,17 @@
+[Unit]
+Description=PolyCrossArb candle pipeline
+After=network-online.target
+
+[Service]
+Type=simple
+User=polycrossarb
+WorkingDirectory=/opt/polycrossarb
+EnvironmentFile=/opt/polycrossarb/.env
+ExecStart=/usr/local/bin/uv run python scripts/run_production.py --mode paper
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -13,6 +13,7 @@ dependencies = [
     "networkx>=3.2",
     "structlog>=24.1",
     "python-dotenv>=1.0",
+    "sortedcontainers>=2.4",
 ]
 
 [project.optional-dependencies]
