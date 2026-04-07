@@ -56,6 +56,13 @@ class Pipeline:
         self._cycle_count = 0
         self._running = False
 
+        # Enable on-chain execution in live mode for split/merge arbs
+        if mode == ExecutionMode.LIVE and not settings.enable_onchain_execution:
+            import os
+            os.environ["ENABLE_ONCHAIN_EXECUTION"] = "true"
+            from polycrossarb import config
+            config.settings = config.Settings()
+
     async def run(self, max_cycles: int | None = None) -> None:
         """Run the pipeline loop."""
         self._running = True

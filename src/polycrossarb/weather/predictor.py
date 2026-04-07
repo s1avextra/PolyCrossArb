@@ -41,6 +41,7 @@ def predict_outcome(
     event: WeatherEvent,
     reading: TemperatureReading,
     now: datetime | None = None,
+    forecast_max: float | None = None,
 ) -> BracketPrediction | None:
     """Predict which bracket will win based on current weather data.
 
@@ -114,11 +115,32 @@ def predict_outcome(
 
     confidence = min(0.99, max(0.10, base_confidence + boundary_adj + time_adj))
 
+    # ── Forecast-based confidence (for events 12-36h out) ────────
+    # When we have a forecast, use it instead of observed-temp confidence
+    # if it produces a higher signal (forecast is forward-looking).
+    if forecast_max is not None:
+        forecast_bracket = event.find_bracket_for_temp(forecast_max)
+        if forecast_bracket is not None:
+            winning = forecast_bracket
+            forecast_margin = _bracket_margin(forecast_bracket.info, forecast_max)
+            if forecast_margin >= 2:
+                forecast_confidence = 0.85
+            elif forecast_margin >= 1:
+                forecast_confidence = 0.75
+            else:
+                forecast_confidence = 0.55
+            # Use forecast confidence if it's better than observed
+            if forecast_confidence > confidence:
+                confidence = forecast_confidence
+                max_temp = forecast_max
+
     reason_parts = []
     reason_parts.append(f"max_temp={max_temp:.1f}°{event.unit}")
     reason_parts.append(f"bracket={winning.info.bracket_label}")
     reason_parts.append(f"hours_past_peak={hours_past_peak:.1f}")
     reason_parts.append(f"margin={bracket_margin:.1f}°")
+    if forecast_max is not None:
+        reason_parts.append(f"forecast_max={forecast_max:.1f}°{event.unit}")
     reason = ", ".join(reason_parts)
 
     return BracketPrediction(

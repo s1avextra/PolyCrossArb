@@ -32,8 +32,10 @@ from polycrossarb.execution.executor import ExecutionMode, SingleLegExecutor
 from polycrossarb.risk.manager import RiskManager
 from polycrossarb.solver.linear import TradeOrder
 from polycrossarb.crypto.candle_scanner import CandleContract, scan_candle_markets
+from polycrossarb.crypto.fair_value import compute_fair_value
 from polycrossarb.crypto.momentum import MomentumDetector, MomentumSignal
 from polycrossarb.crypto.price_feed import CryptoPriceFeed
+from polycrossarb.monitoring.alerter import alert_circuit_breaker, alert_trade
 from polycrossarb.monitoring.session_monitor import SessionMonitor
 
 log = structlog.get_logger(__name__)
@@ -277,6 +279,13 @@ class CandlePipeline:
             # Check circuit breaker after resolutions
             if resolved and self._check_circuit_breaker():
                 self._breaker_tripped = True
+                total_resolved = self._wins + self._losses
+                wr = self._wins / max(total_resolved, 1)
+                alert_circuit_breaker("candle", "auto-stop triggered", {
+                    "win_rate": f"{wr:.0%}",
+                    "drawdown": f"${self._peak_profit - self._realized_profit:.2f}",
+                    "trades": total_resolved,
+                })
                 log.warning("candle.circuit_breaker.tripped",
                             wins=self._wins, losses=self._losses,
                             realized=f"${self._realized_profit:.2f}")
@@ -490,8 +499,45 @@ class CandlePipeline:
                     self._monitor.record_signal_skip(cid, f"price_out_of_range_{market_price:.2f}")
                     continue
 
-                # Fair value: confidence that this direction wins
-                fair_value = 0.5 + (signal.confidence - 0.5) * 0.8  # dampen confidence
+                # ── YES+NO mispricing check ────────────────────────────
+                # If up_price + down_price != 1.0, there's a risk-free
+                # arb on top of directional edge. Log it.
+                vig = contract.up_price + contract.down_price - 1.0
+                if abs(vig) > 0.02:
+                    log.info("candle.mispricing",
+                             cid=cid[:16],
+                             up=f"${contract.up_price:.3f}",
+                             down=f"${contract.down_price:.3f}",
+                             vig=f"{vig:+.3f}")
+
+                # ── Black-Scholes fair value ───────────────────────────
+                # Use BS binary pricing with vol + time remaining instead
+                # of the old heuristic dampening.
+                vol = self._price_feed.implied_volatility
+                days_remaining = minutes_left / 1440.0
+                open_btc = signal.open_price
+
+                if signal.direction == "up":
+                    # P(BTC > open_price at expiry) via BS
+                    fv_result = compute_fair_value(
+                        btc_price=btc,
+                        strike=open_btc,
+                        days_to_expiry=days_remaining,
+                        volatility=vol,
+                        market_price=market_price,
+                    )
+                    fair_value = fv_result.fair_price
+                else:
+                    # P(BTC < open_price) = 1 - P(BTC > open_price)
+                    fv_result = compute_fair_value(
+                        btc_price=btc,
+                        strike=open_btc,
+                        days_to_expiry=days_remaining,
+                        volatility=vol,
+                        market_price=market_price,
+                    )
+                    fair_value = 1.0 - fv_result.fair_price
+
                 edge = fair_value - market_price
 
                 # Cap edge at realistic maximum — edges >25% signal stale prices
@@ -535,10 +581,10 @@ class CandlePipeline:
                          contracts=len(self._contracts),
                          trades=self._trade_count)
 
-            # 1-second interval
+            # 500ms interval — 2Hz evaluation for lower latency
             elapsed = time.time() - t0
-            if elapsed < 1.0:
-                await asyncio.sleep(1.0 - elapsed)
+            if elapsed < 0.5:
+                await asyncio.sleep(0.5 - elapsed)
 
     def _estimate_window_minutes(self, contract: CandleContract) -> float:
         """Estimate the window length from the description."""
@@ -607,8 +653,10 @@ class CandlePipeline:
 
         if self.mode == ExecutionMode.PAPER:
             # Apply realistic slippage and fees for paper trading
-            slippage_bps = 30  # 30 bps market impact
-            fee_rate = 0.002   # 20 bps fee
+            # Use maker order strategy: 0% fee + potential rebate
+            # vs taker at 1.8%. Place limit 1 tick inside spread.
+            slippage_bps = 10  # 10 bps for maker (less than 30 bps taker impact)
+            fee_rate = 0.0     # 0% maker fee (Polymarket maker rebate)
             slipped_price = market_price * (1 + slippage_bps / 10000)
             slipped_price = min(slipped_price, 0.99)
             shares = position / slipped_price  # recalc with slipped price

@@ -102,6 +102,32 @@ class WeatherAggregator:
 
         return reading
 
+    async def fetch_forecast_max(self, cfg: CityConfig) -> float | None:
+        """Fetch tomorrow's forecast high from Open-Meteo (free, no key).
+
+        Returns the forecasted max temperature for tomorrow in the city's unit,
+        or None on failure.
+        """
+        try:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": cfg.lat,
+                "longitude": cfg.lon,
+                "daily": "temperature_2m_max",
+                "timezone": "auto",
+                "forecast_days": 2,
+                "temperature_unit": "fahrenheit" if cfg.temp_unit == "F" else "celsius",
+            }
+            resp = await self._client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            daily_maxes = data.get("daily", {}).get("temperature_2m_max", [])
+            if len(daily_maxes) >= 2:
+                return float(daily_maxes[1])  # index 1 = tomorrow
+        except Exception:
+            log.debug("Open-Meteo forecast failed for %s", cfg.name)
+        return None
+
     def get_max_observed(self, city: str) -> float | None:
         """Get the highest temperature we've seen for this city today."""
         return self._max_temps.get(city)

@@ -160,12 +160,13 @@ class WeatherPipeline:
             if not event.city_config:
                 continue
 
-            # ONLY trade events resolving within 12 hours
-            # This is where the edge lives — we know the temperature,
-            # the market is slow to update, capital returns fast
+            # Trade events resolving within 36 hours
+            # 0-12h: observed-temp edge (high confidence)
+            # 12-36h: forecast-based edge (enables trading tomorrow's markets)
+            hours_left = None
             if event.resolution_utc:
                 hours_left = (event.resolution_utc - datetime.now(timezone.utc)).total_seconds() / 3600
-                if hours_left > 12 or hours_left < 0:
+                if hours_left > 36 or hours_left < 0:
                     continue
 
             # Get latest temperature reading
@@ -173,13 +174,23 @@ class WeatherPipeline:
             if not reading:
                 continue
 
+            # Fetch forecast for events >12h out
+            forecast_max = None
+            if hours_left is not None and hours_left > 12:
+                forecast_max = await self._weather.fetch_forecast_max(event.city_config)
+
             # Predict winning bracket
-            prediction = predict_outcome(event, reading)
+            prediction = predict_outcome(event, reading, forecast_max=forecast_max)
             if not prediction:
                 continue
 
             self._predictions[event.event_id] = prediction
             min_confidence = settings.min_weather_confidence
+
+            # Lower min_confidence for cheap markets — Kelly edge is huge
+            best_price = prediction.winning_bracket.yes_price
+            if best_price is not None and best_price < 0.15:
+                min_confidence = 0.65
 
             if prediction.confidence < min_confidence:
                 continue

@@ -10,6 +10,7 @@ import httpx
 
 from polycrossarb.config import settings
 from polycrossarb.data.models import Market, OrderBook, OrderBookLevel, Outcome
+from polycrossarb.data.rate_limiter import rate_limiter
 
 log = logging.getLogger(__name__)
 
@@ -65,13 +66,21 @@ class PolymarketClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
+    def _bucket_for(self, base_url: str) -> str:
+        """Return the rate-limiter bucket name for a given base URL."""
+        if base_url == self._gamma_url:
+            return "gamma"
+        return "clob"
+
     async def _request(self, base_url: str, path: str, params: dict | None = None) -> Any:
         client = await self._get_client()
         url = f"{base_url}{path}"
+        bucket = self._bucket_for(base_url)
         last_exc = None
         for attempt in range(self._max_retries):
             try:
-                resp = await client.get(url, params=params)
+                async with rate_limiter.acquire(bucket):
+                    resp = await client.get(url, params=params)
                 resp.raise_for_status()
                 return resp.json()
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
