@@ -68,8 +68,10 @@ _DATE_PARSE_PATTERNS = [
 ]
 
 
-def _parse_date_to_iso(date_str: str, year: int = 2026) -> str | None:
-    """Convert 'March 30' to '2026-03-30'."""
+def _parse_date_to_iso(date_str: str, year: int | None = None) -> str | None:
+    """Convert 'March 30' to '2026-03-30'. Auto-detects current year."""
+    if year is None:
+        year = datetime.now().year
     try:
         for fmt in ["%B %d", "%b %d", "%Y-%m-%d"]:
             try:

@@ -179,7 +179,7 @@ class WeatherPipeline:
                 continue
 
             self._predictions[event.event_id] = prediction
-            min_confidence = getattr(settings, 'min_weather_confidence', 0.70)
+            min_confidence = settings.min_weather_confidence
 
             if prediction.confidence < min_confidence:
                 continue
@@ -240,8 +240,24 @@ class WeatherPipeline:
 
             if result.success:
                 self._trade_count += 1
-                self._total_profit += order.expected_profit
+                # Use actual fill price, not expected, for profit accounting
+                actual_profit = order.expected_profit - result.slippage * order.size
+                self._total_profit += actual_profit
                 self._traded_events.add(event.event_id)
+
+                # Register with risk manager for exposure tracking
+                from polycrossarb.solver.linear import TradeOrder
+                trade_order = TradeOrder(
+                    market_condition_id=order.market_condition_id,
+                    outcome_idx=0,
+                    side="buy",
+                    size=result.filled_size,
+                    price=result.fill_price,
+                    expected_cost=result.cost,
+                    neg_risk=order.neg_risk,
+                )
+                self._risk.record_trade([trade_order], event_id=event.event_id)
+
                 log.info(
                     "weather.trade.filled",
                     city=event.city,
@@ -249,6 +265,7 @@ class WeatherPipeline:
                     fill_price=f"${result.fill_price:.4f}",
                     slippage=f"${result.slippage:.4f}",
                     cost=f"${result.cost:.2f}",
+                    actual_profit=f"${actual_profit:.2f}",
                     confidence=f"{order.confidence:.0%}",
                 )
             else:

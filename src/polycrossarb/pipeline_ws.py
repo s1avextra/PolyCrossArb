@@ -31,7 +31,7 @@ from polycrossarb.data.websocket import (
     PolymarketWebSocket,
     PriceUpdate,
 )
-from polycrossarb.execution.executor import ExecutionMode, LiveExecutor, PaperExecutor
+from polycrossarb.execution.executor import ExecutionMode, LiveExecutor, PaperExecutor, HybridExecutor
 from polycrossarb.execution.fees import prefetch_fee_rates
 from polycrossarb.graph.dependency import DependencyGraph
 from polycrossarb.graph.screener import EventGroup, find_event_partitions
@@ -59,6 +59,7 @@ class WebSocketPipeline:
         self._risk = RiskManager()
         self._paper_executor = PaperExecutor(self._risk)
         self._live_executor = LiveExecutor(self._risk)
+        self._hybrid_executor = HybridExecutor(self._risk)
 
         # Market state
         self._markets: dict[str, Market] = {}  # condition_id -> Market
@@ -131,6 +132,30 @@ class WebSocketPipeline:
                 arb_checks=self._arb_checks,
                 pnl=f"${self._risk.total_pnl:.4f}",
             )
+
+    async def graceful_shutdown(self) -> None:
+        """Graceful shutdown: cancel open orders, flush state, close connections.
+
+        Called on SIGTERM/SIGINT to prevent half-executed trades.
+        """
+        log.info("ws_pipeline.shutdown_start")
+        self._running = False
+        self._ws.stop()
+
+        # Cancel any active market-making orders
+        if self._mm_active_orders:
+            log.info("Cancelling %d MM orders...", len(self._mm_active_orders))
+            await self._cancel_mm_orders()
+
+        # Persist final risk state
+        self._risk.save_state()
+
+        log.info(
+            "ws_pipeline.shutdown_complete",
+            trades=self._trade_count,
+            pnl=f"${self._risk.total_pnl:.4f}",
+            positions=len(self._risk.positions),
+        )
 
     def stop(self) -> None:
         self._running = False
@@ -342,11 +367,21 @@ class WebSocketPipeline:
             exec_result = self._paper_executor.execute(result, trade_markets, partition.event_id)
         else:
             # Live mode: global lock ensures only ONE trade executes at a time
-            # This prevents multiple arbs from racing for the same USDC balance
             if self._execution_lock.locked():
-                return  # another trade is in-flight
+                return
             async with self._execution_lock:
-                exec_result = await self._live_executor.execute(result, trade_markets, partition.event_id)
+                if result.execution_strategy == "split_then_sell":
+                    cid = result.orders[0].market_condition_id if result.orders else ""
+                    n = len(result.orders)
+                    exec_result = await self._hybrid_executor.execute_split_then_sell(
+                        cid, n, result.total_cost, result.orders, trade_markets)
+                elif result.execution_strategy == "buy_then_merge":
+                    cid = result.orders[0].market_condition_id if result.orders else ""
+                    n = len(result.orders)
+                    exec_result = await self._hybrid_executor.execute_buy_then_merge(
+                        cid, n, result.total_cost / max(n, 1), result.orders, trade_markets)
+                else:
+                    exec_result = await self._live_executor.execute(result, trade_markets, partition.event_id)
 
         if exec_result.all_filled:
             # Set cooldown ONLY after successful execution

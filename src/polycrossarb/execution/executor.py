@@ -262,9 +262,9 @@ class LiveExecutor:
         self._initialized = False
 
     def _ensure_client(self):
-        """Lazy-init the CLOB client on first use."""
-        if self._initialized:
-            return self._client is not None
+        """Lazy-init the CLOB client, or re-init after connection failure."""
+        if self._initialized and self._client is not None:
+            return True
 
         from polycrossarb.config import settings
         if not settings.poly_api_key or not settings.private_key:
@@ -297,7 +297,17 @@ class LiveExecutor:
         except Exception:
             log.exception("Failed to initialize CLOB client")
             self._initialized = True
+            self._client = None
             return False
+
+    def _reset_client(self):
+        """Force re-initialization of the CLOB client on next use.
+
+        Call this after connection errors to get a fresh session.
+        """
+        self._client = None
+        self._initialized = False
+        log.info("CLOB client reset — will reconnect on next use")
 
     async def execute(
         self,
@@ -434,6 +444,11 @@ class LiveExecutor:
                 log.info("Placed: %s %s %.1f@%.4f id=%s",
                          order.side, token_id[:16], order.size, order.price, oid[:16])
 
+            except (ConnectionError, OSError, TimeoutError) as e:
+                log.error("Connection error placing %s: %s — resetting client", order.var_key, str(e)[:80])
+                self._reset_client()
+                placement_failed = True
+                break
             except Exception as e:
                 log.error("Order failed for %s: %s", order.var_key, str(e)[:100])
                 placement_failed = True
@@ -674,9 +689,9 @@ class SingleLegExecutor:
         self._initialized = False
 
     def _ensure_client(self) -> bool:
-        """Lazy-init the CLOB client. Same logic as LiveExecutor."""
-        if self._initialized:
-            return self._client is not None
+        """Lazy-init the CLOB client, or re-init after connection failure."""
+        if self._initialized and self._client is not None:
+            return True
 
         from polycrossarb.config import settings
         if not settings.poly_api_key or not settings.private_key:
@@ -708,7 +723,13 @@ class SingleLegExecutor:
         except Exception:
             log.exception("SingleLeg: failed to init CLOB client")
             self._initialized = True
+            self._client = None
             return False
+
+    def _reset_client(self):
+        """Force re-initialization on next use after connection errors."""
+        self._client = None
+        self._initialized = False
 
     async def execute_single(
         self,
@@ -770,6 +791,18 @@ class SingleLegExecutor:
         except Exception as e:
             return SingleLegResult(success=False, error=f"Book check failed: {e}")
 
+        # ── Use live best ask as limit price ────────────────────
+        try:
+            best_ask = float(book.asks[0].price)
+            # Use the worse of our price and best ask + 1 tick to ensure fill
+            tick = float(tick_size)
+            live_price = min(best_ask + tick, price + tick * 2)
+            # Round to tick size
+            live_price = round(live_price / tick) * tick
+            live_price = max(0.01, min(0.99, live_price))
+        except (IndexError, ValueError):
+            live_price = round(price / 0.01) * 0.01  # fallback: round to cent
+
         # ── Place order ───────────────────────────────────────────
 
         try:
@@ -778,7 +811,7 @@ class SingleLegExecutor:
 
             args = OrderArgs(
                 token_id=token_id,
-                price=price,
+                price=live_price,
                 size=size,
                 side=BUY,
             )
@@ -801,32 +834,59 @@ class SingleLegExecutor:
         # ── Wait for fill ─────────────────────────────────────────
 
         filled_size = 0.0
-        fill_price = price
+        fill_price = live_price
         deadline = time.time() + self.FILL_TIMEOUT
+        last_matched = 0.0
 
         while time.time() < deadline:
             await asyncio.sleep(self.FILL_POLL_INTERVAL)
             try:
                 status = self._client.get_order(order_id)
                 matched = float(status.get("size_matched", 0))
+                last_matched = matched
                 if matched >= size * 0.95:
                     filled_size = matched
+                    # VWAP across all fills
                     trades = status.get("associate_trades") or []
-                    if trades and isinstance(trades, list) and len(trades) > 0:
-                        try:
-                            fill_price = float(trades[0].get("price", price))
-                        except (ValueError, TypeError):
-                            pass
+                    if trades and isinstance(trades, list):
+                        total_value = 0.0
+                        total_qty = 0.0
+                        for t in trades:
+                            try:
+                                tp = float(t.get("price", 0))
+                                ts = float(t.get("size", 0))
+                                if tp > 0 and ts > 0:
+                                    total_value += tp * ts
+                                    total_qty += ts
+                            except (ValueError, TypeError):
+                                pass
+                        if total_qty > 0:
+                            fill_price = total_value / total_qty
                     break
             except Exception:
                 pass
 
+        # If not fully filled, check what DID fill and track it
+        if filled_size == 0.0 and last_matched > 0:
+            # Partial fill — record whatever filled so it's not orphaned
+            filled_size = last_matched
+
         if filled_size < size * 0.50:
-            # Not enough filled — cancel
+            # Cancel remaining
             try:
                 self._client.cancel(order_id)
             except Exception:
                 log.warning("SingleLeg: failed to cancel %s", order_id[:16])
+
+            # Still record partial fill if any shares were matched
+            if filled_size > 0:
+                log.warning("SingleLeg: partial fill %.1f/%.1f — recording orphaned shares",
+                            filled_size, size)
+                self._record_fill(
+                    token_id, event_id, side, filled_size, fill_price,
+                    live_price, neg_risk,
+                )
+
             return SingleLegResult(
                 success=False, order_id=order_id,
                 filled_size=filled_size, fill_price=fill_price,
@@ -835,10 +895,35 @@ class SingleLegExecutor:
 
         # ── Record trade ──────────────────────────────────────────
 
-        slippage = abs(fill_price - price)
+        return self._record_fill(
+            token_id, event_id, side, filled_size, fill_price,
+            live_price, neg_risk, order_id,
+        )
+
+    def _record_fill(
+        self,
+        token_id: str,
+        event_id: str,
+        side: str,
+        filled_size: float,
+        fill_price: float,
+        limit_price: float,
+        neg_risk: bool,
+        order_id: str = "",
+    ) -> SingleLegResult:
+        """Record a fill in the risk manager with fee tracking."""
+        slippage = abs(fill_price - limit_price)
         cost = fill_price * filled_size
 
-        # Record in risk manager using a TradeOrder wrapper
+        # Estimate fee (taker ~2% for prices near 0.50, varies by price)
+        # calculate_taker_fee(shares, price, ...)
+        from polycrossarb.execution.fees import calculate_taker_fee
+        try:
+            fee = calculate_taker_fee(filled_size, fill_price)
+        except Exception:
+            fee = cost * 0.02  # fallback: 2%
+
+        # Record in risk manager
         trade_order = TradeOrder(
             market_condition_id=event_id or token_id[:20],
             outcome_idx=0,
@@ -849,10 +934,11 @@ class SingleLegExecutor:
             neg_risk=neg_risk,
         )
         self.risk_manager.record_trade([trade_order], event_id=event_id, paper=False)
+        self.risk_manager.record_fees(fee)
 
         log.info(
-            "SingleLeg: FILLED %.1f @ $%.4f (slippage $%.4f, cost $%.2f)",
-            filled_size, fill_price, slippage, cost,
+            "SingleLeg: FILLED %.1f @ $%.4f (slip $%.4f, cost $%.2f, fee $%.3f)",
+            filled_size, fill_price, slippage, cost, fee,
         )
 
         return SingleLegResult(
@@ -861,5 +947,232 @@ class SingleLegExecutor:
             filled_size=filled_size,
             fill_price=fill_price,
             cost=cost,
+            fee=fee,
             slippage=slippage,
         )
+
+
+# ── Hybrid Executor (on-chain + CLOB) ─────────────────────────────
+
+
+class HybridExecutor:
+    """Executes arbs using on-chain split/merge combined with CLOB orders.
+
+    Strategy extracted from vidarx ($631K profit, $85.6M volume):
+      - Small iceberg orders ($3-5 each) to avoid market impact
+      - Buy both sides of binary markets via CLOB
+      - Wait 5 minutes for on-chain settlement
+      - Merge all tokens for $1.00 USDC.e redemption
+      - Run 7+ markets concurrently
+
+    Strategies:
+      split_then_sell: splitPosition on-chain → sell tokens on CLOB (overpriced)
+      buy_then_merge:  buy tokens on CLOB → mergePositions on-chain (underpriced)
+    """
+
+    # vidarx-inspired parameters
+    ICEBERG_SIZE_USD = 3.50       # median fill from vidarx analysis
+    SETTLEMENT_WAIT_S = 300       # 5 minutes — vidarx waits 260-428s
+    MAX_FILL_ATTEMPTS = 80        # vidarx does 32-80 fills per token
+    FILL_INTERVAL_S = 2           # seconds between iceberg orders
+
+    def __init__(self, risk_manager: RiskManager):
+        self._risk = risk_manager
+        self._live = LiveExecutor(risk_manager)
+        self._onchain = None  # lazy init
+        self._pending_merges: list[dict] = []  # positions waiting for settlement
+
+    def _ensure_onchain(self) -> bool:
+        if self._onchain is not None:
+            return True
+        try:
+            from polycrossarb.execution.onchain import OnChainExecutor
+            self._onchain = OnChainExecutor()
+            return True
+        except Exception as e:
+            log.error("Failed to init OnChainExecutor: %s", e)
+            return False
+
+    async def execute_split_then_sell(
+        self,
+        condition_id: str,
+        num_outcomes: int,
+        set_size: float,
+        sell_orders: list[TradeOrder],
+        markets: list[Market] | None = None,
+    ) -> ExecutionResult:
+        """Execute overpriced arb: split on-chain, sell tokens on CLOB."""
+        if not self._ensure_onchain():
+            return ExecutionResult(all_filled=False)
+        if not self._live._ensure_client():
+            return ExecutionResult(all_filled=False)
+
+        try:
+            log.info("hybrid.split: condition=%s amount=$%.2f outcomes=%d",
+                     condition_id[:16], set_size, num_outcomes)
+            tx_hash = self._onchain.split_position(condition_id, set_size, num_outcomes)
+            log.info("hybrid.split.ok: tx=%s", tx_hash[:16])
+        except Exception as e:
+            log.error("hybrid.split.failed: %s", e)
+            return ExecutionResult(all_filled=False)
+
+        # Sell tokens via iceberg orders
+        result = await self._iceberg_execute(sell_orders, markets, set_size)
+
+        if not result.all_filled:
+            log.warning("hybrid.sell.partial: tokens held — will resolve at expiry")
+
+        return result
+
+    async def execute_buy_then_merge(
+        self,
+        condition_id: str,
+        num_outcomes: int,
+        set_size: float,
+        buy_orders: list[TradeOrder],
+        markets: list[Market] | None = None,
+    ) -> ExecutionResult:
+        """Execute underpriced arb: buy tokens on CLOB, merge on-chain.
+
+        Vidarx flow: buy via many small CLOB orders → wait 5 min → merge.
+        """
+        if not self._ensure_onchain():
+            return ExecutionResult(all_filled=False)
+        if not self._live._ensure_client():
+            return ExecutionResult(all_filled=False)
+
+        # Step 1: Buy all tokens via iceberg orders
+        result = await self._iceberg_execute(buy_orders, markets, set_size)
+
+        if not result.all_filled:
+            log.warning("hybrid.buy.failed: not all tokens acquired. No merge.")
+            return result
+
+        # Step 2: Wait for on-chain settlement
+        log.info("hybrid.settlement_wait: waiting %ds for on-chain settlement",
+                 self.SETTLEMENT_WAIT_S)
+        import asyncio
+        await asyncio.sleep(self.SETTLEMENT_WAIT_S)
+
+        # Step 3: Merge on-chain
+        try:
+            log.info("hybrid.merge: condition=%s amount=$%.2f outcomes=%d",
+                     condition_id[:16], set_size, num_outcomes)
+            tx_hash = self._onchain.merge_positions(condition_id, set_size, num_outcomes)
+            log.info("hybrid.merge.ok: tx=%s → $%.2f USDC.e recovered",
+                     tx_hash[:16], set_size)
+        except Exception as e:
+            log.error("hybrid.merge.failed: %s (holding tokens — resolve at expiry)", e)
+
+        return result
+
+    async def _iceberg_execute(
+        self,
+        orders: list[TradeOrder],
+        markets: list[Market] | None,
+        total_size: float,
+    ) -> ExecutionResult:
+        """Execute orders, splitting into iceberg fills only when position > ICEBERG_SIZE.
+
+        Adaptive sizing based on bankroll:
+          - Small bankroll ($6): positions are $1-3 → single order per leg, no splitting
+          - Medium bankroll ($50+): positions are $5-20 → 2-6 iceberg fills
+          - Large bankroll ($500+): positions are $50-200 → 15-60 iceberg fills (vidarx pattern)
+
+        Iceberg splitting only activates when a leg's cost exceeds ICEBERG_SIZE_USD.
+        Below that threshold, the entire leg is placed as one order.
+        """
+        import asyncio
+
+        if not self._live._ensure_client():
+            return ExecutionResult(all_filled=False)
+
+        all_filled = True
+        total_cost = 0.0
+        total_filled = 0.0
+
+        for order in orders:
+            target_size = order.size
+            order_value = target_size * order.price
+
+            # Decide: single order or iceberg split
+            if order_value <= self.ICEBERG_SIZE_USD:
+                # Small position — place as one order (no splitting overhead)
+                success = await self._place_single(order, target_size)
+                if success:
+                    total_cost += order_value
+                    total_filled += target_size
+                else:
+                    all_filled = False
+            else:
+                # Large position — split into iceberg fills
+                remaining = target_size
+                fills = 0
+
+                while remaining > 0.5 and fills < self.MAX_FILL_ATTEMPTS:
+                    chunk_usd = min(self.ICEBERG_SIZE_USD, remaining * order.price)
+                    chunk_shares = chunk_usd / order.price if order.price > 0 else 0
+                    chunk_shares = min(chunk_shares, remaining)
+
+                    if chunk_shares < 0.5:
+                        break
+
+                    success = await self._place_single(order, chunk_shares)
+                    if success:
+                        remaining -= chunk_shares
+                        total_cost += chunk_usd
+                        total_filled += chunk_shares
+                        fills += 1
+                        log.debug("iceberg #%d: %.1f shares @ $%.3f ($%.2f)",
+                                  fills, chunk_shares, order.price, chunk_usd)
+                    else:
+                        fills += 1
+
+                    if remaining > 0.5:
+                        await asyncio.sleep(self.FILL_INTERVAL_S)
+
+                if remaining > target_size * 0.05:
+                    log.warning("hybrid.iceberg.partial: %s filled %.0f/%.0f",
+                                order.market_condition_id[:16],
+                                target_size - remaining, target_size)
+                    all_filled = False
+
+        return ExecutionResult(
+            all_filled=all_filled,
+            actual_profit_estimate=0.0,
+        )
+
+    async def _place_single(self, order: TradeOrder, size: float) -> bool:
+        """Place a single CLOB order. Returns True if accepted."""
+        try:
+            from py_clob_client.order_builder.constants import BUY, SELL
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+
+            side = BUY if order.side == "buy" else SELL
+            token_id = order.token_id if hasattr(order, 'token_id') else ""
+
+            # Polymarket minimum order is $1
+            if size * order.price < 1.0:
+                size = max(size, 1.0 / order.price)
+
+            args = OrderArgs(
+                token_id=token_id,
+                price=order.price,
+                size=round(size, 1),
+                side=side,
+            )
+            opts = PartialCreateOrderOptions(
+                tick_size="0.01",
+                neg_risk=order.neg_risk,
+            )
+            resp = self._live._client.create_and_post_order(args, opts)
+
+            if resp and not (isinstance(resp, dict) and resp.get("error")):
+                return True
+            else:
+                error = resp.get("error", "?") if isinstance(resp, dict) else "empty"
+                log.debug("order rejected: %s", error)
+                return False
+        except Exception as e:
+            log.debug("order failed: %s", str(e)[:50])
+            return False

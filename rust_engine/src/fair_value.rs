@@ -4,7 +4,7 @@
 //! d2 = [ln(S/K) + (r - σ²/2)T] / (σ√T)
 
 /// Standard normal CDF (Abramowitz & Stegun approximation)
-fn norm_cdf(x: f64) -> f64 {
+pub fn norm_cdf(x: f64) -> f64 {
     let a1 = 0.254829592;
     let a2 = -0.284496736;
     let a3 = 1.421413741;

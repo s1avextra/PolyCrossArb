@@ -57,6 +57,7 @@ class SolverResult:
     total_revenue: float = 0.0
     trading_fees: float = 0.0
     gas_fees: float = 0.0
+    execution_strategy: str = "clob_only"  # "clob_only" | "split_then_sell" | "buy_then_merge"
 
     @property
     def is_optimal(self) -> bool:
@@ -163,30 +164,48 @@ def solve_partition_arb(
     # Determine if this is a neg_risk event
     is_neg_risk = any(m.neg_risk for m in group.markets)
 
-    if mid_sum > 1.0:
-        # OVERPRICED: BUY NO on all outcomes.
-        # For N outcomes: cost = sum(NO prices) = N - sum(YES prices)
-        # Payout: (N-1) × $1.00 (all NOs win except the one that happens)
-        # Profit: (N-1) - (N - sum(YES)) = sum(YES) - 1.0
-        #
-        # We need ASK prices on the NO side (what we pay to buy NO).
-        # NO ask price ≈ 1 - YES bid price.
-        no_ask_prices = [1 - p for p in exec_prices]  # exec_prices are YES bids
-        no_cost_per_set = sum(no_ask_prices)
-        no_payout_per_set = n - 1  # (N-1) NOs always win
+    use_onchain = cfg.enable_onchain_execution
 
-        profit_per_set = no_payout_per_set - no_cost_per_set  # = sum(YES) - 1.0
+    if mid_sum > 1.0:
+        if use_onchain:
+            # OVERPRICED + SPLIT: mint all outcome tokens for $1.00 on-chain,
+            # then sell each YES token on CLOB at best bid.
+            # Cost = 1.00 per set (on-chain, zero slippage).
+            # Revenue = sum(YES best bids) per set.
+            # Profit = sum(YES bids) - 1.00 - gas
+            split_cost_per_set = 1.0
+            sell_revenue_per_set = sum(exec_prices)  # exec_prices are YES bids
+            profit_per_set = sell_revenue_per_set - split_cost_per_set
+        else:
+            # OVERPRICED (CLOB-only): BUY NO on all outcomes.
+            # NO ask price ≈ 1 - YES bid price.
+            no_ask_prices = [1 - p for p in exec_prices]
+            no_cost_per_set = sum(no_ask_prices)
+            no_payout_per_set = n - 1
+            profit_per_set = no_payout_per_set - no_cost_per_set  # = sum(YES) - 1.0
+
         if profit_per_set <= 0:
             return SolverResult(status="spread_kills_arb", guaranteed_profit=0.0)
 
         prob += size * profit_per_set, "maximize_profit"
 
-        # Capital needed: buy NO on all outcomes = sum(NO ask prices) per set
-        prob += size * no_cost_per_set <= max_position_usd, "capital_limit"
+        if use_onchain:
+            prob += size * split_cost_per_set <= max_position_usd, "capital_limit"
+        else:
+            prob += size * no_cost_per_set <= max_position_usd, "capital_limit"
 
     else:
-        # UNDERPRICED: buy YES on all → pay exec_sum per set, receive 1.0
-        profit_per_set = 1.0 - exec_sum
+        if use_onchain:
+            # UNDERPRICED + MERGE: buy all YES tokens on CLOB,
+            # then merge on-chain for $1.00 USDC.e per set.
+            # Cost = sum(YES asks) per set.
+            # Revenue = 1.00 per set (on-chain, guaranteed).
+            # No exit problem — merge redeems directly to USDC.e.
+            profit_per_set = 1.0 - exec_sum
+        else:
+            # UNDERPRICED (CLOB-only): buy all outcomes, hope to exit
+            profit_per_set = 1.0 - exec_sum
+
         if profit_per_set <= 0:
             return SolverResult(status="spread_kills_arb", guaranteed_profit=0.0)
 
@@ -228,21 +247,35 @@ def solve_partition_arb(
         ep = exec_prices[i]
 
         if mid_sum > 1.0:
-            # BUY NO tokens: NO price = 1 - YES price
-            no_price = 1 - ep
-            order_cost = no_price * opt_size
-            # outcome_idx=1 = NO token
-            no_name = market.outcomes[1].name if len(market.outcomes) > 1 else "No"
-            order = TradeOrder(
-                market_condition_id=market.condition_id,
-                outcome_idx=1, side="buy", size=opt_size, price=no_price,
-                expected_cost=order_cost, neg_risk=is_neg_risk,
-                outcome_name=no_name,
-            )
-            orders.append(order)
-            total_cost += order_cost
+            if use_onchain:
+                # SPLIT+SELL: sell YES tokens on CLOB at best bid
+                # The split mints tokens on-chain (no CLOB order needed for buy side)
+                order_cost = ep * opt_size  # revenue from selling
+                yes_name = market.outcomes[0].name if market.outcomes else "Yes"
+                order = TradeOrder(
+                    market_condition_id=market.condition_id,
+                    outcome_idx=0, side="sell", size=opt_size, price=ep,
+                    expected_cost=order_cost, neg_risk=is_neg_risk,
+                    outcome_name=yes_name,
+                )
+                orders.append(order)
+                total_rev += order_cost
+                total_cost = opt_size * 1.0  # split cost = $1.00 per set (on-chain)
+            else:
+                # BUY NO tokens: NO price = 1 - YES price
+                no_price = 1 - ep
+                order_cost = no_price * opt_size
+                no_name = market.outcomes[1].name if len(market.outcomes) > 1 else "No"
+                order = TradeOrder(
+                    market_condition_id=market.condition_id,
+                    outcome_idx=1, side="buy", size=opt_size, price=no_price,
+                    expected_cost=order_cost, neg_risk=is_neg_risk,
+                    outcome_name=no_name,
+                )
+                orders.append(order)
+                total_cost += order_cost
         else:
-            # BUY YES tokens
+            # BUY YES tokens (same for both CLOB-only and buy+merge)
             order_cost = ep * opt_size
             yes_name = market.outcomes[0].name if market.outcomes else "Yes"
             order = TradeOrder(
@@ -255,17 +288,27 @@ def solve_partition_arb(
             total_cost += order_cost
 
     # ── Calculate all costs ───────────────────────────────────────
-    # Trading fees per leg — uses live API when token_id available
+    # Trading fees per CLOB leg — uses live API when token_id available
     trading_fees = 0.0
     for i, market in enumerate(group.markets):
         cat = market.category.lower() if market.category else "other"
         token_id = market.outcomes[0].token_id if market.outcomes else ""
         trading_fees += calculate_taker_fee(opt_size, exec_prices[i], cat, token_id)
 
-    # Gas fees: 1 tx per leg (live Polygon gas price)
-    gas_fees = estimate_gas_cost(n)
+    # Gas fees: CLOB legs + on-chain tx if applicable
+    if use_onchain:
+        # 1 on-chain tx (split or merge) + N CLOB order txs
+        gas_fees = estimate_gas_cost(n + 1)
+    else:
+        gas_fees = estimate_gas_cost(n)
 
     net_profit = gross_profit - trading_fees - gas_fees
+
+    # Determine execution strategy
+    if use_onchain:
+        exec_strategy = "split_then_sell" if mid_sum > 1.0 else "buy_then_merge"
+    else:
+        exec_strategy = "clob_only"
 
     return SolverResult(
         status="optimal",
@@ -276,6 +319,7 @@ def solve_partition_arb(
         total_revenue=total_rev,
         trading_fees=trading_fees,
         gas_fees=gas_fees,
+        execution_strategy=exec_strategy,
     )
 
 
@@ -283,28 +327,35 @@ def _capital_turnover_score(group: EventGroup, result: SolverResult) -> float:
     """Score a trade by capital efficiency: profit per dollar per day.
 
     Prioritises:
-      1. High profit/capital ratio (immediate return)
-      2. Fast-resolving events (capital freed sooner for reuse)
-      3. Fewer legs (lower execution risk)
+      1. buy_then_merge (instant capital recovery via on-chain merge)
+      2. High profit/capital ratio (immediate return)
+      3. Fast-resolving events (capital freed sooner for reuse)
+      4. Fewer legs (lower execution risk)
 
-    This maximises bankroll compound growth rate.
+    buy_then_merge gets a massive score boost because capital is freed
+    in ~2 seconds (on-chain merge), not days/weeks (resolution).
     """
     cost = max(result.total_cost, 0.01)
     profit_ratio = result.guaranteed_profit / cost
 
-    days_to_resolve = 365.0
-    for m in group.markets:
-        if m.end_date:
-            try:
-                end = datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
-                delta = (end - datetime.now(end.tzinfo)).total_seconds() / 86400
-                if 0 < delta < days_to_resolve:
-                    days_to_resolve = delta
-            except (ValueError, TypeError):
-                pass
+    if result.execution_strategy == "buy_then_merge":
+        # Capital freed instantly via merge — treat as 0-day lockup.
+        # Use a tiny denominator to give these trades top priority.
+        days_to_resolve = 0.01  # ~15 minutes effective
+    else:
+        days_to_resolve = 365.0
+        for m in group.markets:
+            if m.end_date:
+                try:
+                    end = datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
+                    delta = (end - datetime.now(end.tzinfo)).total_seconds() / 86400
+                    if 0 < delta < days_to_resolve:
+                        days_to_resolve = delta
+                except (ValueError, TypeError):
+                    pass
 
     # Annualised return: (profit_ratio / days) * 365
-    daily_return = profit_ratio / max(days_to_resolve, 0.5)
+    daily_return = profit_ratio / max(days_to_resolve, 0.01)
 
     # Penalty for many legs (execution risk)
     leg_penalty = 1.0 / (1 + len(group.markets) * 0.02)

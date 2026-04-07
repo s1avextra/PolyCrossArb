@@ -1,12 +1,14 @@
 """Risk management: position limits, exposure tracking, cooldowns.
 
-State is persisted to disk (state.json) so the bot can crash and
-restart without losing track of open positions, P&L, or trade history.
+State is persisted to SQLite so the bot can crash and restart without
+losing track of open positions, P&L, or trade history. SQLite provides
+ACID durability — no more corrupted JSON files.
 """
 from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -58,7 +60,7 @@ class RiskManager:
     This means profits compound and losses reduce exposure automatically.
     """
 
-    STATE_FILE = "state.json"
+    STATE_DB = "state.db"
 
     def __init__(
         self,
@@ -79,7 +81,10 @@ class RiskManager:
         self._max_per_market_ratio = 0.20  # 20% of bankroll per event
         self._max_per_market_override = max_per_market
         self.cooldown_seconds = cooldown_seconds
-        self._state_path = Path(state_dir) / self.STATE_FILE
+
+        self._state_dir = Path(state_dir)
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._state_dir / self.STATE_DB
 
         self._positions: dict[str, Position] = {}
         self._trade_history: list[TradeRecord] = []
@@ -87,7 +92,8 @@ class RiskManager:
         self._total_pnl: float = 0.0
         self._total_fees_paid: float = 0.0
 
-        # Restore state from disk if available
+        # Initialize SQLite and restore state
+        self._init_db()
         self._load_state()
 
     @property
@@ -189,6 +195,7 @@ class RiskManager:
                 paper=paper,
             )
             self._trade_history.append(record)
+            self.record_trade_to_db(record)
 
             # Update position
             side = "long" if order.side == "buy" else "short"
@@ -330,74 +337,199 @@ class RiskManager:
             "total_fees": round(self._total_fees_paid, 4),
         }
 
-    # ── State persistence ─────────────────────────────────────────
+    # ── State persistence (SQLite) ──────────────────────────────
+
+    def _init_db(self) -> None:
+        """Create SQLite tables if they don't exist."""
+        con = sqlite3.connect(self._db_path)
+        con.execute("PRAGMA journal_mode=WAL")  # safe concurrent reads
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS positions (
+                key                TEXT PRIMARY KEY,
+                market_condition_id TEXT NOT NULL,
+                outcome_idx        INTEGER NOT NULL,
+                side               TEXT NOT NULL,
+                size               REAL NOT NULL,
+                entry_price        REAL NOT NULL,
+                entry_time         REAL NOT NULL,
+                event_id           TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS trades (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp           REAL NOT NULL,
+                market_condition_id TEXT NOT NULL,
+                outcome_idx         INTEGER NOT NULL,
+                side                TEXT NOT NULL,
+                size                REAL NOT NULL,
+                price               REAL NOT NULL,
+                cost                REAL NOT NULL,
+                event_id            TEXT NOT NULL DEFAULT '',
+                pnl                 REAL NOT NULL DEFAULT 0,
+                paper               INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS cooldowns (
+                event_id TEXT PRIMARY KEY,
+                last_trade_time REAL NOT NULL
+            );
+        """)
+        con.close()
+
+    def _db(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path)
 
     def save_state(self) -> None:
-        """Persist current state to disk. Called after every trade."""
-        state = {
-            "version": 1,
-            "saved_at": time.time(),
-            "total_pnl": self._total_pnl,
-            "total_fees_paid": self._total_fees_paid,
-            "positions": {
-                key: {
-                    "market_condition_id": pos.market_condition_id,
-                    "outcome_idx": pos.outcome_idx,
-                    "side": pos.side,
-                    "size": pos.size,
-                    "entry_price": pos.entry_price,
-                    "entry_time": pos.entry_time,
-                    "event_id": pos.event_id,
-                }
-                for key, pos in self._positions.items()
-            },
-            "last_trade_time": self._last_trade_time,
-            "trade_count": len(self._trade_history),
-        }
-
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Atomic write: write to temp file then rename
-        tmp = self._state_path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(state, f, indent=2)
-        tmp.rename(self._state_path)
-
-        log.debug("State saved: %d positions, pnl=$%.4f", len(self._positions), self._total_pnl)
-
-    def _load_state(self) -> None:
-        """Restore state from disk on startup."""
-        if not self._state_path.exists():
-            log.info("No saved state found — starting fresh")
-            return
-
+        """Persist current state to SQLite. ACID — no corruption risk."""
+        con = self._db()
         try:
-            with open(self._state_path) as f:
-                state = json.load(f)
+            con.execute("BEGIN")
 
-            self._total_pnl = state.get("total_pnl", 0.0)
-            self._total_fees_paid = state.get("total_fees_paid", 0.0)
-            self._last_trade_time = state.get("last_trade_time", {})
-
-            for key, pos_data in state.get("positions", {}).items():
-                self._positions[key] = Position(
-                    market_condition_id=pos_data["market_condition_id"],
-                    outcome_idx=pos_data["outcome_idx"],
-                    side=pos_data["side"],
-                    size=pos_data["size"],
-                    entry_price=pos_data["entry_price"],
-                    entry_time=pos_data["entry_time"],
-                    event_id=pos_data.get("event_id", ""),
+            # Upsert scalar state
+            for k, v in [
+                ("total_pnl", self._total_pnl),
+                ("total_fees_paid", self._total_fees_paid),
+                ("saved_at", time.time()),
+            ]:
+                con.execute(
+                    "INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+                    (k, json.dumps(v)),
                 )
 
-            saved_at = state.get("saved_at", 0)
-            age = time.time() - saved_at if saved_at else 0
-            log.info(
-                "State restored: %d positions, pnl=$%.4f, fees=$%.4f (saved %.0fs ago)",
-                len(self._positions), self._total_pnl, self._total_fees_paid, age,
-            )
+            # Rebuild positions table
+            con.execute("DELETE FROM positions")
+            for key, pos in self._positions.items():
+                con.execute(
+                    "INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (key, pos.market_condition_id, pos.outcome_idx, pos.side,
+                     pos.size, pos.entry_price, pos.entry_time, pos.event_id),
+                )
+
+            # Rebuild cooldowns table
+            con.execute("DELETE FROM cooldowns")
+            for eid, ts in self._last_trade_time.items():
+                con.execute(
+                    "INSERT INTO cooldowns VALUES (?, ?)", (eid, ts),
+                )
+
+            con.commit()
+            log.debug("State saved: %d positions, pnl=$%.4f", len(self._positions), self._total_pnl)
+        except Exception:
+            con.rollback()
+            log.exception("Failed to save state")
+        finally:
+            con.close()
+
+    def _load_state(self) -> None:
+        """Restore state from SQLite on startup.
+
+        Also migrates from legacy state.json if it exists.
+        """
+        # Migrate from legacy JSON if DB is empty
+        legacy_path = self._state_dir / "state.json"
+        if legacy_path.exists():
+            self._migrate_from_json(legacy_path)
+
+        con = self._db()
+        try:
+            # Scalar state
+            for row in con.execute("SELECT key, value FROM state"):
+                k, v = row[0], json.loads(row[1])
+                if k == "total_pnl":
+                    self._total_pnl = v
+                elif k == "total_fees_paid":
+                    self._total_fees_paid = v
+
+            # Positions
+            for row in con.execute("SELECT * FROM positions"):
+                key = row[0]
+                self._positions[key] = Position(
+                    market_condition_id=row[1],
+                    outcome_idx=row[2],
+                    side=row[3],
+                    size=row[4],
+                    entry_price=row[5],
+                    entry_time=row[6],
+                    event_id=row[7],
+                )
+
+            # Cooldowns
+            for row in con.execute("SELECT event_id, last_trade_time FROM cooldowns"):
+                self._last_trade_time[row[0]] = row[1]
+
+            if self._positions or self._total_pnl != 0:
+                log.info(
+                    "State restored: %d positions, pnl=$%.4f, fees=$%.4f",
+                    len(self._positions), self._total_pnl, self._total_fees_paid,
+                )
+            else:
+                log.info("No saved state found — starting fresh")
         except Exception:
             log.exception("Failed to restore state — starting fresh")
             self._positions.clear()
             self._total_pnl = 0.0
             self._total_fees_paid = 0.0
+        finally:
+            con.close()
+
+    def _migrate_from_json(self, json_path: Path) -> None:
+        """One-time migration from legacy state.json to SQLite."""
+        con = self._db()
+        try:
+            # Check if DB already has data
+            row = con.execute("SELECT COUNT(*) FROM state").fetchone()
+            if row and row[0] > 0:
+                return  # already migrated
+
+            with open(json_path) as f:
+                state = json.load(f)
+
+            con.execute("BEGIN")
+            for k, v in [
+                ("total_pnl", state.get("total_pnl", 0.0)),
+                ("total_fees_paid", state.get("total_fees_paid", 0.0)),
+                ("saved_at", state.get("saved_at", time.time())),
+            ]:
+                con.execute("INSERT OR REPLACE INTO state VALUES (?, ?)", (k, json.dumps(v)))
+
+            for key, pos_data in state.get("positions", {}).items():
+                con.execute(
+                    "INSERT OR REPLACE INTO positions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (key, pos_data["market_condition_id"], pos_data["outcome_idx"],
+                     pos_data["side"], pos_data["size"], pos_data["entry_price"],
+                     pos_data["entry_time"], pos_data.get("event_id", "")),
+                )
+
+            for eid, ts in state.get("last_trade_time", {}).items():
+                con.execute("INSERT OR REPLACE INTO cooldowns VALUES (?, ?)", (eid, ts))
+
+            con.commit()
+            log.info("Migrated state.json → state.db (%d positions)", len(state.get("positions", {})))
+
+            # Rename old file so we don't re-migrate
+            json_path.rename(json_path.with_suffix(".json.bak"))
+        except Exception:
+            con.rollback()
+            log.exception("Failed to migrate state.json")
+        finally:
+            con.close()
+
+    def record_trade_to_db(self, record: TradeRecord) -> None:
+        """Append a trade to the persistent audit trail."""
+        con = self._db()
+        try:
+            con.execute(
+                "INSERT INTO trades (timestamp, market_condition_id, outcome_idx, "
+                "side, size, price, cost, event_id, pnl, paper) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (record.timestamp, record.market_condition_id, record.outcome_idx,
+                 record.side, record.size, record.price, record.cost,
+                 record.event_id, record.pnl, int(record.paper)),
+            )
+            con.commit()
+        except Exception:
+            log.debug("Failed to write trade to DB")
+        finally:
+            con.close()

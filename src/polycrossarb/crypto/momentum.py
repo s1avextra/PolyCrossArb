@@ -1,17 +1,14 @@
 """BTC momentum detector for candle trading.
 
-Tracks BTC price over short windows (1-15 minutes) to detect
+Tracks BTC price over short windows (1-60 minutes) to detect
 directional momentum. When BTC has been consistently moving in
 one direction, the candle outcome becomes predictable.
 
-Key insight: BTC price momentum within a 5-15 minute window
-is highly persistent. If BTC has gone up $50 in the first 10
-minutes of a 15-minute candle, it's very likely to finish up.
-
-Confidence model:
-  - Direction consistency (% of ticks in the same direction)
-  - Magnitude (how far price has moved relative to volatility)
-  - Time remaining (less time = more locked in)
+Confidence model (volatility-normalized):
+  - Z-score: price move / (σ × √window) — vol-adjusted magnitude
+  - Time factor: how locked-in the outcome is (time elapsed / total)
+  - Consistency: fraction of ticks agreeing with direction
+  - Reversion count: how many times price crossed through open (noise indicator)
 """
 from __future__ import annotations
 
@@ -36,18 +33,29 @@ class MomentumSignal:
     minutes_remaining: float
     current_price: float
     open_price: float       # price at start of window
+    z_score: float = 0.0    # volatility-normalized magnitude
+    reversion_count: int = 0  # times price crossed open
 
 
 class MomentumDetector:
     """Tracks BTC price momentum for candle direction prediction.
 
-    Maintains a rolling window of price ticks and computes
-    directional momentum signals.
+    Uses volatility-normalized signals instead of fixed dollar thresholds.
     """
 
-    def __init__(self):
+    def __init__(self, realized_vol: float | None = None):
         self._ticks: deque[tuple[float, float]] = deque(maxlen=5000)  # (timestamp, price)
         self._window_opens: dict[str, float] = {}  # contract_id -> open price
+        self._realized_vol: float = realized_vol or 0.50  # annualized, updated externally
+
+    @property
+    def realized_vol(self) -> float:
+        return self._realized_vol
+
+    def set_realized_vol(self, vol: float):
+        """Update realized volatility from price feed."""
+        if vol > 0:
+            self._realized_vol = vol
 
     def add_tick(self, price: float):
         """Record a new price tick."""
@@ -85,7 +93,6 @@ class MomentumDetector:
         # Get the open price (price at window start)
         open_price = self._window_opens.get(contract_id)
         if open_price is None:
-            # Estimate from tick history
             for ts, price in self._ticks:
                 if ts >= window_start:
                     open_price = price
@@ -95,14 +102,14 @@ class MomentumDetector:
         if open_price is None or open_price <= 0:
             return None
 
-        # Calculate price change
+        # Price change
         price_change = current_price - open_price
         price_change_pct = price_change / open_price
 
         # Direction
         direction = "up" if price_change >= 0 else "down"
 
-        # Consistency: what fraction of recent ticks agree with the direction?
+        # Collect ticks in this window
         recent_ticks = [
             (ts, p) for ts, p in self._ticks
             if ts >= window_start
@@ -111,41 +118,63 @@ class MomentumDetector:
         if len(recent_ticks) < 3:
             return None
 
+        # Consistency + reversion count
         consistent = 0
+        reversion_count = 0
+        prev_side = None  # True = above open, False = below
         for i in range(1, len(recent_ticks)):
             tick_dir = recent_ticks[i][1] - recent_ticks[i - 1][1]
             if (direction == "up" and tick_dir >= 0) or (direction == "down" and tick_dir <= 0):
                 consistent += 1
+            # Count crossings through open price
+            curr_side = recent_ticks[i][1] >= open_price
+            if prev_side is not None and curr_side != prev_side:
+                reversion_count += 1
+            prev_side = curr_side
 
         consistency = consistent / max(len(recent_ticks) - 1, 1)
 
-        # Confidence model
         minutes_elapsed = window_start_ago_minutes
+        total_window = minutes_elapsed + minutes_remaining
 
-        # Base: how much of the window has passed?
-        time_factor = min(1.0, minutes_elapsed / (minutes_elapsed + minutes_remaining))
+        # ── Volatility-normalized magnitude (z-score) ──────────────
+        # Expected move for this window based on realized vol
+        # sigma_window = price × annual_vol × sqrt(window_minutes / minutes_per_year)
+        sigma_window = open_price * self._realized_vol * math.sqrt(total_window / 525600)
+        sigma_window = max(sigma_window, 1.0)  # floor at $1 to avoid div-by-zero
+        z_score = abs(price_change) / sigma_window
 
-        # Magnitude: how significant is the move relative to typical volatility?
-        # Typical 5-min BTC move: ~$20-50. Anything >$100 is very significant.
-        magnitude = min(1.0, abs(price_change) / 100.0)
+        # ── Time factor ────────────────────────────────────────────
+        time_factor = min(1.0, minutes_elapsed / total_window) if total_window > 0 else 0
 
-        # Combine factors
+        # ── Reversion penalty ──────────────────────────────────────
+        # More crossings through open = noisier, less directional
+        reversion_penalty = max(0.0, 1.0 - reversion_count * 0.05)
+
+        # ── Confidence model (reweighted) ──────────────────────────
+        # Z-score replaces the old fixed-$ magnitude threshold
+        # Saturate z-score contribution at z=3.0
+        z_factor = min(1.0, z_score / 3.0)
+
         confidence = (
-            0.40 * time_factor +       # more time elapsed = more locked in
-            0.30 * consistency +        # more consistent = stronger trend
-            0.30 * magnitude            # bigger move = more significant
+            0.35 * time_factor +
+            0.35 * z_factor +
+            0.15 * consistency +
+            0.15 * reversion_penalty
         )
 
         # Clamp
         confidence = max(0.10, min(0.95, confidence))
 
-        # Boost if near end of window with clear direction
-        if minutes_remaining < 2 and abs(price_change) > 20:
+        # Boost near resolution with strong vol-adjusted move
+        if minutes_remaining < 2.0 and z_score > 1.0:
             confidence = min(0.95, confidence + 0.15)
+        elif minutes_remaining < 1.0 and z_score > 0.5:
+            confidence = min(0.95, confidence + 0.20)
 
-        # Reduce if move is tiny (could reverse)
-        if abs(price_change) < 5:
-            confidence *= 0.5
+        # Reduce if move is sub-0.3 sigma (noise)
+        if z_score < 0.3:
+            confidence *= 0.4
 
         return MomentumSignal(
             direction=direction,
@@ -157,4 +186,6 @@ class MomentumDetector:
             minutes_remaining=minutes_remaining,
             current_price=current_price,
             open_price=open_price,
+            z_score=z_score,
+            reversion_count=reversion_count,
         )

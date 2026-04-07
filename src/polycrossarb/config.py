@@ -40,11 +40,13 @@ class Settings(BaseSettings):
     min_leg_value_usd: float = 5.0     # each leg order must be >= $5 (not dust)
     min_leg_volume_usd: float = 500    # each leg must have $500+ volume (real trading activity)
 
-    # Only trade OVERPRICED events (sum > 1.0, sell strategy).
-    # Underpriced events (sum < 1.0, buy all YES) produce lottery tickets
-    # that can't be exited. Selling on overpriced is safer — you receive
-    # USDC upfront and only risk the collateral.
+    # When on-chain merge is disabled, only trade OVERPRICED events.
+    # With merge enabled, underpriced arbs are safely exitable via
+    # mergePositions (buy all tokens on CLOB → redeem for $1.00 on-chain).
     only_overpriced: bool = True
+
+    # On-chain split/merge execution (requires web3)
+    enable_onchain_execution: bool = False  # safety flag — enable after testing
 
     # Kelly fraction: 0.25 = quarter Kelly (academic optimal for prediction markets)
     # Full Kelly maximises growth but has 50% chance of 50% drawdown.

@@ -101,6 +101,11 @@ class ArbOpportunity:
     margin: float  # profit margin as fraction (e.g. 0.03 = 3%)
     profit_per_dollar: float
     details: str = ""
+    # Execution strategy: how to execute this arb
+    #   "clob_only" — buy/sell all legs on CLOB (default)
+    #   "split_then_sell" — mint tokens via splitPosition, sell on CLOB (overpriced)
+    #   "buy_then_merge" — buy tokens on CLOB, redeem via mergePositions (underpriced)
+    execution_strategy: str = "clob_only"
 
     @property
     def market_ids(self) -> list[str]:

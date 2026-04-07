@@ -24,7 +24,8 @@ from polycrossarb.execution.fees import prefetch_fee_rates
 from polycrossarb.config import settings
 from polycrossarb.data.client import PolymarketClient
 from polycrossarb.data.models import Market
-from polycrossarb.execution.executor import ExecutionMode, LiveExecutor, PaperExecutor
+from polycrossarb.arb.detector import detect_single_market_orderbook_arbs
+from polycrossarb.execution.executor import ExecutionMode, LiveExecutor, PaperExecutor, HybridExecutor
 from polycrossarb.graph.dependency import DependencyGraph
 from polycrossarb.risk.manager import RiskManager
 from polycrossarb.solver.linear import solve_all_partitions
@@ -49,6 +50,7 @@ class Pipeline:
         self._graph = DependencyGraph()
         self._paper_executor = PaperExecutor(self._risk)
         self._live_executor = LiveExecutor(self._risk)
+        self._hybrid_executor = HybridExecutor(self._risk)
 
         self._markets: list[Market] = []
         self._cycle_count = 0
@@ -109,30 +111,50 @@ class Pipeline:
             # ── 3. Detect arbitrage ───────────────────────────────
             cross_opps = detect_cross_market_arbs(priced, exclusive_only=True)
 
+            # ── 3a. Also scan binary markets for merge/split (vidarx pattern)
+            # Find 2-outcome markets with mid-price sum near 1.0 (potential arbs)
+            binary_candidates = [
+                m for m in priced
+                if m.num_outcomes == 2
+                and not m.closed and m.active
+                and abs(m.outcome_price_sum - 1.0) < 0.10  # within 10% of 1.0
+                and m.volume >= 100  # minimum activity
+            ][:100]  # cap at 100 to limit API calls
+
+            # Fetch order books for binary candidates
+            if binary_candidates:
+                await self._client.enrich_with_order_books(binary_candidates, concurrency=30)
+
+            # Detect real book-level arbs on binary markets
+            book_opps = detect_single_market_orderbook_arbs(binary_candidates, min_margin=0.01)
+
+            all_opps = cross_opps + book_opps
+
             log.info(
                 "cycle.detect",
                 cycle=cycle_id,
                 cross_opps=len(cross_opps),
+                book_opps=len(book_opps),
                 partitions=len(partitions),
                 bankroll=f"${self._risk.effective_bankroll:.2f}",
             )
 
-            if not cross_opps:
+            if not all_opps:
                 self._log_cycle(cycle_id, cycle_start, 0, 0)
                 return
 
-            # ── 3b. Enrich TOP arb candidates with order books + fees
-            # Sort by margin, only fetch books for top 50 opportunities
+            # ── 3b. Enrich TOP cross-arb candidates with order books + fees
             top_opps = sorted(cross_opps, key=lambda o: o.margin, reverse=True)[:50]
             top_market_ids = {m.condition_id for opp in top_opps for m in opp.markets}
             arb_markets = [m for m in priced if m.condition_id in top_market_ids]
 
-            # Fetch order books for executable price accuracy
-            await self._client.enrich_with_order_books(arb_markets, concurrency=30)
+            if arb_markets:
+                await self._client.enrich_with_order_books(arb_markets, concurrency=30)
 
-            # Prefetch live fee rates for candidates
+            # Prefetch live fee rates for all candidates
+            all_candidate_markets = arb_markets + binary_candidates
             prefetch_fee_rates([
-                o.token_id for m in arb_markets
+                o.token_id for m in all_candidate_markets
                 for o in m.outcomes if o.token_id
             ])
 
@@ -148,10 +170,67 @@ class Pipeline:
                 min_profit=settings.min_profit_usd,
             )
 
-            log.info("cycle.solve", cycle=cycle_id, profitable=len(results))
+            log.info("cycle.solve", cycle=cycle_id, profitable=len(results),
+                     book_opps=len(book_opps))
+
+            # ── 4b. Convert book arbs to SolverResults for unified execution
+            from polycrossarb.solver.linear import SolverResult, TradeOrder
+            from polycrossarb.execution.fees import calculate_taker_fee, estimate_gas_cost
+
+            for opp in book_opps:
+                if self._risk.available_capital < 1.0:
+                    break
+
+                market = opp.markets[0]
+                orders = []
+                total_cost = 0.0
+
+                for idx, outcome in enumerate(market.outcomes):
+                    if not outcome.order_book:
+                        continue
+                    price = outcome.order_book.best_ask if opp.arb_type == "single_under_book" else outcome.order_book.best_bid
+                    if not price:
+                        continue
+
+                    # Size: use available capital, capped by depth
+                    max_usd = min(self._risk.available_capital / max(market.num_outcomes, 1), self._risk.max_per_market)
+                    shares = max_usd / price if price > 0 else 0
+                    if shares * price < 1.0:
+                        shares = 0
+                        continue
+
+                    side = "buy" if opp.arb_type == "single_under_book" else "sell"
+                    orders.append(TradeOrder(
+                        market_condition_id=market.condition_id,
+                        outcome_idx=idx,
+                        side=side,
+                        size=shares,
+                        price=price,
+                        expected_cost=shares * price,
+                        neg_risk=market.neg_risk,
+                    ))
+                    total_cost += shares * price
+
+                if len(orders) == market.num_outcomes and total_cost >= 1.0:
+                    fees = sum(calculate_taker_fee(o.size, o.price, market.category or "other") for o in orders)
+                    gas = estimate_gas_cost(len(orders) + 1)
+                    profit = opp.margin * (total_cost / max(sum(o.price for o in orders), 0.01)) - fees - gas
+
+                    if profit >= settings.min_profit_usd:
+                        book_result = SolverResult(
+                            status="optimal",
+                            guaranteed_profit=profit,
+                            gross_profit=opp.margin * total_cost,
+                            orders=orders,
+                            total_cost=total_cost,
+                            trading_fees=fees,
+                            gas_fees=gas,
+                            execution_strategy=opp.execution_strategy,
+                        )
+                        results.append(book_result)
 
             if not results:
-                self._log_cycle(cycle_id, cycle_start, len(cross_opps), 0)
+                self._log_cycle(cycle_id, cycle_start, len(all_opps), 0)
                 return
 
             # ── 5 & 6. Risk check + Execute ───────────────────────
@@ -175,6 +254,22 @@ class Pipeline:
                 if self.mode == ExecutionMode.PAPER:
                     exec_result = self._paper_executor.execute(
                         solver_result, trade_markets, event_id,
+                    )
+                elif solver_result.execution_strategy == "split_then_sell":
+                    condition_id = solver_result.orders[0].market_condition_id if solver_result.orders else ""
+                    num_outcomes = len(solver_result.orders)
+                    set_size = solver_result.total_cost
+                    exec_result = await self._hybrid_executor.execute_split_then_sell(
+                        condition_id, num_outcomes, set_size,
+                        solver_result.orders, trade_markets,
+                    )
+                elif solver_result.execution_strategy == "buy_then_merge":
+                    condition_id = solver_result.orders[0].market_condition_id if solver_result.orders else ""
+                    num_outcomes = len(solver_result.orders)
+                    set_size = solver_result.total_cost / max(num_outcomes, 1)
+                    exec_result = await self._hybrid_executor.execute_buy_then_merge(
+                        condition_id, num_outcomes, set_size,
+                        solver_result.orders, trade_markets,
                     )
                 else:
                     exec_result = await self._live_executor.execute(

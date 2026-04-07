@@ -57,6 +57,7 @@ class CryptoPriceFeed:
     """
 
     STALE_THRESHOLD = 10.0  # seconds — mark source as stale after this
+    MIN_SOURCES = 2  # minimum live sources required for reliable price
 
     def __init__(self):
         self._prices: dict[str, PriceSnapshot] = {}
@@ -117,6 +118,11 @@ class CryptoPriceFeed:
     @property
     def n_live_sources(self) -> int:
         return len(self.sources)
+
+    @property
+    def is_reliable(self) -> bool:
+        """True if enough sources are live for reliable price aggregation."""
+        return self.n_live_sources >= self.MIN_SOURCES
 
     @property
     def cross_exchange_spread(self) -> float:
@@ -302,11 +308,13 @@ class CryptoPriceFeed:
         """MEXC BTC/USDT ticker (free, ~200ms)."""
         url = "wss://wbs.mexc.com/ws"
         sub = {"method": "SUBSCRIPTION", "params": ["spot@public.miniTicker.v3.api@BTCUSDT@UTC+8"]}
+        reconnect_delay = 3
         while self._running:
             try:
-                async with websockets.connect(url, ping_interval=20) as ws:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
                     await ws.send(json.dumps(sub))
                     log.info("MEXC WS connected")
+                    reconnect_delay = 3  # reset on successful connect
                     async for msg in ws:
                         if not self._running:
                             break
@@ -321,4 +329,5 @@ class CryptoPriceFeed:
             except Exception as e:
                 if self._running:
                     log.debug("MEXC WS: %s", e)
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 1.5, 30)  # backoff up to 30s

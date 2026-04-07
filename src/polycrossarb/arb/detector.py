@@ -69,12 +69,22 @@ def detect_single_market_arbs(
                 f"Profit: ${-deviation:.4f} per set."
             )
 
+        # Determine execution strategy based on on-chain capability
+        if settings.enable_onchain_execution:
+            if arb_type == "single_over":
+                exec_strategy = "split_then_sell"
+            else:
+                exec_strategy = "buy_then_merge"
+        else:
+            exec_strategy = "clob_only"
+
         opp = ArbOpportunity(
             arb_type=arb_type,
             markets=[market],
             margin=abs(deviation),
             profit_per_dollar=profit_per_dollar,
             details=details,
+            execution_strategy=exec_strategy,
         )
         opportunities.append(opp)
 
@@ -86,8 +96,10 @@ def detect_single_market_orderbook_arbs(
     markets: list[Market],
     min_margin: float | None = None,
 ) -> list[ArbOpportunity]:
-    """Detect arbs using actual order book prices (best bid/ask) rather than
-    mid-prices for more realistic profit estimation.
+    """Detect arbs using actual order book prices (best bid/ask).
+
+    This is the vidarx pattern: find binary markets where
+    ask_YES + ask_NO < 1.0, buy both, merge on-chain for $1.00.
 
     For overpriced markets: use best bids (what we can sell at).
     For underpriced markets: use best asks (what we can buy at).
@@ -108,54 +120,72 @@ def detect_single_market_orderbook_arbs(
             continue
 
         # Check overpriced: can we sell all at bids summing > 1?
+        # With split: mint tokens at $1.00, sell at bids
         bid_sum = 0.0
         all_bids = True
+        min_bid_depth = float("inf")
         for o in market.outcomes:
-            bb = o.order_book.best_bid  # type: ignore[union-attr]
+            bb = o.order_book.best_bid
             if bb is None:
                 all_bids = False
                 break
             bid_sum += bb
+            depth = sum(l.size * l.price for l in o.order_book.bids)
+            min_bid_depth = min(min_bid_depth, depth)
 
-        if all_bids and bid_sum - 1.0 > min_margin:
+        if all_bids and bid_sum - 1.0 > min_margin and min_bid_depth >= 5.0:
             deviation = bid_sum - 1.0
+            exec_strategy = "split_then_sell" if settings.enable_onchain_execution else "clob_only"
             opp = ArbOpportunity(
                 arb_type="single_over_book",
                 markets=[market],
                 margin=deviation,
                 profit_per_dollar=deviation / bid_sum,
                 details=(
-                    f"BOOK BID SUM={bid_sum:.4f}: sell all at bids. "
-                    f"Profit ${deviation:.4f}/set (executable)."
+                    f"SPLIT+SELL: bids={bid_sum:.4f} > $1.00. "
+                    f"Mint at $1.00, sell at bids. "
+                    f"Profit ${deviation:.4f}/set. Depth ${min_bid_depth:.0f}"
                 ),
+                execution_strategy=exec_strategy,
             )
             opportunities.append(opp)
 
         # Check underpriced: can we buy all at asks summing < 1?
+        # With merge: buy at asks, merge on-chain for $1.00
         ask_sum = 0.0
         all_asks = True
+        min_ask_depth = float("inf")
         for o in market.outcomes:
-            ba = o.order_book.best_ask  # type: ignore[union-attr]
+            ba = o.order_book.best_ask
             if ba is None:
                 all_asks = False
                 break
             ask_sum += ba
+            depth = sum(l.size * l.price for l in o.order_book.asks)
+            min_ask_depth = min(min_ask_depth, depth)
 
-        if all_asks and 1.0 - ask_sum > min_margin:
+        if all_asks and 1.0 - ask_sum > min_margin and min_ask_depth >= 5.0:
             deviation = 1.0 - ask_sum
+            exec_strategy = "buy_then_merge" if settings.enable_onchain_execution else "clob_only"
             opp = ArbOpportunity(
                 arb_type="single_under_book",
                 markets=[market],
                 margin=deviation,
                 profit_per_dollar=deviation / ask_sum,
                 details=(
-                    f"BOOK ASK SUM={ask_sum:.4f}: buy all at asks. "
-                    f"Profit ${deviation:.4f}/set (executable)."
+                    f"BUY+MERGE: asks={ask_sum:.4f} < $1.00. "
+                    f"Buy all at asks, merge for $1.00. "
+                    f"Profit ${deviation:.4f}/set. Depth ${min_ask_depth:.0f}"
                 ),
+                execution_strategy=exec_strategy,
             )
             opportunities.append(opp)
 
-    opportunities.sort(key=lambda o: o.margin, reverse=True)
+    # Prioritize: binary first, buy_then_merge second, then margin
+    opportunities.sort(
+        key=lambda o: (len(o.markets) == 1, o.execution_strategy == "buy_then_merge", o.margin),
+        reverse=True,
+    )
     return opportunities
 
 
@@ -246,8 +276,9 @@ def detect_cross_market_arbs(
         if abs(deviation) < min_margin:
             continue
 
-        # Only trade overpriced if configured (avoids buying lottery tickets)
-        if settings.only_overpriced and deviation < 0:
+        # Only trade overpriced if configured — UNLESS on-chain merge is enabled,
+        # which makes underpriced arbs safe (merge redeems to USDC.e, no exit problem)
+        if settings.only_overpriced and not settings.enable_onchain_execution and deviation < 0:
             continue
 
         # Tick size check: margin must survive rounding.
@@ -297,14 +328,28 @@ def detect_cross_market_arbs(
                 f"{'[neg_risk=confirmed exclusive]' if neg_risk else '[check exclusivity]'}"
             )
 
+        # Determine execution strategy
+        if settings.enable_onchain_execution:
+            if arb_type == "cross_over":
+                exec_strategy = "split_then_sell"
+            else:
+                exec_strategy = "buy_then_merge"
+        else:
+            exec_strategy = "clob_only"
+
         opp = ArbOpportunity(
             arb_type=arb_type,
             markets=group,
             margin=abs(deviation),
             profit_per_dollar=profit_per_dollar,
             details=details,
+            execution_strategy=exec_strategy,
         )
         opportunities.append(opp)
 
-    opportunities.sort(key=lambda o: o.margin, reverse=True)
+    # Prioritize: binary (2-leg) first, buy_then_merge second, then margin
+    opportunities.sort(
+        key=lambda o: (len(o.markets) == 2, o.execution_strategy == "buy_then_merge", o.margin),
+        reverse=True,
+    )
     return opportunities

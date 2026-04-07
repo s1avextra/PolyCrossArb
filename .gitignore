@@ -12,4 +12,7 @@ snapshots/
 snapshots*/
 *.pdf
 state.json
+state.db
+*.db-wal
+*.db-shm
 rust_engine/target/

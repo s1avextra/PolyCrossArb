@@ -8,40 +8,34 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import signal
 import sys
 
 sys.path.insert(0, "src")
 
-import structlog
-
 from polycrossarb.execution.executor import ExecutionMode
+from polycrossarb.monitoring.health import HealthServer
+from polycrossarb.monitoring.logging_config import configure_logging
 from polycrossarb.pipeline_ws import WebSocketPipeline
 
-structlog.configure(
-    processors=[
-        structlog.stdlib.add_log_level,
-        structlog.dev.ConsoleRenderer(),
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-)
-
-logging.basicConfig(level=logging.WARNING)
-logging.getLogger("polycrossarb").setLevel(logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("websockets").setLevel(logging.WARNING)
+configure_logging()
 
 
 async def main(mode: str, duration: int | None):
     exec_mode = ExecutionMode.LIVE if mode == "live" else ExecutionMode.PAPER
     pipeline = WebSocketPipeline(mode=exec_mode)
 
+    # Health endpoint for remote monitoring
+    health = HealthServer(port=8080)
+    health.set_status_fn(pipeline.status)
+    health.start()
+
+    def _shutdown():
+        asyncio.ensure_future(pipeline.graceful_shutdown())
+
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, pipeline.stop)
+        loop.add_signal_handler(sig, _shutdown)
 
     if duration:
         # Run for a fixed duration then stop

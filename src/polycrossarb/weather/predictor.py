@@ -136,8 +136,10 @@ def _bracket_margin(info, temp: float) -> float:
     """How far the temperature is from the nearest bracket boundary.
 
     Higher margin = more confidence the temp won't cross into another bracket.
+    Uses math.floor because official high temperatures are rounded down.
     """
-    t = round(temp)
+    import math
+    t = math.floor(temp)
 
     if info.is_lower_bound and info.bracket_high is not None:
         return info.bracket_high - t  # distance below upper limit

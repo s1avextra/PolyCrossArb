@@ -269,7 +269,10 @@ def calculate_taker_fee(
             if cached_fee <= 0:
                 return 0.0
             p = max(0.001, min(0.999, price))
-            fee = shares * p * cached_fee * (p * (1 - p))
+            # Use category exponent for correct fee scaling
+            cat = category.lower().strip()
+            _, exponent, _ = _FALLBACK_SCHEDULE.get(cat, _FALLBACK_SCHEDULE[_FALLBACK_DEFAULT])
+            fee = shares * p * cached_fee * (p * (1 - p)) ** exponent
             fee = max(0.0, round(fee, 4))  # never negative
             if 0 < fee < 0.0001:
                 fee = 0.0001

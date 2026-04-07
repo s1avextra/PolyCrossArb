@@ -37,6 +37,7 @@ class WeatherAggregator:
     """Aggregates temperature data from multiple sources.
 
     Tracks the running maximum observed temperature per city.
+    Auto-resets max_today at each city's local midnight.
     """
 
     def __init__(self, owm_api_key: str = ""):
@@ -45,13 +46,30 @@ class WeatherAggregator:
         self._max_temps: dict[str, float] = {}  # city -> max observed temp
         self._last_readings: dict[str, TemperatureReading] = {}
         self._last_fetch: dict[str, float] = {}
+        self._last_reset_date: dict[str, str] = {}  # city -> "YYYY-MM-DD" of last reset
 
     async def close(self):
         await self._client.aclose()
 
+    def _check_daily_reset(self, city_config: CityConfig):
+        """Reset max_today at the city's local midnight."""
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        local_now = datetime.now(timezone.utc).astimezone(ZoneInfo(city_config.timezone))
+        local_date = local_now.strftime("%Y-%m-%d")
+
+        last_date = self._last_reset_date.get(city_config.name)
+        if last_date != local_date:
+            # New local day — reset max for this city
+            self._max_temps.pop(city_config.name, None)
+            self._last_reset_date[city_config.name] = local_date
+
     async def fetch(self, city_config: CityConfig) -> TemperatureReading | None:
         """Fetch current temperature for a city from the best available source."""
         city = city_config.name
+
+        # Auto-reset max at local midnight
+        self._check_daily_reset(city_config)
 
         # Rate limit: don't fetch same city more than once per 20s
         now = time.time()
