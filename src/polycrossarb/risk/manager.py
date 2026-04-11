@@ -375,8 +375,80 @@ class RiskManager:
                 event_id TEXT PRIMARY KEY,
                 last_trade_time REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                contract_id TEXT PRIMARY KEY,
+                payload     TEXT NOT NULL
+            );
         """)
         con.close()
+
+    # ── Generic key-value meta store (breaker state, kill flags, etc.) ──
+
+    def set_meta(self, key: str, value: str) -> None:
+        con = self._db()
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        con = self._db()
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            return row[0] if row else default
+        finally:
+            con.close()
+
+    def clear_meta(self, key: str) -> None:
+        con = self._db()
+        try:
+            con.execute("DELETE FROM meta WHERE key=?", (key,))
+            con.commit()
+        finally:
+            con.close()
+
+    # ── Paper-position persistence (candle strategy) ──
+
+    def save_paper_positions(self, positions: dict[str, dict]) -> None:
+        """Replace stored paper positions with the given dict."""
+        con = self._db()
+        try:
+            con.execute("BEGIN")
+            con.execute("DELETE FROM paper_positions")
+            for cid, pos in positions.items():
+                con.execute(
+                    "INSERT INTO paper_positions (contract_id, payload) VALUES (?, ?)",
+                    (cid, json.dumps(pos)),
+                )
+            con.commit()
+        except Exception:
+            con.rollback()
+            log.exception("Failed to save paper positions")
+        finally:
+            con.close()
+
+    def load_paper_positions(self) -> dict[str, dict]:
+        con = self._db()
+        try:
+            out: dict[str, dict] = {}
+            for cid, payload in con.execute(
+                "SELECT contract_id, payload FROM paper_positions"
+            ):
+                try:
+                    out[cid] = json.loads(payload)
+                except Exception:
+                    continue
+            return out
+        finally:
+            con.close()
 
     def _db(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path)

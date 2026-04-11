@@ -61,6 +61,34 @@ class Settings(BaseSettings):
     min_crypto_edge: float = 0.03
     max_crypto_position_pct: float = 0.10
 
+    # ── Candle strategy zone gates ────────────────────────────────
+    # Three-zone entry timing. Tunable from .env without redeploy.
+    candle_zone_early_min_confidence: float = 0.55
+    candle_zone_early_min_z: float = 2.0
+    candle_zone_early_min_edge: float = 0.03
+    candle_zone_primary_min_z: float = 1.0
+    candle_zone_late_min_confidence: float = 0.65
+    candle_zone_late_min_z: float = 0.5
+    candle_zone_late_min_edge: float = 0.08
+    candle_dead_zone_lo: float = 0.80
+    candle_dead_zone_hi: float = 0.90
+    candle_min_price: float = 0.10
+    candle_max_price: float = 0.90
+    candle_edge_cap: float = 0.25
+    candle_skip_dead_zone: bool = True
+
+    # ── Candle circuit breaker ────────────────────────────────────
+    candle_breaker_min_trades: int = 20
+    candle_breaker_min_win_rate: float = 0.65
+    candle_breaker_max_drawdown_pct: float = 0.30
+
+    # ── Operational kill switch ───────────────────────────────────
+    # Touch this file from any shell to halt trading immediately.
+    kill_switch_path: str = "/tmp/polycrossarb/KILL"
+
+    # Hard-fail in live mode if alerter webhook is missing
+    alert_required: bool = False
+
     @field_validator("max_total_exposure_usd", "max_position_per_market_usd")
     @classmethod
     def must_be_positive(cls, v: float, info) -> float:

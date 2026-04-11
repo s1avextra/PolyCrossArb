@@ -101,8 +101,22 @@ async def main(mode: str, bankroll: float | None, duration: int | None = None):
     collector = DataCollector()
 
     loop = asyncio.get_event_loop()
-    for sig_name in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig_name, lambda: (pipeline.stop(), collector.stop()))
+
+    def _handle_signal(sig_name: str) -> None:
+        # Spawn the async shutdown so we can drain paper-position state
+        # and send the shutdown alert before the process exits.
+        async def _do():
+            try:
+                await pipeline.shutdown(reason=f"signal {sig_name}")
+            finally:
+                try:
+                    collector.stop()
+                except Exception:
+                    pass
+        asyncio.create_task(_do())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _handle_signal, sig.name)
 
     if duration:
         async def stop_after():

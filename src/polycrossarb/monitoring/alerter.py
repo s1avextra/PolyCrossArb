@@ -4,6 +4,8 @@ Sends alerts to Slack or Telegram when the bot needs human attention.
 Configure via environment variables:
   ALERT_WEBHOOK_URL  — Slack incoming webhook or Telegram bot URL
   ALERT_CHANNEL      — "slack" or "telegram" (default: slack)
+  ALERT_REQUIRED     — "1" to make a missing webhook a hard error (live mode)
+  ALERT_DRY_RUN      — "1" to capture alerts in memory instead of POSTing (tests)
 
 Alerts fire on:
   - Circuit breaker tripped
@@ -27,6 +29,39 @@ log = logging.getLogger(__name__)
 _COOLDOWN_SECONDS = 300
 _last_alert: dict[str, float] = {}
 
+# Dry-run capture for tests: list of (category, message) tuples
+_dry_run_buffer: list[tuple[str, str]] = []
+
+
+class AlerterNotConfigured(RuntimeError):
+    """Raised when ALERT_REQUIRED=1 but ALERT_WEBHOOK_URL is unset."""
+
+
+def require_alerter_configured() -> None:
+    """Verify alerter is wired. Call once at startup in live mode.
+
+    Raises AlerterNotConfigured if ALERT_WEBHOOK_URL is unset and
+    ALERT_DRY_RUN is not enabled. Independent of ALERT_REQUIRED so
+    callers can fail-fast regardless of env var.
+    """
+    if os.environ.get("ALERT_DRY_RUN") == "1":
+        return
+    if not os.environ.get("ALERT_WEBHOOK_URL", "").strip():
+        raise AlerterNotConfigured(
+            "ALERT_WEBHOOK_URL must be set in live mode. "
+            "Set ALERT_DRY_RUN=1 only in tests."
+        )
+
+
+def reset_dry_run_buffer() -> None:
+    """Clear the in-memory alert buffer (test helper)."""
+    _dry_run_buffer.clear()
+
+
+def get_dry_run_alerts() -> list[tuple[str, str]]:
+    """Return captured alerts from dry-run mode (test helper)."""
+    return list(_dry_run_buffer)
+
 
 def _should_alert(category: str) -> bool:
     now = time.time()
@@ -44,26 +79,35 @@ def _get_config() -> tuple[str, str]:
 
 
 def _send(message: str, category: str) -> None:
-    """Send an alert via webhook. Non-blocking, fire-and-forget."""
+    """Send an alert via webhook. Non-blocking, fire-and-forget.
+
+    In dry-run mode (ALERT_DRY_RUN=1), captures alerts in memory.
+    If ALERT_REQUIRED=1 and no webhook is configured, raises.
+    """
+    if os.environ.get("ALERT_DRY_RUN") == "1":
+        if _should_alert(category):
+            _dry_run_buffer.append((category, message))
+        return
+
     url, channel = _get_config()
     if not url:
-        log.debug("No ALERT_WEBHOOK_URL configured — alert suppressed: %s", message[:80])
+        if os.environ.get("ALERT_REQUIRED") == "1":
+            raise AlerterNotConfigured(
+                f"Alert [{category}] requested but ALERT_WEBHOOK_URL is unset"
+            )
+        log.warning("No ALERT_WEBHOOK_URL configured — alert dropped: [%s] %s",
+                    category, message[:80])
         return
 
     if not _should_alert(category):
         return
 
     try:
-        if channel == "telegram":
-            # Telegram Bot API: POST /sendMessage
-            # URL format: https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>
-            httpx.post(url, json={"text": message}, timeout=5)
-        else:
-            # Slack incoming webhook
-            httpx.post(url, json={"text": message}, timeout=5)
+        # Both Slack and Telegram bot URLs accept POST {"text": ...}
+        httpx.post(url, json={"text": message}, timeout=5)
         log.info("Alert sent [%s]: %s", category, message[:60])
     except Exception:
-        log.debug("Alert delivery failed for [%s]", category)
+        log.warning("Alert delivery failed for [%s]", category)
 
 
 # ── Public API ─────────────────────────────────────────────

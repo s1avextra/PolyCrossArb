@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,15 +19,53 @@ jobs:
       - name: Install uv
         run: pip install uv
 
-      - name: Install dependencies
-        run: uv pip install --system ".[dev]"
+      - name: Install dependencies (with execution + dev extras)
+        run: uv pip install --system ".[dev,execution]"
 
-      - name: Run unit tests
-        run: pytest tests/ -v
+      - name: Install ruff and mypy
+        run: pip install ruff mypy
+
+      - name: Lint (ruff check)
+        run: ruff check src/ tests/ scripts/
+
+      - name: Type check (mypy, non-blocking)
+        # Mypy starts permissive — strict mode comes after Phase 3
+        continue-on-error: true
+        run: mypy --ignore-missing-imports --no-strict-optional src/polycrossarb
+
+      - name: Run unit tests with coverage
+        run: |
+          pip install pytest-cov
+          pytest tests/ -v --cov=polycrossarb --cov-report=term-missing --cov-fail-under=20
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust_engine/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust_engine/Cargo.lock', 'rust_engine/Cargo.toml') }}
+
+      - name: Build rust_engine (release)
+        working-directory: rust_engine
+        run: cargo build --release --locked
+
+      - name: Cargo test
+        working-directory: rust_engine
+        run: cargo test --release --locked
 
   smoke-test:
     runs-on: ubuntu-latest
-    # Only run smoke test on main branch (requires API access)
+    needs: [python]
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +78,7 @@ jobs:
         run: pip install uv
 
       - name: Install dependencies
-        run: uv pip install --system ".[dev]"
+        run: uv pip install --system ".[dev,execution]"
 
       - name: API smoke test
         run: python scripts/smoke_test.py

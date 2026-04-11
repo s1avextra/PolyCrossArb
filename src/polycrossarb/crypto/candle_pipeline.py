@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,27 +28,33 @@ from pathlib import Path
 import structlog
 
 from polycrossarb.config import settings
-from polycrossarb.data.client import PolymarketClient
-from polycrossarb.execution.executor import ExecutionMode, SingleLegExecutor
-from polycrossarb.risk.manager import RiskManager
-from polycrossarb.solver.linear import TradeOrder
 from polycrossarb.crypto.candle_scanner import CandleContract, scan_candle_markets
+from polycrossarb.crypto.decision import (
+    CandleDecision,
+    SkipReason,
+    decide_candle_trade,
+    zone_config_from_settings,
+)
 from polycrossarb.crypto.fair_value import compute_fair_value
 from polycrossarb.crypto.momentum import MomentumDetector, MomentumSignal
 from polycrossarb.crypto.price_feed import CryptoPriceFeed
-from polycrossarb.monitoring.alerter import alert_circuit_breaker, alert_trade
+from polycrossarb.data.client import PolymarketClient
+from polycrossarb.execution.executor import ExecutionMode, SingleLegExecutor
+from polycrossarb.monitoring.alerter import (
+    alert_circuit_breaker,
+    alert_shutdown,
+    alert_trade,
+    require_alerter_configured,
+)
 from polycrossarb.monitoring.session_monitor import SessionMonitor
+from polycrossarb.risk.manager import RiskManager
+from polycrossarb.solver.linear import TradeOrder
 
 log = structlog.get_logger(__name__)
 
 
 class CandlePipeline:
     """High-frequency BTC candle trading pipeline."""
-
-    # ── Circuit breaker defaults ──────────────────────────────────
-    BREAKER_MIN_TRADES = 20       # need N resolved trades before checking
-    BREAKER_MIN_WIN_RATE = 0.65   # auto-stop below this win rate
-    BREAKER_MAX_DRAWDOWN_PCT = 0.30  # auto-stop if drawdown > 30% of peak
 
     def __init__(
         self,
@@ -60,6 +67,20 @@ class CandlePipeline:
         self.mode = mode
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
+
+        # Live mode requires alerter to be configured up front so a missing
+        # webhook fails fast instead of silently dropping CIRCUIT BREAKER
+        # alerts later.
+        if mode == ExecutionMode.LIVE and settings.alert_required:
+            require_alerter_configured()
+
+        # Pull tunables from settings (config-driven, no code edits to tune)
+        self.BREAKER_MIN_TRADES = settings.candle_breaker_min_trades
+        self.BREAKER_MIN_WIN_RATE = settings.candle_breaker_min_win_rate
+        self.BREAKER_MAX_DRAWDOWN_PCT = settings.candle_breaker_max_drawdown_pct
+        self._zone_config = zone_config_from_settings()
+        self._kill_switch_path = Path(settings.kill_switch_path)
+        self._skip_dead_zone = settings.candle_skip_dead_zone
 
         self._client = PolymarketClient()
         self._risk = risk_manager or RiskManager()
@@ -87,6 +108,38 @@ class CandlePipeline:
         self._running = False
         self._breaker_tripped = False
         self._monitor = SessionMonitor()
+
+        # Restore breaker state and any in-flight paper positions across restarts
+        try:
+            if self._risk.get_meta("candle_breaker_tripped") == "1":
+                self._breaker_tripped = True
+                log.warning("candle.breaker.restored",
+                            note="circuit breaker was tripped before restart")
+            stored_pp = self._risk.load_paper_positions()
+            if stored_pp:
+                self._paper_positions.update(stored_pp)
+                log.info("candle.paper_positions.restored", n=len(stored_pp))
+        except Exception:
+            log.exception("candle.state_restore_failed")
+
+    def _kill_switch_active(self) -> bool:
+        """Operational halt — touch this file to stop trading instantly."""
+        try:
+            return self._kill_switch_path.exists()
+        except Exception:
+            return False
+
+    def _persist_breaker_tripped(self) -> None:
+        try:
+            self._risk.set_meta("candle_breaker_tripped", "1")
+        except Exception:
+            log.exception("candle.breaker.persist_failed")
+
+    def _persist_paper_positions(self) -> None:
+        try:
+            self._risk.save_paper_positions(self._paper_positions)
+        except Exception:
+            log.exception("candle.paper_positions.persist_failed")
 
     async def run(self) -> None:
         """Run the candle trading pipeline."""
@@ -122,8 +175,49 @@ class CandlePipeline:
                      profit=f"${self._total_profit:.2f}")
 
     def stop(self):
+        """Synchronous stop — used by signal handlers and the breaker."""
         self._running = False
-        self._price_feed.stop()
+        try:
+            self._price_feed.stop()
+        except Exception:
+            pass
+
+    async def shutdown(self, reason: str = "shutdown") -> None:
+        """Graceful async shutdown.
+
+        Persists state, fires a shutdown alert, and signals the run loop
+        to exit. Safe to call multiple times — idempotent.
+
+        Caller (signal handler / supervisor) should ``await`` this so the
+        outstanding work has a chance to drain before the process exits.
+        """
+        if not self._running:
+            return
+        log.info("candle.shutdown.start", reason=reason)
+        self._running = False
+        try:
+            self._price_feed.stop()
+        except Exception:
+            log.exception("candle.shutdown.price_feed_stop_failed")
+
+        try:
+            self._persist_paper_positions()
+        except Exception:
+            log.exception("candle.shutdown.persist_paper_failed")
+
+        try:
+            alert_shutdown(
+                reason=reason,
+                pnl=self._realized_profit,
+                trades=self._wins + self._losses,
+            )
+        except Exception:
+            log.exception("candle.shutdown.alert_failed")
+
+        log.info("candle.shutdown.done",
+                 reason=reason,
+                 wins=self._wins, losses=self._losses,
+                 realized=f"${self._realized_profit:.2f}")
 
     def _check_circuit_breaker(self) -> bool:
         """Check if safety limits are breached. Returns True if tripped."""
@@ -275,10 +369,13 @@ class CandlePipeline:
 
             for cid in resolved:
                 del self._paper_positions[cid]
+            if resolved:
+                self._persist_paper_positions()
 
             # Check circuit breaker after resolutions
             if resolved and self._check_circuit_breaker():
                 self._breaker_tripped = True
+                self._persist_breaker_tripped()
                 total_resolved = self._wins + self._losses
                 wr = self._wins / max(total_resolved, 1)
                 alert_circuit_breaker("candle", "auto-stop triggered", {
@@ -384,6 +481,32 @@ class CandlePipeline:
             self._momentum.add_tick(btc)
             self._momentum.set_realized_vol(self._price_feed.volatility)
 
+            # ── Hard kill switch (touch /tmp/polycrossarb/KILL) ──
+            if self._kill_switch_active():
+                log.warning("candle.kill_switch_active",
+                            path=str(self._kill_switch_path))
+                self._breaker_tripped = True
+                self._persist_breaker_tripped()
+                alert_circuit_breaker("candle", "kill switch", {
+                    "path": str(self._kill_switch_path),
+                })
+                self.stop()
+                continue
+
+            # ── Eager circuit breaker (every cycle, not just on resolution) ──
+            if not self._breaker_tripped and self._check_circuit_breaker():
+                self._breaker_tripped = True
+                self._persist_breaker_tripped()
+                total_resolved = self._wins + self._losses
+                wr = self._wins / max(total_resolved, 1)
+                alert_circuit_breaker("candle", "auto-stop (eager)", {
+                    "win_rate": f"{wr:.0%}",
+                    "drawdown": f"${self._peak_profit - self._realized_profit:.2f}",
+                    "trades": total_resolved,
+                })
+                self.stop()
+                continue
+
             # Skip trading if circuit breaker tripped
             if self._breaker_tripped:
                 await asyncio.sleep(1)
@@ -426,6 +549,12 @@ class CandlePipeline:
 
                 # Calculate window elapsed
                 window_minutes = self._estimate_window_minutes(contract)
+                if window_minutes <= 0:
+                    # Unparseable description — skip rather than fall back
+                    self._monitor.record_signal_skip(
+                        cid, "window_parse_failed"
+                    )
+                    continue
                 minutes_elapsed = max(0, window_minutes - minutes_left)
 
                 if minutes_elapsed < 0.5:
@@ -447,107 +576,44 @@ class CandlePipeline:
                 if not signal:
                     continue
 
-                # ── 3-Zone entry timing ────────────────────────────────
-                # Zone determines confidence/edge thresholds based on
-                # where we are in the window. Early entries get better
-                # prices, late entries need stronger signals.
-                elapsed_pct = minutes_elapsed / window_minutes if window_minutes > 0 else 1.0
+                # ── Pure decision function (shared with backtest) ──
+                # Same code path runs in live and L2 backtest — see
+                # polycrossarb.crypto.decision.decide_candle_trade
+                decision = decide_candle_trade(
+                    signal=signal,
+                    minutes_elapsed=minutes_elapsed,
+                    minutes_remaining=minutes_left,
+                    window_minutes=window_minutes,
+                    up_price=contract.up_price,
+                    down_price=contract.down_price,
+                    btc_price=btc,
+                    open_btc=signal.open_price,
+                    implied_vol=self._price_feed.implied_volatility,
+                    min_confidence=self._min_confidence,
+                    min_edge=self._min_edge,
+                    skip_dead_zone=self._skip_dead_zone,
+                    zone_config=self._zone_config,
+                )
 
-                if elapsed_pct < 0.40:
-                    # EARLY ZONE: only trade on very strong vol-adjusted signals
-                    zone = "early"
-                    zone_min_confidence = 0.55
-                    zone_min_z_score = 2.0
-                    zone_min_edge = 0.03
-                elif elapsed_pct < 0.80:
-                    # PRIMARY ZONE: sweet spot — decent signal + decent price
-                    zone = "primary"
-                    zone_min_confidence = self._min_confidence
-                    zone_min_z_score = 1.0
-                    zone_min_edge = self._min_edge
-                else:
-                    # LATE ZONE: only trade with strong edge (market is priced in)
-                    zone = "late"
-                    zone_min_confidence = 0.65
-                    zone_min_z_score = 0.5
-                    zone_min_edge = max(self._min_edge, 0.08)
-
-                if signal.confidence < zone_min_confidence:
-                    self._monitor.record_signal_skip(cid, f"low_confidence_{zone}_{signal.confidence:.2f}")
+                if isinstance(decision, SkipReason):
+                    self._monitor.record_signal_skip(
+                        cid, f"{decision.reason}_{decision.zone}_{decision.detail}"
+                    )
                     continue
 
-                if signal.z_score < zone_min_z_score:
-                    self._monitor.record_signal_skip(cid, f"low_zscore_{zone}_{signal.z_score:.2f}")
-                    continue
-
-                # Skip 80-90% confidence dead zone — backtesting shows
-                # this bucket has 66% WR but net negative P&L
-                if 0.80 <= signal.confidence < 0.90:
-                    self._monitor.record_signal_skip(cid, "confidence_dead_zone_80_90")
-                    continue
-
-                # Check edge: is the market mispricing the direction?
-                if signal.direction == "up":
-                    market_price = contract.up_price
-                    token_id = contract.up_token_id
-                else:
-                    market_price = contract.down_price
-                    token_id = contract.down_token_id
-
-                # Skip lottery tickets and near-certainties
-                if market_price < 0.10 or market_price > 0.90:
-                    self._monitor.record_signal_skip(cid, f"price_out_of_range_{market_price:.2f}")
-                    continue
-
-                # ── YES+NO mispricing check ────────────────────────────
-                # If up_price + down_price != 1.0, there's a risk-free
-                # arb on top of directional edge. Log it.
-                vig = contract.up_price + contract.down_price - 1.0
-                if abs(vig) > 0.02:
+                # Decision is a CandleDecision — proceed to execute
+                if abs(decision.yes_no_vig) > 0.02:
                     log.info("candle.mispricing",
                              cid=cid[:16],
                              up=f"${contract.up_price:.3f}",
                              down=f"${contract.down_price:.3f}",
-                             vig=f"{vig:+.3f}")
+                             vig=f"{decision.yes_no_vig:+.3f}")
 
-                # ── Black-Scholes fair value ───────────────────────────
-                # Use BS binary pricing with vol + time remaining instead
-                # of the old heuristic dampening.
-                vol = self._price_feed.implied_volatility
-                days_remaining = minutes_left / 1440.0
-                open_btc = signal.open_price
-
-                if signal.direction == "up":
-                    # P(BTC > open_price at expiry) via BS
-                    fv_result = compute_fair_value(
-                        btc_price=btc,
-                        strike=open_btc,
-                        days_to_expiry=days_remaining,
-                        volatility=vol,
-                        market_price=market_price,
-                    )
-                    fair_value = fv_result.fair_price
-                else:
-                    # P(BTC < open_price) = 1 - P(BTC > open_price)
-                    fv_result = compute_fair_value(
-                        btc_price=btc,
-                        strike=open_btc,
-                        days_to_expiry=days_remaining,
-                        volatility=vol,
-                        market_price=market_price,
-                    )
-                    fair_value = 1.0 - fv_result.fair_price
-
-                edge = fair_value - market_price
-
-                # Cap edge at realistic maximum — edges >25% signal stale prices
-                if edge > 0.25:
-                    self._monitor.record_signal_skip(cid, f"edge_too_high_{edge:.2f}")
-                    continue
-
-                if edge < zone_min_edge:
-                    self._monitor.record_signal_skip(cid, f"low_edge_{zone}_{edge:.3f}")
-                    continue
+                token_id = contract.up_token_id if decision.direction == "up" else contract.down_token_id
+                market_price = decision.market_price
+                fair_value = decision.fair_value
+                edge = decision.edge
+                zone = decision.zone
 
                 # Mark this window as traded (even before execution)
                 traded_windows.add(window_key)
@@ -587,13 +653,16 @@ class CandlePipeline:
                 await asyncio.sleep(0.5 - elapsed)
 
     def _estimate_window_minutes(self, contract: CandleContract) -> float:
-        """Estimate the window length from the description."""
+        """Estimate the window length from the description.
+
+        Returns the parsed minute count, or 0.0 if the description does
+        not match a known shape. Callers must treat 0.0 as "skip this
+        contract" rather than defaulting to a guessed window — silently
+        bucketing every unparseable contract into 15m has caused stale
+        windows in past traces.
+        """
         desc = contract.window_description.lower()
         if "am-" in desc or "pm-" in desc:
-            # Parse time range
-            # "3:45AM-4:00AM" = 15 min
-            # "4:00AM-4:05AM" = 5 min
-            # "12:00AM-4:00AM" = 240 min
             parts = desc.replace("et", "").strip().split("-")
             if len(parts) == 2:
                 try:
@@ -606,10 +675,13 @@ class CandlePipeline:
                     return diff
                 except (ValueError, IndexError):
                     pass
-        # Hourly contracts
+        # Hourly contracts have a single hour token in the question
         if any(f"{h}am" in desc or f"{h}pm" in desc for h in range(1, 13)):
             return 60
-        return 15  # default
+        log.warning("candle.window_parse_failed",
+                    cid=contract.market.condition_id[:16],
+                    desc=contract.window_description[:60])
+        return 0.0
 
     async def _execute_candle_trade(
         self,
@@ -703,6 +775,7 @@ class CandlePipeline:
                     "open_btc": signal.open_price,
                     "end_time": end.timestamp(),
                 }
+                self._persist_paper_positions()
             except (ValueError, TypeError):
                 pass
 

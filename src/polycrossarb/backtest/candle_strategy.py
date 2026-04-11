@@ -1,0 +1,316 @@
+"""Candle strategy adapter for L2 backtest engine.
+
+Bridges:
+  - L2BacktestEngine event stream (real PMXT order book updates)
+  - BTCHistory (real historical BTC ticks)
+  - CandleRegistry (token_id -> candle window metadata)
+  - MomentumDetector (live strategy code, unchanged)
+  - decide_candle_trade (live decision logic, unchanged)
+
+The result is a strategy callback that the L2 engine can plug in to
+replay any historical period and report what the live bot would have
+done — using the SAME code paths as production.
+
+This is the "code parity" pattern that gives 1:1 correspondence between
+live and backtest, modulo (a) the fill model and (b) the latency model.
+"""
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from polycrossarb.backtest.btc_history import BTCHistory
+from polycrossarb.backtest.candle_registry import CandleContract, CandleRegistry
+from polycrossarb.backtest.l2_replay import BacktestOrder, TokenBook
+from polycrossarb.crypto.decision import (
+    CandleDecision,
+    SkipReason,
+    ZoneConfig,
+    decide_candle_trade,
+)
+from polycrossarb.crypto.momentum import MomentumDetector
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class WindowState:
+    """Per-candle-window tracking state."""
+    contract: CandleContract
+    open_btc: float = 0.0
+    last_btc: float = 0.0
+    traded: bool = False
+    decision: CandleDecision | None = None
+    skip_history: list[SkipReason] = field(default_factory=list)
+
+
+@dataclass
+class StrategyConfig:
+    """Tunable parameters for the candle backtest.
+
+    ``zone_config`` parity: if None at construction, the adapter snaps to
+    the *current* settings.candle_zone_* values via
+    ``zone_config_from_settings()``. This guarantees a backtest run uses
+    the same zone gates as the live bot would in the same .env, so .env
+    tweaks can be A/B-tested in the backtest before deploying.
+    """
+    min_confidence: float = 0.60
+    min_edge: float = 0.07
+    realized_vol: float = 0.50
+    position_size_usd: float = 5.0
+    fee_rate: float = 0.072
+    use_implied_vol: bool = False  # if True, vol is recomputed from BTC history
+    vol_lookback_seconds: float = 3600.0
+    skip_dead_zone: bool = True
+    zone_config: ZoneConfig | None = None
+
+
+class CandleStrategyAdapter:
+    """Wraps the live candle decision logic for the L2 backtest engine.
+
+    The adapter is stateful per strategy instance:
+      - Tracks per-window open BTC prices
+      - Maintains a MomentumDetector instance
+      - Records skip reasons per window for post-mortem analysis
+
+    Usage:
+        registry = CandleRegistry()
+        registry.fetch_range(start, end)
+
+        btc = BTCHistory()
+        btc.load_csv("data/btcusdt_1s_7d.csv")
+
+        adapter = CandleStrategyAdapter(
+            registry=registry,
+            btc_history=btc,
+            config=StrategyConfig(min_edge=0.07),
+        )
+
+        engine = L2BacktestEngine(latency=preset_dublin_vps())
+        engine.replay(
+            start=start,
+            end=end,
+            token_ids=registry.all_token_ids(),
+            strategy=adapter.on_event,
+            fee_rate=config.fee_rate,
+        )
+
+        for window_id, state in adapter.windows.items():
+            print(state.contract.window_label, state.decision, len(state.skip_history))
+    """
+
+    def __init__(
+        self,
+        registry: CandleRegistry,
+        btc_history: BTCHistory,
+        config: StrategyConfig | None = None,
+    ):
+        self.registry = registry
+        self.btc_history = btc_history
+        self.config = config or StrategyConfig()
+
+        # Snap to live settings.candle_zone_* if the caller didn't pin a
+        # ZoneConfig — keeps backtest semantics aligned with live .env.
+        if self.config.zone_config is None:
+            from polycrossarb.crypto.decision import zone_config_from_settings
+            self._zone_config = zone_config_from_settings()
+        else:
+            self._zone_config = self.config.zone_config
+
+        self._momentum = MomentumDetector(realized_vol=self.config.realized_vol)
+        self._momentum.set_realized_vol(self.config.realized_vol)
+
+        # Window state, keyed by condition_id
+        self.windows: dict[str, WindowState] = {}
+
+        # Throttle BTC tick feed to once per second per condition
+        self._last_tick_ts: dict[str, float] = {}
+
+        # Skip reason counter for analysis
+        self.skip_counts: dict[str, int] = defaultdict(int)
+
+        # Trade decisions (one per window — first signal that fires)
+        self.decisions: list[CandleDecision] = []
+        self.decisions_by_window: dict[str, CandleDecision] = {}
+
+        # Stats
+        self.events_processed = 0
+        self.signals_evaluated = 0
+        self.btc_lookups = 0
+
+    def _get_window_state(self, contract: CandleContract) -> WindowState:
+        cid = contract.condition_id
+        if cid not in self.windows:
+            self.windows[cid] = WindowState(contract=contract)
+        return self.windows[cid]
+
+    def _btc_at(self, ts_s: float) -> float:
+        """Lookup BTC price from history, falling back to 0 if missing."""
+        self.btc_lookups += 1
+        return self.btc_history.price_at_seconds(ts_s)
+
+    def _vol_at(self, ts_s: float) -> float:
+        """Get vol estimate at timestamp."""
+        if self.config.use_implied_vol:
+            return self.btc_history.realized_vol_at(
+                int(ts_s * 1000),
+                lookback_seconds=self.config.vol_lookback_seconds,
+            )
+        return self.config.realized_vol
+
+    def on_event(
+        self,
+        ts_s: float,
+        token_id: str,
+        book: TokenBook,
+        history: dict[str, list[tuple[float, float]]],
+    ) -> list[BacktestOrder]:
+        """Strategy callback for L2BacktestEngine.
+
+        Called on every PMXT event. Decides whether to place a trade.
+        """
+        self.events_processed += 1
+
+        contract = self.registry.lookup(token_id)
+        if contract is None:
+            return []
+
+        # Skip if we've already traded this window
+        window = self._get_window_state(contract)
+        if window.traded:
+            return []
+
+        # Skip if outside the window
+        if ts_s >= contract.end_time_s:
+            return []
+        if ts_s < contract.start_time_s:
+            return []
+
+        # Skip if book has no touch
+        if book.best_bid <= 0 or book.best_ask <= 0:
+            return []
+
+        minutes_remaining = (contract.end_time_s - ts_s) / 60.0
+        minutes_elapsed = contract.window_minutes - minutes_remaining
+
+        # Need at least 30 seconds of window elapsed for momentum to work
+        if minutes_elapsed < 0.5:
+            return []
+
+        # Get BTC at this moment
+        btc_price = self._btc_at(ts_s)
+        if btc_price <= 0:
+            return []
+
+        # Initialize window open BTC on first sight
+        if window.open_btc == 0:
+            window.open_btc = self._btc_at(contract.start_time_s)
+            if window.open_btc == 0:
+                window.open_btc = btc_price
+            self._momentum.set_window_open(contract.condition_id, window.open_btc)
+
+        window.last_btc = btc_price
+
+        # Throttle BOTH the tick feed AND the decision pass at 2Hz per
+        # condition. The live scan loop fires at 2Hz, so the backtest
+        # mirrors that. Without the second gate, decide_candle_trade
+        # gets called on every L2 event (16M+ times for a 1-hour replay)
+        # — 99% wasted work.
+        last_tick = self._last_tick_ts.get(contract.condition_id, 0.0)
+        if ts_s - last_tick < 0.5:
+            return []
+        self._momentum.add_tick(btc_price, timestamp=ts_s)
+        self._last_tick_ts[contract.condition_id] = ts_s
+
+        # Compute the momentum signal — pass historical timestamp
+        signal = self._momentum.detect(
+            contract_id=contract.condition_id,
+            window_start_ago_minutes=minutes_elapsed,
+            minutes_remaining=minutes_remaining,
+            current_price=btc_price,
+            now_ts=ts_s,
+        )
+        if signal is None:
+            return []
+
+        self.signals_evaluated += 1
+
+        # Get current Up/Down prices from books
+        # The current `book` is for `token_id`, but we need both Up and Down.
+        # In the engine's book registry we'd need both — but we only have one
+        # here. For decision purposes we use mid prices from the local book.
+        if token_id == contract.up_token_id:
+            up_mid = book.mid()
+            down_mid = 1.0 - up_mid  # paired by complementarity
+        else:
+            down_mid = book.mid()
+            up_mid = 1.0 - down_mid
+
+        if up_mid <= 0 or down_mid <= 0:
+            return []
+
+        # Run the SAME decision function as live, with the same zone gates.
+        decision = decide_candle_trade(
+            signal=signal,
+            minutes_elapsed=minutes_elapsed,
+            minutes_remaining=minutes_remaining,
+            window_minutes=contract.window_minutes,
+            up_price=up_mid,
+            down_price=down_mid,
+            btc_price=btc_price,
+            open_btc=window.open_btc,
+            implied_vol=self._vol_at(ts_s),
+            min_confidence=self.config.min_confidence,
+            min_edge=self.config.min_edge,
+            skip_dead_zone=self.config.skip_dead_zone,
+            zone_config=self._zone_config,
+        )
+
+        if isinstance(decision, SkipReason):
+            window.skip_history.append(decision)
+            self.skip_counts[f"{decision.reason}_{decision.zone}"] += 1
+            return []
+
+        # We have a trade signal — pick the right token and place an order
+        if decision.direction == "up":
+            chosen_token = contract.up_token_id
+        else:
+            chosen_token = contract.down_token_id
+
+        size = self.config.position_size_usd / max(decision.market_price, 0.01)
+
+        order = BacktestOrder(
+            timestamp=ts_s,
+            token_id=chosen_token,
+            side="buy",
+            size=round(size, 1),
+            order_type="market",
+            fee_rate=self.config.fee_rate,
+        )
+
+        window.traded = True
+        window.decision = decision
+        self.decisions.append(decision)
+        self.decisions_by_window[contract.condition_id] = decision
+
+        return [order]
+
+    def summary(self) -> dict:
+        """Pre-resolution summary (counts only — call resolve_pnl for P&L)."""
+        n_traded = sum(1 for w in self.windows.values() if w.traded)
+        skip_top = sorted(self.skip_counts.items(), key=lambda x: -x[1])[:10]
+        zones = defaultdict(int)
+        for d in self.decisions:
+            zones[d.zone] += 1
+        return {
+            "events_processed": self.events_processed,
+            "signals_evaluated": self.signals_evaluated,
+            "btc_lookups": self.btc_lookups,
+            "windows_seen": len(self.windows),
+            "windows_traded": n_traded,
+            "decisions": len(self.decisions),
+            "by_zone": dict(zones),
+            "top_skip_reasons": skip_top,
+        }

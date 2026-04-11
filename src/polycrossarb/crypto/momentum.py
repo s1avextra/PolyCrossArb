@@ -57,9 +57,16 @@ class MomentumDetector:
         if vol > 0:
             self._realized_vol = vol
 
-    def add_tick(self, price: float):
-        """Record a new price tick."""
-        self._ticks.append((time.time(), price))
+    def add_tick(self, price: float, timestamp: float | None = None):
+        """Record a new price tick.
+
+        Args:
+            price: BTC spot
+            timestamp: explicit unix seconds (None = wall clock, used in live mode).
+                       Backtest replay must pass historical timestamps.
+        """
+        ts = timestamp if timestamp is not None else time.time()
+        self._ticks.append((ts, price))
 
     def set_window_open(self, contract_id: str, price: float):
         """Set the opening price for a candle window."""
@@ -75,6 +82,7 @@ class MomentumDetector:
         window_start_ago_minutes: float,
         minutes_remaining: float,
         current_price: float,
+        now_ts: float | None = None,
     ) -> MomentumSignal | None:
         """Detect momentum for a specific candle window.
 
@@ -83,11 +91,13 @@ class MomentumDetector:
             window_start_ago_minutes: How many minutes ago the window started.
             minutes_remaining: Minutes until resolution.
             current_price: Current BTC price.
+            now_ts: Explicit "now" in unix seconds (None = wall clock).
+                    Backtest replay must pass historical timestamps.
         """
         if not self._ticks or minutes_remaining <= 0:
             return None
 
-        now = time.time()
+        now = now_ts if now_ts is not None else time.time()
         window_start = now - (window_start_ago_minutes * 60)
 
         # Get the open price (price at window start)
@@ -109,14 +119,22 @@ class MomentumDetector:
         # Direction
         direction = "up" if price_change >= 0 else "down"
 
-        # Collect ticks in this window
-        recent_ticks = [
-            (ts, p) for ts, p in self._ticks
-            if ts >= window_start
-        ]
-
+        # Collect ticks in this window. Walk the deque from the newest
+        # tick backwards and stop as soon as we cross window_start —
+        # ticks are always appended in monotonic time order, so this is
+        # O(k) where k is the number of ticks inside the window
+        # (typically a few hundred for a 5-min candle with 2 Hz feed),
+        # vs O(n) on the deque comprehension that used to scan all
+        # 5000 entries on every call. Hot path: backtest replays call
+        # detect() ~140k times per replay-hour.
+        recent_ticks: list[tuple[float, float]] = []
+        for ts, p in reversed(self._ticks):
+            if ts < window_start:
+                break
+            recent_ticks.append((ts, p))
         if len(recent_ticks) < 3:
             return None
+        recent_ticks.reverse()
 
         # Consistency + reversion count
         consistent = 0

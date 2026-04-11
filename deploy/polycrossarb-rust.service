@@ -1,19 +1,30 @@
 [Unit]
 Description=PolyCrossArb rust pipeline
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=polycrossarb
-WorkingDirectory=/opt/polycrossarb
-EnvironmentFile=/opt/polycrossarb/.env
+WorkingDirectory=/opt/polycrossarb/current
+EnvironmentFile=/etc/polycrossarb/env
 ExecStart=/opt/polycrossarb/polycrossarb-engine
+ExecStop=/bin/kill -SIGTERM $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
 Restart=on-failure
 Environment=CLOB_DIRECT=1
 LimitNOFILE=65536
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polycrossarb/logs /opt/polycrossarb/data /tmp/polycrossarb
 
 [Install]
 WantedBy=multi-user.target

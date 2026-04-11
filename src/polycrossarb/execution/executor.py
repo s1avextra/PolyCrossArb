@@ -676,6 +676,11 @@ class SingleLegExecutor:
     Pre-flight: check balance, order book depth, minimum order.
     Execute: place limit order, poll for fill, record in RiskManager.
     Hold to resolution — no exit needed.
+
+    Concurrency: ``execute_single`` is serialized with an asyncio.Lock
+    so concurrent strategy callbacks cannot race the shared CLOB
+    client (balance check, order placement, fill polling). The lock
+    must be reused across calls — do NOT recreate it per request.
     """
 
     FILL_TIMEOUT = 30
@@ -684,9 +689,11 @@ class SingleLegExecutor:
     MIN_DEPTH_USD = 5.0
 
     def __init__(self, risk_manager: RiskManager):
+        import asyncio as _asyncio
         self.risk_manager = risk_manager
         self._client = None
         self._initialized = False
+        self._lock = _asyncio.Lock()
 
     def _ensure_client(self) -> bool:
         """Lazy-init the CLOB client, or re-init after connection failure."""
@@ -740,16 +747,22 @@ class SingleLegExecutor:
         neg_risk: bool = True,
         event_id: str = "",
     ) -> SingleLegResult:
-        """Execute a single-token trade.
+        """Execute a single-token trade. Serialized via self._lock."""
+        async with self._lock:
+            return await self._execute_single_locked(
+                token_id, side, price, size, neg_risk, event_id,
+            )
 
-        Args:
-            token_id: The outcome token to buy/sell.
-            side: "buy" only (we hold to resolution).
-            price: Limit price.
-            size: Number of shares.
-            neg_risk: Whether this is a neg_risk market.
-            event_id: For cooldown and risk tracking.
-        """
+    async def _execute_single_locked(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        neg_risk: bool,
+        event_id: str,
+    ) -> SingleLegResult:
+        """Inner serialized body — must only be called holding self._lock."""
         import asyncio
 
         if not self._ensure_client():

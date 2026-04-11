@@ -1,17 +1,28 @@
 [Unit]
 Description=PolyCrossArb arb pipeline
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=polycrossarb
-WorkingDirectory=/opt/polycrossarb
-EnvironmentFile=/opt/polycrossarb/.env
+WorkingDirectory=/opt/polycrossarb/current
+EnvironmentFile=/etc/polycrossarb/env
 ExecStart=/usr/local/bin/uv run python scripts/run_arb.py --mode paper
+ExecStop=/bin/kill -SIGTERM $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=30
 StandardOutput=journal
 StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polycrossarb/logs /opt/polycrossarb/data /tmp/polycrossarb
 
 [Install]
 WantedBy=multi-user.target
