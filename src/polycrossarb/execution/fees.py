@@ -162,20 +162,38 @@ _FALLBACK_SCHEDULE: dict[str, tuple[float, float, float]] = {
 _FALLBACK_DEFAULT = "other"
 
 
-def _fallback_fee(shares: float, price: float, category: str) -> float:
-    """Calculate fee using hardcoded fallback schedule."""
-    cat = category.lower().strip()
-    fee_rate, exponent, _ = _FALLBACK_SCHEDULE.get(cat, _FALLBACK_SCHEDULE[_FALLBACK_DEFAULT])
+def polymarket_fee(shares: float, price: float, fee_rate: float) -> float:
+    """Polymarket binary-option fee formula (verified against NautilusTrader adapter).
 
-    if fee_rate == 0 or shares <= 0:
+        fee = qty * fee_rate * p * (1 - p)
+
+    Maximum at p = 0.50. Symmetric around 0.5.
+    Reference: prediction_market_extensions/adapters/polymarket/parsing.py
+    in evan-kolberg/prediction-market-backtesting (NautilusTrader fork).
+
+    This replaces the prior `qty * p * rate * (p*(1-p))^exponent` formula
+    which under-counted fees by ~2x at p=0.5.
+    """
+    if fee_rate <= 0 or shares <= 0:
         return 0.0
-
-    p = max(0.001, min(0.999, price))
-    fee = shares * p * fee_rate * (p * (1 - p)) ** exponent
-    fee = round(fee, 4)
-    if 0 < fee < 0.0001:
-        fee = 0.0001
+    p = max(0.0, min(1.0, price))
+    fee = shares * fee_rate * p * (1.0 - p)
+    fee = round(fee, 5)
+    if 0 < fee < 0.00001:
+        fee = 0.00001
     return fee
+
+
+def _fallback_fee(shares: float, price: float, category: str) -> float:
+    """Calculate fee using hardcoded fallback schedule.
+
+    Uses the verified Polymarket binary fee formula. The `exponent` field
+    in the fallback schedule is retained for backward compatibility but
+    is no longer applied — Polymarket's actual formula has no exponent.
+    """
+    cat = category.lower().strip()
+    fee_rate, _exponent, _ = _FALLBACK_SCHEDULE.get(cat, _FALLBACK_SCHEDULE[_FALLBACK_DEFAULT])
+    return polymarket_fee(shares, price, fee_rate)
 
 
 # ── Gas cost estimation ───────────────────────────────────────────────
@@ -266,17 +284,7 @@ def calculate_taker_fee(
     if token_id and token_id in _fee_cache:
         cached_fee, cached_at = _fee_cache[token_id]
         if time.time() - cached_at < _CACHE_TTL:
-            if cached_fee <= 0:
-                return 0.0
-            p = max(0.001, min(0.999, price))
-            # Use category exponent for correct fee scaling
-            cat = category.lower().strip()
-            _, exponent, _ = _FALLBACK_SCHEDULE.get(cat, _FALLBACK_SCHEDULE[_FALLBACK_DEFAULT])
-            fee = shares * p * cached_fee * (p * (1 - p)) ** exponent
-            fee = max(0.0, round(fee, 4))  # never negative
-            if 0 < fee < 0.0001:
-                fee = 0.0001
-            return fee
+            return polymarket_fee(shares, price, cached_fee)
 
     # Fallback to hardcoded schedule (no network call)
     return _fallback_fee(shares, price, category)
