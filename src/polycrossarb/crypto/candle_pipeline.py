@@ -284,14 +284,18 @@ class CandlePipeline:
         return False
 
     async def _refresh_contracts(self):
-        """Fetch candle contracts.
+        """Fetch candle contracts using targeted Gamma query.
 
-        The Gamma API returns 50k+ markets. Scanning them for candle
-        patterns blocks the event loop. Run the filter in a thread.
+        Instead of fetching all 50k+ markets (76s), we sort by endDate
+        ascending and paginate only until we pass the 2h horizon. Candle
+        markets resolve soon so they're at the top. ~1.7s vs 76s = 45x.
         """
-        markets = await self._client.fetch_all_active_markets(min_liquidity=0)
-        # scan_candle_markets iterates 50k+ markets — run in thread to
-        # avoid blocking the scan loop (measured: 36ms on VPS)
+        try:
+            markets = await self._client.fetch_markets_by_end_date(max_hours=3.0)
+        except Exception:
+            # Fallback to full fetch if targeted query fails
+            log.warning("candle.targeted_fetch_failed, falling back to full fetch")
+            markets = await self._client.fetch_all_active_markets(min_liquidity=0)
         self._contracts = await asyncio.to_thread(
             scan_candle_markets, markets, 1.0, 50,
         )
