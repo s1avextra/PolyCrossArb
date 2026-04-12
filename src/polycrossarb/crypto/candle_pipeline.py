@@ -518,6 +518,7 @@ class CandlePipeline:
                     log.warning("candle.low_sources",
                                 sources=self._price_feed.n_live_sources,
                                 min_required=self._price_feed.MIN_SOURCES)
+                await asyncio.sleep(0.5)
                 continue
 
             # Evaluate each candle contract
