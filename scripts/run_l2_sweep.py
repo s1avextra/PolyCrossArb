@@ -66,6 +66,7 @@ _end: datetime | None = None
 _prefer_maker: bool = False
 _position_size: float = 5.0
 _fee_rate: float = 0.072
+_token_ids: list[str] | None = None  # filtered token_ids for the sweep
 
 
 def parse_dt(s: str) -> datetime:
@@ -126,7 +127,7 @@ def _run_cell(cell: dict) -> dict:
     t = time.time()
     engine.replay(
         start=_start, end=_end,
-        token_ids=_registry.all_token_ids(),
+        token_ids=_token_ids,
         strategy=adapter.on_event,
         fee_rate=cfg.fee_rate,
     )
@@ -152,7 +153,7 @@ def _run_cell(cell: dict) -> dict:
 
 def main() -> int:
     global _btc, _registry, _loader, _latency, _base_zone
-    global _start, _end, _prefer_maker, _position_size, _fee_rate
+    global _start, _end, _prefer_maker, _position_size, _fee_rate, _token_ids
 
     parser = argparse.ArgumentParser(
         description="Parallel L2 parameter sweep across all CPU cores",
@@ -160,6 +161,8 @@ def main() -> int:
     parser.add_argument("--start", required=True)
     parser.add_argument("--hours", type=int, default=2)
     parser.add_argument("--vps", choices=list(PRESETS), default="dublin")
+    parser.add_argument("--asset", default="BTC",
+                        help="Filter contracts by asset (BTC, ETH, SOL, or ALL)")
     parser.add_argument("--workers", type=int, default=0,
                         help="Number of parallel workers (0 = all cores)")
     # Primary-zone gates
@@ -230,6 +233,7 @@ def main() -> int:
 
     print(f"\n  L2 MEGASWEEP (parallel)")
     print(f"  Range:          {_start} → {_end} ({args.hours}h)")
+    print(f"  Asset:          {args.asset.upper()}")
     print(f"  Preset:         {args.vps}")
     print(f"  Workers:        {n_workers} / {os.cpu_count()} cores")
     print(f"  Grid:           {n_runs} runs")
@@ -266,6 +270,20 @@ def main() -> int:
     if _registry.n_contracts == 0:
         print("ERROR: no candle contracts in range", file=sys.stderr)
         return 1
+
+    # Filter token_ids by asset
+    asset_filter = args.asset.upper()
+    if asset_filter == "ALL":
+        _token_ids = _registry.all_token_ids()
+        asset_label = "ALL"
+    else:
+        filtered = _registry.filter_by_asset(asset_filter)
+        _token_ids = []
+        for c in filtered:
+            _token_ids.append(c.up_token_id)
+            _token_ids.append(c.down_token_id)
+        asset_label = asset_filter
+    print(f"  Asset filter:   {asset_label} ({len(_token_ids)} token_ids from {len(_token_ids)//2} contracts)")
 
     _loader = PMXTLoader(cache_dir=args.cache_dir)
     _latency = PRESETS[args.vps]
