@@ -67,6 +67,7 @@ fi
 
 ssh "$VPS" bash -s <<DEPLOY_EOF
 set -euo pipefail
+source \$HOME/.cargo/env 2>/dev/null || true
 
 # Fix ownership (rsync preserves macOS uid which polycrossarb can't write to)
 chown -R polycrossarb:polycrossarb '$RELEASE_DIR'
