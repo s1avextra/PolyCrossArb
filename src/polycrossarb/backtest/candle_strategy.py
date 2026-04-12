@@ -255,13 +255,12 @@ class CandleStrategyAdapter:
 
         window.last_btc = asset_price
 
-        # Throttle BOTH the tick feed AND the decision pass at 2Hz per
-        # condition. The live scan loop fires at 2Hz, so the backtest
-        # mirrors that. Without the second gate, decide_candle_trade
-        # gets called on every L2 event (16M+ times for a 1-hour replay)
-        # — 99% wasted work.
+        # Throttle the tick feed + decision pass at 10Hz per condition to
+        # match the live scan loop (100ms interval). Without this gate,
+        # decide_candle_trade gets called on every L2 event (16M+ per
+        # replay-hour) — 99% wasted work.
         last_tick = self._last_tick_ts.get(contract.condition_id, 0.0)
-        if ts_s - last_tick < 0.5:
+        if ts_s - last_tick < 0.1:
             return []
         # Feed the correct asset's tick to its own detector
         asset_det = self._get_momentum(asset)

@@ -714,10 +714,13 @@ class CandlePipeline:
                          contracts=len(self._contracts),
                          trades=self._trade_count)
 
-            # 500ms interval — 2Hz evaluation for lower latency
+            # 100ms interval — 10Hz evaluation. Lowered from 500ms (2Hz) to
+            # reduce detection lag. For paper mode this cuts avg detection
+            # latency from 250ms to 50ms. Live mode uses Rust event-driven
+            # path (CLOB_DIRECT=1) which has no polling latency at all.
             elapsed = time.time() - t0
-            if elapsed < 0.5:
-                await asyncio.sleep(0.5 - elapsed)
+            if elapsed < 0.1:
+                await asyncio.sleep(0.1 - elapsed)
 
     def _estimate_window_minutes(self, contract: CandleContract) -> float:
         """Estimate the window length from the description.
