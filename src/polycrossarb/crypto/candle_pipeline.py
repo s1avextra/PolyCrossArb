@@ -256,14 +256,21 @@ class CandlePipeline:
             )
             return True
 
-        # Drawdown check: works from both positive and negative peak
+        # Drawdown check: works from both positive and negative peak.
+        # Include worst-case loss from open positions (full entry cost)
+        # so the breaker doesn't wait for resolution to see the damage.
+        open_exposure = sum(
+            p["entry_price"] * p["size"]
+            for p in self._paper_positions.values()
+        )
+        effective_pnl = self._realized_profit - open_exposure
         self._peak_profit = max(self._peak_profit, self._realized_profit)
-        drawdown = self._peak_profit - self._realized_profit
+        drawdown = self._peak_profit - effective_pnl
         # Use absolute drawdown against initial bankroll when peak is 0 or negative
         if self._peak_profit > 0:
             dd_pct = drawdown / self._peak_profit
         else:
-            dd_pct = abs(self._realized_profit) / max(self._risk._initial_bankroll, 1.0)
+            dd_pct = abs(effective_pnl) / max(self._risk._initial_bankroll, 1.0)
 
         if dd_pct > self.BREAKER_MAX_DRAWDOWN_PCT:
             log.warning(
@@ -425,6 +432,16 @@ class CandlePipeline:
             await asyncio.sleep(1)
 
         prev_sources: set[str] = set()
+        # Latency degradation tracker: staleness samples within
+        # each 30s window; alert when p99 exceeds threshold for
+        # N consecutive windows.
+        _staleness_window: list[float] = []
+        _window_start = time.time()
+        _consecutive_high = 0
+        _latency_threshold_ms = float(
+            os.environ.get("LATENCY_ALERT_P99_MS", "200")
+        )
+        _alert_after_windows = 5
 
         while self._running:
             agg = self._price_feed.get_aggregated()
@@ -443,6 +460,26 @@ class CandlePipeline:
             for src in prev_sources - current_sources:
                 self._monitor.record_source_dropout(src, 0, agg.staleness_ms / 1000)
             prev_sources = current_sources
+
+            # Latency degradation detection (30s rolling windows)
+            _staleness_window.append(agg.staleness_ms)
+            if time.time() - _window_start >= 30:
+                if _staleness_window:
+                    sorted_s = sorted(_staleness_window)
+                    p99_ms = sorted_s[min(len(sorted_s) - 1, int(len(sorted_s) * 0.99))]
+                    if p99_ms > _latency_threshold_ms:
+                        _consecutive_high += 1
+                        if _consecutive_high >= _alert_after_windows:
+                            from polycrossarb.monitoring.alerter import alert_latency_degradation
+                            alert_latency_degradation(
+                                p99_us=int(p99_ms * 1000),
+                                threshold_ms=_latency_threshold_ms,
+                                window_count=_consecutive_high,
+                            )
+                    else:
+                        _consecutive_high = 0
+                _staleness_window.clear()
+                _window_start = time.time()
 
             # Risk state
             self._monitor.record_risk_state(
@@ -839,6 +876,11 @@ class CandlePipeline:
 
         if market_price <= 0.01 or market_price >= 0.99:
             return  # price out of tradeable range
+
+        # Re-check kill switch right before execution to close the race
+        # window between the scan loop check and order placement.
+        if self._kill_switch_active() or self._breaker_tripped:
+            return
 
         shares = position / market_price
 

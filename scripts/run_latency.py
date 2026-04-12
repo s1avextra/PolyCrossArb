@@ -38,6 +38,7 @@ from polycrossarb.data.client import PolymarketClient
 from polycrossarb.crypto.candle_scanner import scan_candle_markets
 from polycrossarb.crypto.price_feed import CryptoPriceFeed
 from polycrossarb.execution.executor import ExecutionMode, SingleLegExecutor
+from polycrossarb.ipc.bridge import EngineBridge
 from polycrossarb.risk.manager import RiskManager
 from polycrossarb.monitoring.session_monitor import SessionMonitor
 
@@ -71,6 +72,8 @@ class LatencyPipeline:
         self._price_feed = CryptoPriceFeed()
         self._running = False
         self._rust_proc: subprocess.Popen | None = None
+        self._bridge: EngineBridge | None = None
+        self._use_ipc = os.environ.get("IPC_MODE") == "uds"
         self._initial_bankroll = bankroll
         self._bankroll = bankroll
 
@@ -108,28 +111,39 @@ class LatencyPipeline:
             env["DEBUG"] = "1"
         self._rust_proc = subprocess.Popen(
             [str(RUST_ENGINE)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE if not self._use_ipc else subprocess.DEVNULL,
+            stdout=subprocess.PIPE if not self._use_ipc else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1,  # line-buffered
+            bufsize=1,
             env=env,
         )
-        log.info("latency.rust_started", pid=self._rust_proc.pid)
+        log.info("latency.rust_started", pid=self._rust_proc.pid,
+                 ipc="uds" if self._use_ipc else "stdio")
 
         # Read Rust stderr in background (diagnostics)
         asyncio.create_task(self._read_rust_stderr())
 
-        # Wait for Rust to be ready (reads "Ready:" from stderr)
-        await asyncio.sleep(5)
+        # Wait for Rust to be ready, then connect via IPC if enabled
+        await asyncio.sleep(3)
+        if self._use_ipc:
+            self._bridge = EngineBridge()
+            if not await self._bridge.connect(timeout=10.0):
+                log.error("latency.ipc_connect_failed")
+                self.stop()
+                return
 
         try:
-            await asyncio.gather(
+            tasks = [
                 self._price_feed.start(),
                 self._contract_feed_loop(),
-                self._signal_reader_loop(),
                 self._resolution_loop(),
-            )
+            ]
+            if self._use_ipc:
+                tasks.append(self._ipc_reader_loop())
+            else:
+                tasks.append(self._signal_reader_loop())
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             pass
         finally:
@@ -138,6 +152,8 @@ class LatencyPipeline:
 
     def stop(self):
         self._running = False
+        if self._bridge and self._bridge.connected:
+            asyncio.ensure_future(self._bridge.disconnect())
         if self._rust_proc:
             self._rust_proc.terminate()
             self._rust_proc.wait(timeout=5)
@@ -176,9 +192,11 @@ class LatencyPipeline:
                         "window_minutes": window_minutes,
                     })
 
-                # Send to Rust via stdin
-                msg = json.dumps({"type": "contracts", "data": contract_data})
-                if self._rust_proc and self._rust_proc.stdin:
+                # Send to Rust via IPC or stdin
+                if self._use_ipc and self._bridge and self._bridge.connected:
+                    await self._bridge.send_contracts(contract_data)
+                elif self._rust_proc and self._rust_proc.stdin:
+                    msg = json.dumps({"type": "contracts", "data": contract_data})
                     self._rust_proc.stdin.write(msg + "\n")
                     self._rust_proc.stdin.flush()
 
@@ -213,6 +231,32 @@ class LatencyPipeline:
             except Exception as e:
                 log.warning("latency.signal_error", error=str(e)[:100])
                 await asyncio.sleep(0.1)
+
+    async def _ipc_reader_loop(self):
+        """Read trade signals from Rust engine via UDS IPC."""
+        while self._running and self._bridge and self._bridge.connected:
+            try:
+                async for msg in self._bridge.read_messages():
+                    if not self._running:
+                        break
+                    msg_type = msg.get("type", "")
+                    if msg_type == "trade_signal":
+                        self._signals_received += 1
+                        await self._handle_signal(msg)
+                    elif msg_type == "fill_report":
+                        log.info("latency.fill_report",
+                                 order_id=msg.get("order_id", "")[:16],
+                                 latency_us=msg.get("latency_us", 0))
+                    elif msg_type == "latency_report":
+                        log.info("latency.report",
+                                 avg_us=msg.get("avg_us", 0),
+                                 p99_us=msg.get("p99_us", 0))
+            except Exception as e:
+                log.warning("latency.ipc_reader_error", error=str(e)[:100])
+                if self._running:
+                    await asyncio.sleep(1)
+                    if self._bridge:
+                        await self._bridge.reconnect_loop(max_retries=5)
 
     async def _handle_signal(self, sig: dict):
         """Process a trade signal from Rust engine."""
@@ -418,6 +462,12 @@ class LatencyPipeline:
 
     def _send_balance_update(self):
         """Send current bankroll to Rust engine so it updates capital limits."""
+        if self._use_ipc and self._bridge and self._bridge.connected:
+            asyncio.ensure_future(
+                self._bridge.send_risk_update(round(self._bankroll, 2))
+            )
+            log.info("latency.balance_update", bankroll=f"${self._bankroll:.2f}", via="ipc")
+            return
         if not self._rust_proc or not self._rust_proc.stdin:
             return
         try:
@@ -427,7 +477,7 @@ class LatencyPipeline:
             })
             self._rust_proc.stdin.write(msg + "\n")
             self._rust_proc.stdin.flush()
-            log.info("latency.balance_update", bankroll=f"${self._bankroll:.2f}")
+            log.info("latency.balance_update", bankroll=f"${self._bankroll:.2f}", via="stdin")
         except Exception as e:
             log.warning("latency.balance_update_failed", error=str(e)[:50])
 

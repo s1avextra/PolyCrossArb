@@ -138,8 +138,13 @@ def _run_cell(cell: dict) -> dict:
     dt = time.time() - t
 
     a = adapter.summary()
+    # Include effective (floored) thresholds so the output reflects
+    # the actual gates used, not just the requested values.
+    # decision.py:133 floors late_min_edge with max(min_edge, cfg.late_min_edge).
+    eff_late_edge = max(cell["min_edge"], cell["late_min_edge"])
     return {
         **cell,
+        "effective_late_min_edge": eff_late_edge,
         "trades": results.n_trades,
         "wins": results.n_wins,
         "losses": results.n_losses,

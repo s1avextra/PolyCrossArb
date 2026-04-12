@@ -5,7 +5,7 @@
 set -uo pipefail
 
 APP_DIR="${POLYCROSSARB_DIR:-/opt/polycrossarb}"
-SERVICES="${POLYCROSSARB_SERVICES:-polycrossarb-candle polycrossarb-arb polycrossarb-weather polycrossarb-rust}"
+SERVICES="${POLYCROSSARB_SERVICES:-polycrossarb-candle polycrossarb-rust}"
 WEBHOOK_URL="${ALERT_WEBHOOK_URL:-}"
 KILL_FILE="${KILL_FILE:-/tmp/polycrossarb/KILL}"
 STATE_DB="${STATE_DB:-$APP_DIR/logs/state.db}"
@@ -66,12 +66,13 @@ fi
 
 # 5. State DB sanity — circuit breaker, last trade, paper position count.
 if [ -f "$STATE_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
-    BREAKER=$(sqlite3 "$STATE_DB" "SELECT value FROM meta WHERE key='candle_breaker_tripped'" 2>/dev/null || echo "")
+    DB_OUT=$(sqlite3 "$STATE_DB" "SELECT 'breaker=' || COALESCE((SELECT value FROM meta WHERE key='candle_breaker_tripped'), '0'); SELECT 'ts=' || COALESCE((SELECT MAX(timestamp) FROM trades), '0');" 2>/dev/null || echo "")
+    BREAKER=$(echo "$DB_OUT" | sed -n 's/^breaker=//p')
+    LAST_TRADE_TS=$(echo "$DB_OUT" | sed -n 's/^ts=//p')
     if [ "$BREAKER" = "1" ]; then
         alert "circuit_breaker" "candle circuit breaker is tripped — manual reset required"
     fi
 
-    LAST_TRADE_TS=$(sqlite3 "$STATE_DB" "SELECT MAX(timestamp) FROM trades" 2>/dev/null || echo "0")
     LAST_TRADE_TS=${LAST_TRADE_TS:-0}
     LAST_TRADE_TS=${LAST_TRADE_TS%.*}
     if [ "$LAST_TRADE_TS" != "0" ]; then

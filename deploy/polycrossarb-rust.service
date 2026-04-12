@@ -24,7 +24,7 @@ NoNewPrivileges=true
 PrivateTmp=false
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/polycrossarb/logs /opt/polycrossarb/data /tmp/polycrossarb
+ReadWritePaths=/opt/polycrossarb /tmp/polycrossarb
 
 [Install]
 WantedBy=multi-user.target

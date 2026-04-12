@@ -57,25 +57,34 @@ rsync -avz --delete \
     --exclude 'uv.lock' \
     ./ "$VPS:$RELEASE_DIR/"
 
-# 3. Install Python deps for this release (no virtualenv — system-wide
-#    via uv, same as before but pinned to the release dir for cwd).
-ssh "$VPS" "cd '$RELEASE_DIR' && uv pip install --system '.[execution]'"
-
-# 4. Optionally rebuild rust binary in the release and copy to top level.
+# 3. Fix ownership, install deps, swap symlink, restart — single SSH session.
+RUST_CMDS=""
 if $REBUILD_RUST; then
-    ssh "$VPS" "cd '$RELEASE_DIR/rust_engine' && cargo build --release && cp target/release/polycrossarb-engine '$APP_DIR/'"
+    RUST_CMDS="
+cd '$RELEASE_DIR/rust_engine' && cargo build --release && cp target/release/polycrossarb-engine '$APP_DIR/'
+systemctl restart polycrossarb-rust"
 fi
 
-# 5. Atomic symlink flip
-ssh "$VPS" "ln -sfn '$RELEASE_DIR' '$APP_DIR/current.new' && mv -Tf '$APP_DIR/current.new' '$APP_DIR/current'"
+ssh "$VPS" bash -s <<DEPLOY_EOF
+set -euo pipefail
 
-# 6. Restart services
-ssh "$VPS" "systemctl restart polycrossarb-candle polycrossarb-arb polycrossarb-weather"
-if $REBUILD_RUST; then
-    ssh "$VPS" "systemctl restart polycrossarb-rust"
-fi
+# Fix ownership (rsync preserves macOS uid which polycrossarb can't write to)
+chown -R polycrossarb:polycrossarb '$RELEASE_DIR'
 
-# 7. Prune old releases keeping last $KEEP
-ssh "$VPS" "cd '$APP_DIR/releases' && ls -1t | tail -n +$((KEEP + 1)) | xargs -r -I {} rm -rf '{}'"
+# Install Python deps
+cd '$RELEASE_DIR' && uv pip install --system '.[execution]'
 
-echo "=== Deployed $RELEASE_ID. Rollback: ssh $VPS 'cd $APP_DIR && deploy/rollback.sh' ==="
+# Optionally rebuild Rust
+$RUST_CMDS
+
+# Atomic symlink flip
+ln -sfn '$RELEASE_DIR' '$APP_DIR/current.new' && mv -Tf '$APP_DIR/current.new' '$APP_DIR/current'
+
+# Restart active services only
+systemctl restart polycrossarb-candle
+
+# Prune old releases keeping last $KEEP
+cd '$APP_DIR/releases' && ls -1t | tail -n +$((KEEP + 1)) | xargs -r -I {} rm -rf '{}'
+DEPLOY_EOF
+
+echo "=== Deployed $RELEASE_ID. Rollback: ssh $VPS '$APP_DIR/current/deploy/rollback.sh' ==="

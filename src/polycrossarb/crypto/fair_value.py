@@ -12,8 +12,11 @@ If the market price diverges from this, there's an arb opportunity.
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -66,7 +69,7 @@ def compute_fair_value(
     Returns:
         FairValueResult with fair price and edge
     """
-    if btc_price <= 0 or strike <= 0 or days_to_expiry <= 0 or volatility <= 0:
+    if btc_price <= 0 or strike <= 0 or days_to_expiry <= 0 or volatility < 0.01:
         return FairValueResult(
             fair_price=0.5, market_price=market_price, edge=0,
             edge_pct=0, d2=0, btc_price=btc_price, strike=strike,
@@ -82,8 +85,12 @@ def compute_fair_value(
     d2 = (math.log(S / K) + (r - 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
     fair_price = _norm_cdf(d2)
 
-    # Clamp to [0.01, 0.99] for safety
+    # Clamp to [0.01, 0.99] — log when clamping masks extreme values
+    raw_fair_price = fair_price
     fair_price = max(0.01, min(0.99, fair_price))
+    if raw_fair_price != fair_price:
+        log.debug("fair_value.clamped raw=%.4f clamped=%.4f d2=%.2f vol=%.4f T=%.6f",
+                  raw_fair_price, fair_price, d2, sigma, T)
 
     edge = fair_price - market_price
     edge_pct = edge / max(market_price, 0.01)

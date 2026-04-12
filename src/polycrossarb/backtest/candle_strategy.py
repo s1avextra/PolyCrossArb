@@ -147,6 +147,10 @@ class CandleStrategyAdapter:
         # Throttle BTC tick feed to once per second per condition
         self._last_tick_ts: dict[str, float] = {}
 
+        # Track last-seen mid for each token_id so we can use real
+        # prices for both sides instead of inferring via 1.0 - x.
+        self._token_mids: dict[str, float] = {}
+
         # Skip reason counter for analysis
         self.skip_counts: dict[str, int] = defaultdict(int)
 
@@ -306,16 +310,16 @@ class CandleStrategyAdapter:
 
         self.signals_evaluated += 1
 
-        # Get current Up/Down prices from books
-        # The current `book` is for `token_id`, but we need both Up and Down.
-        # In the engine's book registry we'd need both — but we only have one
-        # here. For decision purposes we use mid prices from the local book.
+        # Get current Up/Down prices from books.
+        # Track both sides independently so we use real prices (with vig)
+        # instead of inferring via 1.0 - x (which ignores ~4% vig).
+        self._token_mids[token_id] = book.mid()
         if token_id == contract.up_token_id:
             up_mid = book.mid()
-            down_mid = 1.0 - up_mid  # paired by complementarity
+            down_mid = self._token_mids.get(contract.down_token_id, 1.0 - up_mid)
         else:
             down_mid = book.mid()
-            up_mid = 1.0 - down_mid
+            up_mid = self._token_mids.get(contract.up_token_id, 1.0 - down_mid)
 
         if up_mid <= 0 or down_mid <= 0:
             return []

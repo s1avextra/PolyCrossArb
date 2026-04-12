@@ -9,7 +9,7 @@ set -euo pipefail
 APP_DIR="${POLYCROSSARB_DIR:-/opt/polycrossarb}"
 RELEASES_DIR="$APP_DIR/releases"
 CURRENT_LINK="$APP_DIR/current"
-SERVICES="${POLYCROSSARB_SERVICES:-polycrossarb-candle polycrossarb-arb polycrossarb-weather polycrossarb-rust}"
+SERVICES="${POLYCROSSARB_SERVICES:-polycrossarb-candle polycrossarb-rust}"
 
 if [ ! -d "$RELEASES_DIR" ]; then
     echo "ERROR: $RELEASES_DIR does not exist — no versioned deploys yet" >&2

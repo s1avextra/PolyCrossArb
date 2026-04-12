@@ -140,7 +140,7 @@ class CryptoPriceFeed:
         mean_r = sum(r for r, _ in returns) / len(returns)
         var_r = sum((r - mean_r) ** 2 for r, _ in returns) / len(returns)
 
-        if avg_dt <= 0:
+        if avg_dt < 0.01:
             return 0.0
         var_per_second = var_r / avg_dt
         return min(5.0, math.sqrt(var_per_second * 365.25 * 86400))
@@ -305,7 +305,7 @@ class CryptoPriceFeed:
         mean_r = sum(r for r, _ in returns) / len(returns)
         var_r = sum((r - mean_r) ** 2 for r, _ in returns) / len(returns)
 
-        if avg_dt > 0:
+        if avg_dt >= 0.01:
             var_per_second = var_r / avg_dt
             self._volatility_24h = min(5.0, math.sqrt(var_per_second * 365.25 * 86400))
 

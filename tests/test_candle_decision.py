@@ -565,3 +565,63 @@ def test_vol_regime_boundary_extreme() -> None:
     """Exactly at 2.5 ratio is HIGH, above is EXTREME."""
     assert classify_vol_regime(1.25, 0.50) == VolatilityRegime.HIGH     # 2.5 exactly
     assert classify_vol_regime(1.26, 0.50) == VolatilityRegime.EXTREME  # 2.52 > 2.5
+
+
+# ── Boundary condition tests ─────────────────────────────────────
+
+
+def test_dead_zone_boundary_left_inclusive() -> None:
+    """confidence=0.80 is exactly on dead_zone_lo — should be SKIPPED (left-inclusive)."""
+    signal = make_signal(confidence=0.80, z_score=2.0)
+    result = decide_candle_trade(
+        signal=signal, minutes_elapsed=3.0, minutes_remaining=2.0,
+        window_minutes=5.0, up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0, implied_vol=0.50,
+    )
+    assert isinstance(result, SkipReason)
+    assert result.reason == "dead_zone_80_90"
+
+
+def test_dead_zone_boundary_right_exclusive() -> None:
+    """confidence=0.90 is exactly on dead_zone_hi — should NOT be skipped (right-exclusive)."""
+    signal = make_signal(confidence=0.90, z_score=2.0)
+    result = decide_candle_trade(
+        signal=signal, minutes_elapsed=3.0, minutes_remaining=2.0,
+        window_minutes=5.0, up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0, implied_vol=0.50,
+    )
+    # Should pass the dead zone filter — may still be skipped by edge,
+    # but NOT by dead_zone_80_90.
+    if isinstance(result, SkipReason):
+        assert result.reason != "dead_zone_80_90"
+
+
+def test_terminal_z_boundary_exact() -> None:
+    """z_score exactly at terminal_min_z (0.3) should PASS (< is exclusive)."""
+    signal = make_signal(
+        confidence=0.60, z_score=0.3,
+        minutes_elapsed=4.8, minutes_remaining=0.2,
+    )
+    result = decide_candle_trade(
+        signal=signal, minutes_elapsed=4.8, minutes_remaining=0.2,
+        window_minutes=5.0, up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0, implied_vol=0.50,
+    )
+    # z=0.3 == terminal_min_z: should NOT be skipped for low_z_score
+    if isinstance(result, SkipReason):
+        assert result.reason != "low_z_score"
+
+
+def test_terminal_z_just_below_boundary() -> None:
+    """z_score at 0.29 (just below terminal_min_z=0.3) should be SKIPPED."""
+    signal = make_signal(
+        confidence=0.60, z_score=0.29,
+        minutes_elapsed=4.8, minutes_remaining=0.2,
+    )
+    result = decide_candle_trade(
+        signal=signal, minutes_elapsed=4.8, minutes_remaining=0.2,
+        window_minutes=5.0, up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0, implied_vol=0.50,
+    )
+    assert isinstance(result, SkipReason)
+    assert result.reason == "low_z_score"

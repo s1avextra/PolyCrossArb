@@ -4,6 +4,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=PYTHONUNBUFFERED=1
+Environment=UV_CACHE_DIR=/tmp/polycrossarb/uv-cache
 Type=simple
 User=polycrossarb
 WorkingDirectory=/opt/polycrossarb/current
@@ -14,7 +16,7 @@ KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure
-RestartSec=30
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
@@ -23,7 +25,7 @@ NoNewPrivileges=true
 PrivateTmp=false
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/polycrossarb/logs /opt/polycrossarb/data /tmp/polycrossarb
+ReadWritePaths=/opt/polycrossarb /tmp/polycrossarb
 
 [Install]
 WantedBy=multi-user.target

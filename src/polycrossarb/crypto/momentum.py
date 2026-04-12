@@ -237,11 +237,13 @@ class MomentumDetector:
         # Clamp
         confidence = max(0.10, min(0.95, confidence))
 
-        # Boost near resolution with strong vol-adjusted move
-        if minutes_remaining < 2.0 and z_score > 1.0:
-            confidence = min(0.95, confidence + 0.15)
-        elif minutes_remaining < 1.0 and z_score > 0.5:
-            confidence = min(0.95, confidence + 0.20)
+        # Boost near resolution — scale with z_score to avoid over-boosting
+        # weak signals during high-vol regimes where z is inflated by
+        # stale 24h sigma. Proportional boost rewards strong moves more.
+        if minutes_remaining < 1.0 and z_score > 0.5:
+            confidence = min(0.95, confidence + 0.10 * min(z_score, 2.0))
+        elif minutes_remaining < 2.0 and z_score > 1.0:
+            confidence = min(0.95, confidence + 0.05 * min(z_score, 3.0))
 
         # Reduce if move is sub-threshold sigma (noise)
         if z_score < self._noise_z:
