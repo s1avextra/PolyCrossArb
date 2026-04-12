@@ -93,6 +93,16 @@ def main() -> int:
                         help="ZoneConfig.late_min_edge values")
     parser.add_argument("--primary-zs", default="1.0",
                         help="ZoneConfig.primary_min_z values")
+    # Terminal-zone gates (new: fires in last 5% of candle window)
+    parser.add_argument("--terminal-confidences", default="0.55",
+                        help="ZoneConfig.terminal_min_confidence values")
+    parser.add_argument("--terminal-zs", default="0.3",
+                        help="ZoneConfig.terminal_min_z values")
+    parser.add_argument("--terminal-edges", default="0.03",
+                        help="ZoneConfig.terminal_min_edge values")
+    # Maker fee mode
+    parser.add_argument("--prefer-maker", action="store_true",
+                        help="Use MakerFillModel (0%% maker fee, 65%% fill prob)")
     parser.add_argument("--position-size", type=float, default=5.0)
     parser.add_argument("--fee-rate", type=float, default=0.072)
     parser.add_argument("--btc-csv", default="data/btcusdt_1s_7d.csv")
@@ -110,23 +120,31 @@ def main() -> int:
     late_zs = parse_floats(args.late_zs)
     late_edges = parse_floats(args.late_edges)
     primary_zs = parse_floats(args.primary_zs)
+    terminal_confs = parse_floats(args.terminal_confidences)
+    terminal_zs = parse_floats(args.terminal_zs)
+    terminal_edges = parse_floats(args.terminal_edges)
 
     n_runs = (
         len(confidences) * len(edges) * len(vols)
         * len(late_confs) * len(late_zs) * len(late_edges) * len(primary_zs)
+        * len(terminal_confs) * len(terminal_zs) * len(terminal_edges)
     )
 
-    print(f"\n  L2 SWEEP")
-    print(f"  Range:        {start} → {end} ({args.hours}h)")
-    print(f"  Preset:       {args.vps}")
-    print(f"  Grid:         {n_runs} runs total")
-    print(f"  Primary conf: {confidences}")
-    print(f"  Primary edge: {edges}")
-    print(f"  Primary z:    {primary_zs}")
-    print(f"  Late conf:    {late_confs}")
-    print(f"  Late z:       {late_zs}")
-    print(f"  Late edge:    {late_edges}")
-    print(f"  Vol:          {vols}\n")
+    print(f"\n  L2 MEGASWEEP")
+    print(f"  Range:          {start} → {end} ({args.hours}h)")
+    print(f"  Preset:         {args.vps}")
+    print(f"  Grid:           {n_runs} runs total")
+    print(f"  Primary conf:   {confidences}")
+    print(f"  Primary edge:   {edges}")
+    print(f"  Primary z:      {primary_zs}")
+    print(f"  Late conf:      {late_confs}")
+    print(f"  Late z:         {late_zs}")
+    print(f"  Late edge:      {late_edges}")
+    print(f"  Terminal conf:  {terminal_confs}")
+    print(f"  Terminal z:     {terminal_zs}")
+    print(f"  Terminal edge:  {terminal_edges}")
+    print(f"  Prefer maker:   {args.prefer_maker}")
+    print(f"  Vol:            {vols}\n")
 
     # ── Shared setup ──
     t0 = time.time()
@@ -169,14 +187,20 @@ def main() -> int:
                     for lz in late_zs:
                         for le in late_edges:
                             for pz in primary_zs:
-                                cells.append({
-                                    "min_confidence": conf,
-                                    "min_edge": edge,
-                                    "vol": vol,
-                                    "late_min_confidence": lc,
-                                    "late_min_z": lz,
-                                    "late_min_edge": le,
-                                    "primary_min_z": pz,
+                                for tc in terminal_confs:
+                                    for tz in terminal_zs:
+                                        for te in terminal_edges:
+                                            cells.append({
+                                                "min_confidence": conf,
+                                                "min_edge": edge,
+                                                "vol": vol,
+                                                "late_min_confidence": lc,
+                                                "late_min_z": lz,
+                                                "late_min_edge": le,
+                                                "primary_min_z": pz,
+                                                "terminal_min_confidence": tc,
+                                                "terminal_min_z": tz,
+                                                "terminal_min_edge": te,
                                 })
 
     # ── Sweep ──
@@ -191,6 +215,9 @@ def main() -> int:
             late_min_confidence=cell["late_min_confidence"],
             late_min_z=cell["late_min_z"],
             late_min_edge=cell["late_min_edge"],
+            terminal_min_confidence=cell["terminal_min_confidence"],
+            terminal_min_z=cell["terminal_min_z"],
+            terminal_min_edge=cell["terminal_min_edge"],
             dead_zone_lo=base_zone.dead_zone_lo,
             dead_zone_hi=base_zone.dead_zone_hi,
             min_price=base_zone.min_price,
@@ -203,6 +230,8 @@ def main() -> int:
             realized_vol=cell["vol"],
             position_size_usd=args.position_size,
             fee_rate=args.fee_rate,
+            prefer_maker=args.prefer_maker,
+            maker_fee_rate=0.0 if args.prefer_maker else args.fee_rate,
             zone_config=zone_cfg,
         )
         adapter = CandleStrategyAdapter(
@@ -240,8 +269,8 @@ def main() -> int:
         runs.append(rec)
         print(
             f"  [{run_idx:>2d}/{n_runs}] "
-            f"L_conf={cell['late_min_confidence']:.2f} L_z={cell['late_min_z']:.2f} "
-            f"L_edge={cell['late_min_edge']:.2f} P_z={cell['primary_min_z']:.2f} "
+            f"L_z={cell['late_min_z']:.2f} T_z={cell['terminal_min_z']:.2f} "
+            f"T_conf={cell['terminal_min_confidence']:.2f} "
             f"→ n={results.n_trades:<3d} wr={results.win_rate*100:.0f}% "
             f"pnl=${results.total_pnl:+.2f} sharpe={results.sharpe:.2f} "
             f"zones={dict(a.get('by_zone', {}))} ({dt:.0f}s)"
