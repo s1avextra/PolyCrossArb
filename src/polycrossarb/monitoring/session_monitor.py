@@ -370,6 +370,42 @@ class SessionMonitor:
             "attempt": attempt,
         })
 
+    def record_latency_breakdown(
+        self,
+        signal_detect_us: int,
+        sign_us: int,
+        post_us: int,
+        server_us: int,
+        total_us: int,
+        strategy: str = "candle",
+    ):
+        """Record per-stage latency for an order placement."""
+        self._write("execution", "latency_breakdown", {
+            "signal_detect_us": signal_detect_us,
+            "sign_us": sign_us,
+            "post_us": post_us,
+            "server_us": server_us,
+            "total_us": total_us,
+            "strategy": strategy,
+        })
+
+    def record_comparison(
+        self,
+        contract_id: str,
+        paper_direction: str,
+        paper_edge: float,
+        actual_outcome: str,
+        paper_correct: bool,
+    ):
+        """Record paper prediction vs actual outcome for parity analysis."""
+        self._write("signal", "comparison", {
+            "contract_id": contract_id[:16],
+            "paper_direction": paper_direction,
+            "paper_edge": round(paper_edge, 4),
+            "actual_outcome": actual_outcome,
+            "paper_correct": paper_correct,
+        })
+
     # ── Summary ─────────────────────────────────────────────────
 
     def get_summary(self) -> dict:

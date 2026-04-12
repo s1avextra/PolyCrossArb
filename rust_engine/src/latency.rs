@@ -88,6 +88,9 @@ impl LatencyMonitor {
             "binance_ws_parse", "bybit_ws_parse", "okx_ws_parse", "mexc_ws_parse",
             "price_aggregation", "signal_generation", "tick_to_signal",
             "polymarket_ws_parse",
+            // Per-stage breakdown for order placement
+            "stage_price_read", "stage_edge_calc", "stage_signing",
+            "stage_http_post", "stage_server_ack", "stage_total",
         ] {
             metrics.insert(name.to_string(), LatencyStats::new(name));
         }

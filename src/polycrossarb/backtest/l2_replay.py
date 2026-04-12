@@ -101,7 +101,8 @@ class BacktestOrder:
     size: float
     order_type: str        # "market" or "limit"
     limit_price: float | None = None
-    fee_rate: float = 0.0  # fee_rate as decimal (e.g. 0.072 = 7.2%)
+    fee_rate: float = 0.0  # taker fee_rate as decimal (e.g. 0.072 = 7.2%)
+    maker_fee_rate: float = 0.0  # fee for maker fills (typically 0%)
 
 
 @dataclass
@@ -226,7 +227,9 @@ class L2BacktestEngine:
                 ))
                 continue
 
-            fee = polymarket_fee(result.filled_size, result.fill_price, order.fee_rate)
+            # Use maker fee rate when the fill model indicates a maker fill
+            effective_rate = order.maker_fee_rate if result.reason == "maker_fill" else order.fee_rate
+            fee = polymarket_fee(result.filled_size, result.fill_price, effective_rate)
             self.fills.append(BacktestFill(
                 order=order,
                 fill_timestamp=current_ts,

@@ -36,7 +36,12 @@ from polycrossarb.crypto.decision import (
     zone_config_from_settings,
 )
 from polycrossarb.crypto.fair_value import compute_fair_value
-from polycrossarb.crypto.momentum import MomentumDetector, MomentumSignal
+from polycrossarb.crypto.momentum import (
+    MomentumDetector,
+    MomentumSignal,
+    VolatilityRegime,
+    classify_vol_regime,
+)
 from polycrossarb.crypto.price_feed import CryptoPriceFeed
 from polycrossarb.data.client import PolymarketClient
 from polycrossarb.execution.executor import ExecutionMode, SingleLegExecutor
@@ -85,7 +90,12 @@ class CandlePipeline:
         self._client = PolymarketClient()
         self._risk = risk_manager or RiskManager()
         self._price_feed = CryptoPriceFeed()
-        self._momentum = MomentumDetector()
+        # Per-asset momentum detectors — BTC always present, ETH/SOL
+        # created on first use. Each asset needs its own tick history.
+        self._momentum_detectors: dict[str, MomentumDetector] = {
+            "BTC": MomentumDetector(),
+        }
+        self._momentum = self._momentum_detectors["BTC"]  # backwards compat
 
         if mode == ExecutionMode.LIVE:
             self._executor = SingleLegExecutor(self._risk)
@@ -121,6 +131,12 @@ class CandlePipeline:
                 log.info("candle.paper_positions.restored", n=len(stored_pp))
         except Exception:
             log.exception("candle.state_restore_failed")
+
+    def _get_momentum(self, asset: str) -> MomentumDetector:
+        """Get or create a momentum detector for the given asset."""
+        if asset not in self._momentum_detectors:
+            self._momentum_detectors[asset] = MomentumDetector()
+        return self._momentum_detectors[asset]
 
     def _kill_switch_active(self) -> bool:
         """Operational halt — touch this file to stop trading instantly."""
@@ -477,9 +493,18 @@ class CandlePipeline:
                 await asyncio.sleep(1)
                 continue
 
-            # Feed tick to momentum detector with current volatility
+            # Feed BTC tick to its momentum detector
             self._momentum.add_tick(btc)
             self._momentum.set_realized_vol(self._price_feed.volatility)
+
+            # Feed ETH/SOL ticks to their detectors (only when cross-asset is on)
+            if settings.candle_cross_asset_enabled:
+                for alt in ("ETH", "SOL"):
+                    alt_price = self._price_feed.get_price(alt)
+                    if alt_price > 0:
+                        det = self._get_momentum(alt)
+                        det.add_tick(alt_price)
+                        det.set_realized_vol(self._price_feed.volatility)
 
             # ── Hard kill switch (touch /tmp/polycrossarb/KILL) ──
             if self._kill_switch_active():
@@ -539,14 +564,21 @@ class CandlePipeline:
                 except (ValueError, TypeError):
                     continue
 
-                # Skip if already resolved or too far out
-                if minutes_left <= 0.5 or minutes_left > 30:
+                # Skip if already resolved or too far out.
+                # Floor at 5s (0.083 min) — must be strictly below the
+                # terminal zone threshold (5% of window_minutes) so that
+                # terminal-zone trades can fire. For 5-min candles,
+                # terminal at 95% = 0.25 min remaining; this floor at
+                # 0.083 allows trades in the [0.083, 0.25] band.
+                if minutes_left <= 0.083 or minutes_left > 30:
                     continue
 
                 # Deduplicate: only 1 trade per time window
                 window_key = contract.end_date  # same end_date = same candle window
                 if window_key in traded_windows:
                     continue
+
+                cid = contract.market.condition_id
 
                 # Calculate window elapsed
                 window_minutes = self._estimate_window_minutes(contract)
@@ -561,17 +593,50 @@ class CandlePipeline:
                 if minutes_elapsed < 0.5:
                     continue  # too early in the window
 
-                # Set open price if first time seeing this contract
-                cid = contract.market.condition_id
-                if self._momentum.get_open_price(cid) is None:
-                    self._momentum.set_window_open(cid, btc)
+                # Resolve the underlying asset price for this contract
+                asset = getattr(contract, "asset", "BTC")
+                asset_price = self._price_feed.get_price(asset) if asset != "BTC" else btc
+                if asset_price <= 0:
+                    continue
 
-                # Detect momentum
-                signal = self._momentum.detect(
+                # Use the correct per-asset momentum detector
+                asset_momentum = self._get_momentum(asset)
+
+                # Set open price if first time seeing this contract
+                if asset_momentum.get_open_price(cid) is None:
+                    asset_momentum.set_window_open(cid, asset_price)
+
+                # ── Cross-asset reference signal ────────────────────
+                # For non-BTC contracts, compute BTC momentum as a leading
+                # indicator and pass it as a reference signal + a boost to
+                # the decision function.
+                btc_ref_signal = None
+                cross_boost = 0.0
+                if (
+                    asset != "BTC"
+                    and settings.candle_cross_asset_enabled
+                    and btc > 0
+                ):
+                    # Correlation gate: skip cross-asset boost when BTC-asset
+                    # correlation drops below threshold (idiosyncratic events)
+                    corr = self._price_feed.rolling_correlation(asset, window_seconds=30.0)
+                    if corr >= settings.candle_cross_asset_min_correlation:
+                        btc_ref_signal = self._momentum.detect(
+                            contract_id=f"__btc_ref_{cid}",
+                            window_start_ago_minutes=minutes_elapsed,
+                            minutes_remaining=minutes_left,
+                            current_price=btc,
+                        )
+                        if btc_ref_signal and btc_ref_signal.confidence >= 0.60:
+                            cross_boost = settings.candle_cross_asset_confidence_boost
+
+                # Detect momentum for the contract's own asset
+                signal = asset_momentum.detect(
                     contract_id=cid,
                     window_start_ago_minutes=minutes_elapsed,
                     minutes_remaining=minutes_left,
-                    current_price=btc,
+                    current_price=asset_price,
+                    reference_signal=btc_ref_signal,
                 )
 
                 if not signal:
@@ -587,13 +652,14 @@ class CandlePipeline:
                     window_minutes=window_minutes,
                     up_price=contract.up_price,
                     down_price=contract.down_price,
-                    btc_price=btc,
+                    btc_price=asset_price,
                     open_btc=signal.open_price,
                     implied_vol=self._price_feed.implied_volatility,
                     min_confidence=self._min_confidence,
                     min_edge=self._min_edge,
                     skip_dead_zone=self._skip_dead_zone,
                     zone_config=self._zone_config,
+                    cross_asset_boost=cross_boost,
                 )
 
                 if isinstance(decision, SkipReason):
@@ -713,6 +779,17 @@ class CandlePipeline:
         else:
             position = min(10.0, self._risk.max_per_market)
 
+        # ── Volatility regime sizing ────────────────────────────────
+        # During HIGH/EXTREME vol, MM lag widens → more edge per trade.
+        # Scale position up to capture the opportunity.
+        short_vol = self._price_feed.short_term_vol(window_seconds=900.0)
+        baseline_vol = self._price_feed.volatility
+        vol_regime = classify_vol_regime(short_vol, baseline_vol)
+        if vol_regime == VolatilityRegime.HIGH:
+            position *= settings.candle_vol_high_multiplier
+        elif vol_regime == VolatilityRegime.EXTREME:
+            position *= settings.candle_vol_extreme_multiplier
+
         # Cap by available capital (prevent overcommitting across concurrent trades)
         position = min(position, self._risk.available_capital)
 
@@ -725,13 +802,19 @@ class CandlePipeline:
         shares = position / market_price
 
         if self.mode == ExecutionMode.PAPER:
-            # Apply realistic slippage and fees for paper trading
-            # Use maker order strategy: 0% fee + potential rebate
-            # vs taker at 1.8%. Place limit 1 tick inside spread.
-            slippage_bps = 10  # 10 bps for maker (less than 30 bps taker impact)
-            fee_rate = 0.0     # 0% maker fee (Polymarket maker rebate)
+            # Realistic paper model: blend maker (0% fee, 65% fill) and
+            # taker (2% effective fee, 35% fill) to match expected live
+            # execution with prefer_maker enabled.
+            if settings.candle_prefer_maker:
+                # Maker fill: best_ask - 1 tick, 0% fee
+                slippage_bps = -10  # negative = price improvement
+                fee_rate = 0.0
+            else:
+                # Taker fill: 1 tick adverse, ~2% effective fee
+                slippage_bps = 30  # 30 bps taker impact
+                fee_rate = 0.02    # ~2% effective taker fee at typical prices
             slipped_price = market_price * (1 + slippage_bps / 10000)
-            slipped_price = min(slipped_price, 0.99)
+            slipped_price = max(0.01, min(slipped_price, 0.99))
             shares = position / slipped_price  # recalc with slipped price
             fee = position * fee_rate
             expected_profit = shares * (fair_value - slipped_price) - fee
@@ -837,6 +920,7 @@ class CandlePipeline:
             "btc_change": signal.price_change,
             "minutes_left": signal.minutes_remaining,
             "position": position,
+            "vol_regime": vol_regime.value,
             "mode": self.mode,
         }
         with open(self.log_dir / "candle_trades.jsonl", "a") as f:

@@ -677,6 +677,11 @@ class SingleLegExecutor:
     Execute: place limit order, poll for fill, record in RiskManager.
     Hold to resolution — no exit needed.
 
+    Maker mode: when ``prefer_maker=True``, posts a GTC limit order at
+    best_ask - 1 tick (0% fee). If not filled within ``maker_timeout_s``,
+    falls back to taker (FOK at best_ask + 1 tick, 2% fee). This saves
+    ~$0.09 per $5 trade (7.2% → 0% fee).
+
     Concurrency: ``execute_single`` is serialized with an asyncio.Lock
     so concurrent strategy callbacks cannot race the shared CLOB
     client (balance check, order placement, fill polling). The lock
@@ -687,6 +692,7 @@ class SingleLegExecutor:
     FILL_POLL_INTERVAL = 2
     MIN_ORDER_USD = 1.0
     MIN_DEPTH_USD = 5.0
+    MAKER_TIMEOUT_S = 3.0  # max seconds to wait for maker fill
 
     def __init__(self, risk_manager: RiskManager):
         import asyncio as _asyncio
@@ -746,11 +752,17 @@ class SingleLegExecutor:
         size: float,
         neg_risk: bool = True,
         event_id: str = "",
+        prefer_maker: bool = False,
     ) -> SingleLegResult:
-        """Execute a single-token trade. Serialized via self._lock."""
+        """Execute a single-token trade. Serialized via self._lock.
+
+        Args:
+            prefer_maker: If True, attempts a GTC maker order (0% fee) first.
+                Falls back to taker if not filled within MAKER_TIMEOUT_S.
+        """
         async with self._lock:
             return await self._execute_single_locked(
-                token_id, side, price, size, neg_risk, event_id,
+                token_id, side, price, size, neg_risk, event_id, prefer_maker,
             )
 
     async def _execute_single_locked(
@@ -761,6 +773,7 @@ class SingleLegExecutor:
         size: float,
         neg_risk: bool,
         event_id: str,
+        prefer_maker: bool = False,
     ) -> SingleLegResult:
         """Inner serialized body — must only be called holding self._lock."""
         import asyncio
@@ -804,17 +817,24 @@ class SingleLegExecutor:
         except Exception as e:
             return SingleLegResult(success=False, error=f"Book check failed: {e}")
 
-        # ── Use live best ask as limit price ────────────────────
+        # ── Compute limit price ────────────────────────────────
         try:
             best_ask = float(book.asks[0].price)
-            # Use the worse of our price and best ask + 1 tick to ensure fill
             tick = float(tick_size)
+        except (IndexError, ValueError):
+            best_ask = price
+            tick = 0.01
+
+        if prefer_maker:
+            # Maker mode: post at best_ask - 1 tick (GTC, 0% fee)
+            maker_price = round((best_ask - tick) / tick) * tick
+            maker_price = max(0.01, min(0.99, maker_price))
+            live_price = maker_price
+        else:
+            # Taker mode: best_ask + 1 tick to ensure fill
             live_price = min(best_ask + tick, price + tick * 2)
-            # Round to tick size
             live_price = round(live_price / tick) * tick
             live_price = max(0.01, min(0.99, live_price))
-        except (IndexError, ValueError):
-            live_price = round(price / 0.01) * 0.01  # fallback: round to cent
 
         # ── Place order ───────────────────────────────────────────
 
@@ -839,7 +859,9 @@ class SingleLegExecutor:
             if not order_id:
                 return SingleLegResult(success=False, error="No order ID returned")
 
-            log.info("SingleLeg: placed %s %.1f @ $%.4f id=%s", side, size, price, order_id[:16])
+            order_mode = "maker" if prefer_maker else "taker"
+            log.info("SingleLeg: placed %s %s %.1f @ $%.4f id=%s",
+                     order_mode, side, size, live_price, order_id[:16])
 
         except Exception as e:
             return SingleLegResult(success=False, error=f"Order failed: {str(e)[:80]}")
@@ -848,41 +870,68 @@ class SingleLegExecutor:
 
         filled_size = 0.0
         fill_price = live_price
-        deadline = time.time() + self.FILL_TIMEOUT
-        last_matched = 0.0
 
-        while time.time() < deadline:
-            await asyncio.sleep(self.FILL_POLL_INTERVAL)
-            try:
-                status = self._client.get_order(order_id)
-                matched = float(status.get("size_matched", 0))
-                last_matched = matched
-                if matched >= size * 0.95:
-                    filled_size = matched
-                    # VWAP across all fills
-                    trades = status.get("associate_trades") or []
-                    if trades and isinstance(trades, list):
-                        total_value = 0.0
-                        total_qty = 0.0
-                        for t in trades:
-                            try:
-                                tp = float(t.get("price", 0))
-                                ts = float(t.get("size", 0))
-                                if tp > 0 and ts > 0:
-                                    total_value += tp * ts
-                                    total_qty += ts
-                            except (ValueError, TypeError):
-                                pass
-                        if total_qty > 0:
-                            fill_price = total_value / total_qty
-                    break
-            except Exception:
-                pass
+        # For maker orders, use a short timeout before falling back to taker
+        if prefer_maker:
+            maker_deadline = time.time() + self.MAKER_TIMEOUT_S
+            while time.time() < maker_deadline:
+                await asyncio.sleep(0.5)  # poll faster for maker
+                try:
+                    status = self._client.get_order(order_id)
+                    matched = float(status.get("size_matched", 0))
+                    if matched >= size * 0.95:
+                        filled_size = matched
+                        fill_price = self._extract_vwap(status, live_price)
+                        log.info("SingleLeg: maker fill %.1f @ $%.4f (0%% fee)",
+                                 filled_size, fill_price)
+                        break
+                except Exception:
+                    pass
 
-        # If not fully filled, check what DID fill and track it
-        if filled_size == 0.0 and last_matched > 0:
-            # Partial fill — record whatever filled so it's not orphaned
-            filled_size = last_matched
+            # Maker didn't fill → cancel and fall back to taker
+            if filled_size < size * 0.50:
+                try:
+                    self._client.cancel(order_id)
+                except Exception:
+                    pass
+                log.info("SingleLeg: maker timeout, falling back to taker")
+                # Re-place as taker at best_ask + 1 tick
+                taker_price = round((best_ask + tick) / tick) * tick
+                taker_price = max(0.01, min(0.99, taker_price))
+                try:
+                    args = OrderArgs(
+                        token_id=token_id,
+                        price=taker_price,
+                        size=size,
+                        side=BUY,
+                    )
+                    resp = self._client.create_and_post_order(args, opts)
+                    order_id = (resp or {}).get("orderID") or (resp or {}).get("id") or ""
+                    live_price = taker_price
+                except Exception as e:
+                    return SingleLegResult(success=False,
+                                          error=f"Taker fallback failed: {str(e)[:80]}")
+
+        # Standard fill-wait loop (for taker orders or maker fallback)
+        if filled_size < size * 0.50:
+            deadline = time.time() + self.FILL_TIMEOUT
+            last_matched = 0.0
+
+            while time.time() < deadline:
+                await asyncio.sleep(self.FILL_POLL_INTERVAL)
+                try:
+                    status = self._client.get_order(order_id)
+                    matched = float(status.get("size_matched", 0))
+                    last_matched = matched
+                    if matched >= size * 0.95:
+                        filled_size = matched
+                        fill_price = self._extract_vwap(status, live_price)
+                        break
+                except Exception:
+                    pass
+
+            if filled_size == 0.0 and last_matched > 0:
+                filled_size = last_matched
 
         if filled_size < size * 0.50:
             # Cancel remaining
@@ -912,6 +961,25 @@ class SingleLegExecutor:
             token_id, event_id, side, filled_size, fill_price,
             live_price, neg_risk, order_id,
         )
+
+    @staticmethod
+    def _extract_vwap(status: dict, fallback_price: float) -> float:
+        """Extract VWAP fill price from order status."""
+        trades = status.get("associate_trades") or []
+        if not trades or not isinstance(trades, list):
+            return fallback_price
+        total_value = 0.0
+        total_qty = 0.0
+        for t in trades:
+            try:
+                tp = float(t.get("price", 0))
+                ts = float(t.get("size", 0))
+                if tp > 0 and ts > 0:
+                    total_value += tp * ts
+                    total_qty += ts
+            except (ValueError, TypeError):
+                pass
+        return total_value / total_qty if total_qty > 0 else fallback_price
 
     def _record_fill(
         self,

@@ -18,9 +18,12 @@
 mod clob;
 mod exchange;
 mod fair_value;
+mod ipc;
 mod latency;
 mod edge;
 mod debug;
+mod polymarket_ws;
+mod signing;
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -39,6 +42,10 @@ pub struct PriceState {
     pub implied_vol: f64,
     // Per-source timestamps for staleness tracking
     pub source_timestamps: HashMap<String, Instant>,
+    // Multi-asset price tracking: "ETH" -> {source -> price}, "SOL" -> {source -> price}
+    pub alt_prices: HashMap<String, HashMap<String, f64>>,
+    pub alt_mid: HashMap<String, f64>,
+    pub alt_timestamps: HashMap<String, Instant>,
 }
 
 impl PriceState {
@@ -50,6 +57,9 @@ impl PriceState {
             spread: 0.0,
             implied_vol: 0.50,
             source_timestamps: HashMap::new(),
+            alt_prices: HashMap::new(),
+            alt_mid: HashMap::new(),
+            alt_timestamps: HashMap::new(),
         }
     }
 
@@ -75,6 +85,35 @@ impl PriceState {
             let min = live.iter().cloned().fold(f64::MAX, f64::min);
             let max = live.iter().cloned().fold(f64::MIN, f64::max);
             self.spread = max - min;
+        }
+    }
+
+    /// Update price for an alt asset (ETH, SOL).
+    pub fn update_alt(&mut self, asset: &str, source: &str, price: f64) {
+        if price <= 0.0 { return; }
+        let key = format!("{}:{}", asset, source);
+        self.alt_timestamps.insert(key, Instant::now());
+
+        let sources = self.alt_prices.entry(asset.to_string()).or_default();
+        sources.insert(source.to_string(), price);
+
+        // Compute mid from live sources
+        let now = Instant::now();
+        let live: Vec<f64> = sources.iter()
+            .filter(|(src, _)| {
+                let key = format!("{}:{}", asset, src);
+                self.alt_timestamps.get(&key)
+                    .map(|t| now.duration_since(*t).as_secs() < 10)
+                    .unwrap_or(false)
+            })
+            .map(|(_, p)| *p)
+            .collect();
+
+        if !live.is_empty() {
+            self.alt_mid.insert(
+                asset.to_string(),
+                live.iter().sum::<f64>() / live.len() as f64,
+            );
         }
     }
 
@@ -153,6 +192,26 @@ async fn main() {
         });
     }
 
+    // ETH + SOL price feeds (for cross-asset lead-lag)
+    {
+        let s = state.clone();
+        tokio::spawn(async move {
+            loop {
+                exchange::binance_alt_feed(s.clone()).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+    }
+    {
+        let s = state.clone();
+        tokio::spawn(async move {
+            loop {
+                exchange::bybit_alt_feed(s.clone()).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+    }
+
     // Deribit IV loop
     {
         let s = state.clone();
@@ -191,9 +250,15 @@ async fn main() {
             None
         } else {
             let client = clob::create_shared_client(&base_url, &api_key, &api_secret, &api_passphrase);
+            // Set signing key for EIP-712 order signing
+            if let Ok(pk) = std::env::var("PRIVATE_KEY") {
+                client.write().await.set_signing_key(&pk);
+            } else {
+                eprintln!("Warning: PRIVATE_KEY not set — orders will fail EIP-712 signing");
+            }
             // Pre-warm connection pool
             client.write().await.warm_connection().await;
-            eprintln!("CLOB direct order placement ENABLED (0% maker fees)");
+            eprintln!("CLOB direct order placement ENABLED (EIP-712 signed, 0% maker fees)");
             Some(client)
         }
     } else {
@@ -357,6 +422,7 @@ async fn main() {
                             price,
                             size,
                             "BUY",
+                            false, // neg_risk — candle markets are standard CTF
                         ).await {
                             Ok(oid) => eprintln!("CLOB order OK: {} edge={:.1}% id={}",
                                 sig.direction, sig.edge * 100.0, &oid[..16.min(oid.len())]),

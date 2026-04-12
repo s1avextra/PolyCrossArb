@@ -108,6 +108,75 @@ pub async fn mexc_feed(state: Arc<RwLock<PriceState>>) {
     }
 }
 
+// ── ETH/SOL multi-asset feeds ───────────────────────────────────
+// Binance combined stream for ETH + SOL — single connection, lower overhead.
+
+pub async fn binance_alt_feed(state: Arc<RwLock<PriceState>>) {
+    loop {
+        match connect_async("wss://stream.binance.com:9443/stream?streams=ethusdt@ticker/solusdt@ticker").await {
+            Ok((ws, _)) => {
+                eprintln!("Binance alt (ETH+SOL) connected");
+                let (_, mut read) = ws.split();
+                while let Some(Ok(msg)) = read.next().await {
+                    if let Ok(text) = msg.into_text() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(price) = v["data"]["c"].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                                let stream = v["stream"].as_str().unwrap_or("");
+                                let asset = if stream.starts_with("ethusdt") {
+                                    "ETH"
+                                } else if stream.starts_with("solusdt") {
+                                    "SOL"
+                                } else {
+                                    continue;
+                                };
+                                state.write().await.update_alt(asset, "binance", price);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("Binance alt error: {}", e),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+pub async fn bybit_alt_feed(state: Arc<RwLock<PriceState>>) {
+    loop {
+        match connect_async("wss://stream.bybit.com/v5/public/spot").await {
+            Ok((ws, _)) => {
+                eprintln!("Bybit alt (ETH+SOL) connected");
+                let (mut write, mut read) = ws.split();
+                use futures_util::SinkExt;
+                let sub = r#"{"op":"subscribe","args":["tickers.ETHUSDT","tickers.SOLUSDT"]}"#;
+                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(sub.to_string().into())).await;
+
+                while let Some(Ok(msg)) = read.next().await {
+                    if let Ok(text) = msg.into_text() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let (Some(symbol), Some(price)) = (
+                                v["data"]["symbol"].as_str(),
+                                v["data"]["lastPrice"].as_str().and_then(|s| s.parse::<f64>().ok()),
+                            ) {
+                                let asset = if symbol.starts_with("ETH") {
+                                    "ETH"
+                                } else if symbol.starts_with("SOL") {
+                                    "SOL"
+                                } else {
+                                    continue;
+                                };
+                                state.write().await.update_alt(asset, "bybit", price);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("Bybit alt error: {}", e),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
 /// Fetch BTC ATM implied volatility from Deribit (free, no auth)
 pub async fn fetch_deribit_iv() -> Option<f64> {
     let client = reqwest::Client::new();

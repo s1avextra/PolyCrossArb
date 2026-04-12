@@ -76,6 +76,8 @@ class CryptoPriceFeed:
         # Multi-asset price tracking
         self._asset_prices: dict[str, dict[str, float]] = {}  # asset -> {source: price}
         self._asset_mid: dict[str, float] = {}  # asset -> mid price
+        # Per-asset price history for correlation computation
+        self._asset_history: dict[str, deque[tuple[float, float]]] = {}  # asset -> deque[(ts, price)]
 
     @property
     def btc_price(self) -> float:
@@ -96,7 +98,12 @@ class CryptoPriceFeed:
             self._asset_prices[asset] = {}
         self._asset_prices[asset][source] = price
         prices = list(self._asset_prices[asset].values())
-        self._asset_mid[asset] = sum(prices) / len(prices)
+        mid = sum(prices) / len(prices)
+        self._asset_mid[asset] = mid
+        # Record tick for correlation computation
+        if asset not in self._asset_history:
+            self._asset_history[asset] = deque(maxlen=500)
+        self._asset_history[asset].append((time.time(), mid))
 
     @property
     def volatility(self) -> float:
@@ -106,6 +113,91 @@ class CryptoPriceFeed:
     def implied_volatility(self) -> float:
         """Deribit implied vol when available, else realized vol."""
         return self._implied_vol if self._implied_vol else self._volatility_24h
+
+    def short_term_vol(self, window_seconds: float = 900.0) -> float:
+        """Compute annualized realized vol over a recent short window.
+
+        Uses only ticks within the last ``window_seconds`` (default 15 min).
+        Returns 0.0 if insufficient data (< 20 ticks in window).
+        """
+        now = time.time()
+        cutoff = now - window_seconds
+        items = [(ts, p) for ts, p in self._price_history if ts >= cutoff]
+        if len(items) < 20:
+            return 0.0
+
+        returns: list[tuple[float, float]] = []
+        for i in range(1, len(items)):
+            dt = items[i][0] - items[i - 1][0]
+            if dt > 0 and items[i - 1][1] > 0:
+                log_return = math.log(items[i][1] / items[i - 1][1])
+                returns.append((log_return, dt))
+
+        if len(returns) < 10:
+            return 0.0
+
+        avg_dt = sum(dt for _, dt in returns) / len(returns)
+        mean_r = sum(r for r, _ in returns) / len(returns)
+        var_r = sum((r - mean_r) ** 2 for r, _ in returns) / len(returns)
+
+        if avg_dt <= 0:
+            return 0.0
+        var_per_second = var_r / avg_dt
+        return min(5.0, math.sqrt(var_per_second * 365.25 * 86400))
+
+    def rolling_correlation(self, asset: str, window_seconds: float = 30.0) -> float:
+        """Pearson correlation between BTC and ``asset`` log-returns over a rolling window.
+
+        Returns 0.0 if insufficient paired data (< 10 matched intervals).
+        Used to gate cross-asset trading: disable when correlation < 0.70
+        to avoid idiosyncratic divergence events.
+        """
+        now = time.time()
+        cutoff = now - window_seconds
+
+        btc_ticks = [(ts, p) for ts, p in self._price_history if ts >= cutoff]
+        alt_hist = self._asset_history.get(asset.upper())
+        if not alt_hist:
+            return 0.0
+        alt_ticks = [(ts, p) for ts, p in alt_hist if ts >= cutoff]
+
+        if len(btc_ticks) < 10 or len(alt_ticks) < 10:
+            return 0.0
+
+        # Align ticks to 1-second buckets via rounding, compute log-returns
+        def bucket_returns(ticks: list[tuple[float, float]]) -> dict[int, float]:
+            by_sec: dict[int, float] = {}
+            for ts, p in ticks:
+                by_sec[int(ts)] = p
+            keys = sorted(by_sec)
+            returns = {}
+            for i in range(1, len(keys)):
+                if by_sec[keys[i - 1]] > 0:
+                    returns[keys[i]] = math.log(by_sec[keys[i]] / by_sec[keys[i - 1]])
+            return returns
+
+        btc_r = bucket_returns(btc_ticks)
+        alt_r = bucket_returns(alt_ticks)
+
+        # Intersect timestamps
+        common = sorted(set(btc_r) & set(alt_r))
+        if len(common) < 10:
+            return 0.0
+
+        xs = [btc_r[t] for t in common]
+        ys = [alt_r[t] for t in common]
+
+        n = len(xs)
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        cov = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n)) / n
+        var_x = sum((x - mean_x) ** 2 for x in xs) / n
+        var_y = sum((y - mean_y) ** 2 for y in ys) / n
+
+        denom = math.sqrt(var_x * var_y)
+        if denom < 1e-15:
+            return 0.0
+        return max(-1.0, min(1.0, cov / denom))
 
     @property
     def age_ms(self) -> float:

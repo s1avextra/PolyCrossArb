@@ -174,3 +174,19 @@ def alert_shutdown(reason: str, pnl: float, trades: int) -> None:
         f"Session P&L: ${pnl:+.4f} | Trades: {trades}"
     )
     _send(msg, "shutdown")
+
+
+def alert_latency_degradation(
+    p99_us: int,
+    threshold_ms: float,
+    window_count: int,
+    strategy: str = "candle",
+) -> None:
+    """Latency degradation detected — p99 exceeds threshold for consecutive windows."""
+    p99_ms = p99_us / 1000
+    msg = (
+        f":warning: *LATENCY DEGRADATION* — {strategy}\n"
+        f"p99: {p99_ms:.1f}ms (threshold: {threshold_ms:.0f}ms)\n"
+        f"Exceeded for {window_count} consecutive 30s windows"
+    )
+    _send(msg, "latency")

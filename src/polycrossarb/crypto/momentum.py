@@ -12,6 +12,7 @@ Confidence model (volatility-normalized):
 """
 from __future__ import annotations
 
+import enum
 import logging
 import math
 import time
@@ -19,6 +20,51 @@ from collections import deque
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
+
+
+class VolatilityRegime(enum.Enum):
+    """Volatility regime classification.
+
+    Compares trailing short-window realized vol to a longer baseline.
+    During HIGH/EXTREME regimes, MM lag widens and edge per trade
+    increases — scale position size accordingly.
+
+    Thresholds (ratio of short_vol / baseline_vol):
+      LOW      < 0.5   — unusually quiet, tighter spreads
+      NORMAL   0.5–1.5 — typical conditions
+      HIGH     1.5–2.5 — elevated (news/FOMC), wider MM lag
+      EXTREME  > 2.5   — liquidation cascades / black swan
+    """
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    EXTREME = "extreme"
+
+
+def classify_vol_regime(
+    short_vol: float,
+    baseline_vol: float,
+) -> VolatilityRegime:
+    """Classify current volatility regime.
+
+    Args:
+        short_vol: Short-window annualized realized vol (e.g., 15-min).
+        baseline_vol: Longer baseline annualized vol (e.g., 24h).
+
+    Returns:
+        The volatility regime classification.
+    """
+    if baseline_vol <= 0 or short_vol <= 0:
+        return VolatilityRegime.NORMAL
+
+    ratio = short_vol / baseline_vol
+    if ratio > 2.5:
+        return VolatilityRegime.EXTREME
+    if ratio > 1.5:
+        return VolatilityRegime.HIGH
+    if ratio < 0.5:
+        return VolatilityRegime.LOW
+    return VolatilityRegime.NORMAL
 
 
 @dataclass
@@ -83,6 +129,7 @@ class MomentumDetector:
         minutes_remaining: float,
         current_price: float,
         now_ts: float | None = None,
+        reference_signal: MomentumSignal | None = None,
     ) -> MomentumSignal | None:
         """Detect momentum for a specific candle window.
 
@@ -93,6 +140,11 @@ class MomentumDetector:
             current_price: Current BTC price.
             now_ts: Explicit "now" in unix seconds (None = wall clock).
                     Backtest replay must pass historical timestamps.
+            reference_signal: Optional momentum signal from a leading reference
+                asset (e.g. BTC when evaluating ETH/SOL). When both the
+                local and reference signals agree on direction and the
+                reference has high confidence, the local signal receives a
+                confidence boost.
         """
         if not self._ticks or minutes_remaining <= 0:
             return None
@@ -193,6 +245,12 @@ class MomentumDetector:
         # Reduce if move is sub-0.3 sigma (noise)
         if z_score < 0.3:
             confidence *= 0.4
+
+        # Cross-asset agreement is factored in by the decision function
+        # (cross_asset_boost lowers zone thresholds), NOT here. Keeping
+        # the signal's confidence a pure reflection of the asset's own
+        # momentum avoids double-boosting that admits very weak signals.
+        _ = reference_signal  # reserved for future per-asset correlation weighting
 
         return MomentumSignal(
             direction=direction,

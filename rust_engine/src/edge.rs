@@ -169,6 +169,7 @@ pub struct LatencySignal {
     pub size_usd: f64,            // this entry size
     pub minutes_remaining: f64,
     pub window_minutes: f64,
+    pub order_type: String,       // "maker" (GTC, 0% fee) or "taker_fok" (FOK, crosses spread)
     // Latency instrumentation
     pub tick_to_signal_us: u64,   // microseconds from tick to signal
     pub sources: usize,
@@ -449,6 +450,8 @@ impl EdgeAccumulator {
             size_usd,
             minutes_remaining,
             window_minutes,
+            // Terminal zone (last 15s) → aggressive taker; otherwise prefer maker
+            order_type: if minutes_remaining < 0.25 { "taker_fok".to_string() } else { "maker".to_string() },
             tick_to_signal_us,
             sources: n_sources,
             spread,

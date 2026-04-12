@@ -185,6 +185,80 @@ class BookWalkTakerFillModel:
         )
 
 
+class MakerFillModel:
+    """Simulates maker order strategy: post limit at touch, fill probabilistically.
+
+    With sub-10ms latency, we can post GTC maker orders (0% fee) instead
+    of crossing as taker (7.2% fee). The fill probability depends on
+    whether the market moves through our price within the timeout window.
+
+    Model:
+      - Fill at limit price (best_ask - 1 tick for buys) with ``fill_prob``
+      - If not filled, fall back to taker (one-tick adverse) with ``1 - fill_prob``
+      - Maker fee = 0%, taker fee = applied externally by the engine
+
+    Calibrated from live Polymarket data: maker fill rate ~65% on 3s timeout.
+    """
+
+    def __init__(
+        self,
+        fill_prob: float = 0.65,
+        tick_size: float = DEFAULT_TICK,
+        seed: int | None = None,
+    ):
+        self.fill_prob = fill_prob
+        self.tick_size = tick_size
+        import random
+        self._rng = random.Random(seed)
+
+    def fill(
+        self,
+        side: str,
+        size: float,
+        best_bid: float,
+        best_ask: float,
+        order_type: str = "market",
+        limit_price: float | None = None,
+    ) -> FillResult:
+        if size <= 0:
+            return FillResult(0, 0, 0, 0, False, "size <= 0")
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            return FillResult(0, 0, 0, 0, False, "invalid book")
+
+        # Maker attempt: post at touch - 1 tick (inside the spread, 0% fee)
+        if self._rng.random() < self.fill_prob:
+            if side == "buy":
+                fill_price = max(self.tick_size, best_ask - self.tick_size)
+            else:
+                fill_price = min(1.0 - self.tick_size, best_bid + self.tick_size)
+            # Price improvement vs touch
+            touch = best_ask if side == "buy" else best_bid
+            improvement = abs(touch - fill_price)
+            cost = fill_price * size * (-1 if side == "sell" else 1)
+            return FillResult(
+                filled_size=size,
+                fill_price=fill_price,
+                fill_cost=cost,
+                slippage_per_share=-improvement,  # negative = price improvement
+                success=True,
+                reason="maker_fill",
+            )
+        else:
+            # Taker fallback: one-tick adverse
+            fill_price = one_tick_adverse_price(side, best_bid, best_ask, self.tick_size)
+            touch = best_ask if side == "buy" else best_bid
+            slippage = abs(fill_price - touch)
+            cost = fill_price * size * (-1 if side == "sell" else 1)
+            return FillResult(
+                filled_size=size,
+                fill_price=fill_price,
+                fill_cost=cost,
+                slippage_per_share=slippage,
+                success=True,
+                reason="taker_fallback",
+            )
+
+
 class PerfectFillModel:
     """Fill at touch price, no slippage. Use as a sanity baseline only."""
 

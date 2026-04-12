@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     max_crypto_position_pct: float = 0.10
 
     # ── Candle strategy zone gates ────────────────────────────────
-    # Three-zone entry timing. Tunable from .env without redeploy.
+    # Four-zone entry timing. Tunable from .env without redeploy.
+    # Zones: early [0%,40%) | primary [40%,80%) | late [80%,95%) | terminal [95%,100%]
     candle_zone_early_min_confidence: float = 0.55
     candle_zone_early_min_z: float = 2.0
     candle_zone_early_min_edge: float = 0.03
@@ -70,12 +71,29 @@ class Settings(BaseSettings):
     candle_zone_late_min_confidence: float = 0.65
     candle_zone_late_min_z: float = 0.5
     candle_zone_late_min_edge: float = 0.08
+    candle_zone_terminal_min_confidence: float = 0.55
+    candle_zone_terminal_min_z: float = 0.3
+    candle_zone_terminal_min_edge: float = 0.03
     candle_dead_zone_lo: float = 0.80
     candle_dead_zone_hi: float = 0.90
     candle_min_price: float = 0.10
     candle_max_price: float = 0.90
     candle_edge_cap: float = 0.25
     candle_skip_dead_zone: bool = True
+
+    # ── Volatility regime sizing ─────────────────────────────────
+    candle_vol_high_multiplier: float = 1.5
+    candle_vol_extreme_multiplier: float = 2.0
+
+    # ── Cross-asset lead-lag ──────────────────────────���──────────
+    # Use BTC momentum as leading indicator for ETH/SOL contracts.
+    candle_cross_asset_enabled: bool = False
+    candle_cross_asset_min_correlation: float = 0.70
+    candle_cross_asset_confidence_boost: float = 0.10
+
+    # ── Maker fee optimization ────────────────────────────────────
+    candle_prefer_maker: bool = False
+    candle_maker_timeout_s: float = 3.0
 
     # ── Candle circuit breaker ────────────────────────────────────
     candle_breaker_min_trades: int = 20

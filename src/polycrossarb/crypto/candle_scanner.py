@@ -26,7 +26,7 @@ _CANDLE_RE = re.compile(
 
 @dataclass
 class CandleContract:
-    """A BTC Up/Down candle contract."""
+    """A crypto Up/Down candle contract (BTC, ETH, or SOL)."""
     market: Market
     up_token_id: str
     down_token_id: str
@@ -37,6 +37,7 @@ class CandleContract:
     volume: float
     liquidity: float
     window_description: str  # e.g. "3:45AM-4:00AM ET"
+    asset: str = "BTC"      # "BTC", "ETH", or "SOL"
 
     @property
     def spread(self) -> float:
@@ -66,6 +67,15 @@ def scan_candle_markets(
             continue
 
         window_desc = match.group(1).strip()
+
+        # Identify the underlying asset
+        q_lower = m.question.lower()
+        if q_lower.startswith(("ethereum", "eth")):
+            asset = "ETH"
+        elif q_lower.startswith(("solana", "sol")):
+            asset = "SOL"
+        else:
+            asset = "BTC"
 
         # Must have exactly 2 outcomes (Up/Down)
         if len(m.outcomes) != 2:
@@ -110,6 +120,7 @@ def scan_candle_markets(
             volume=m.volume,
             liquidity=m.liquidity,
             window_description=window_desc,
+            asset=asset,
         ))
 
     contracts.sort(key=lambda c: c.hours_left)

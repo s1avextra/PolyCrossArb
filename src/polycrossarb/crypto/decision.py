@@ -71,6 +71,12 @@ class ZoneConfig:
     edits. Frozen so it can be hashed and reused as a singleton — the
     backtest hot path constructs millions of ZoneConfig defaults if we
     don't reuse one.
+
+    Zones (elapsed %):
+      early    [0%, 40%)
+      primary  [40%, 80%)
+      late     [80%, 95%)
+      terminal [95%, 100%]  — last ~15s of a 5-min candle
     """
     early_min_confidence: float = 0.55
     early_min_z: float = 2.0
@@ -79,6 +85,9 @@ class ZoneConfig:
     late_min_confidence: float = 0.65
     late_min_z: float = 0.5
     late_min_edge: float = 0.08
+    terminal_min_confidence: float = 0.55
+    terminal_min_z: float = 0.3
+    terminal_min_edge: float = 0.03
     dead_zone_lo: float = DEFAULT_DEAD_ZONE_LO
     dead_zone_hi: float = DEFAULT_DEAD_ZONE_HI
     min_price: float = DEFAULT_MIN_PRICE
@@ -93,12 +102,18 @@ _DEFAULT_ZONE_CONFIG = ZoneConfig()
 
 
 def zone_for(elapsed_pct: float) -> str:
-    """Map elapsed-pct to zone name."""
+    """Map elapsed-pct to zone name.
+
+    Terminal zone (≥95%) captures the last ~15s of a 5-min candle where
+    BTC outcome is ~90%+ determined but the MM may still show stale prices.
+    """
     if elapsed_pct < 0.40:
         return "early"
     if elapsed_pct < 0.80:
         return "primary"
-    return "late"
+    if elapsed_pct < 0.95:
+        return "late"
+    return "terminal"
 
 
 def zone_thresholds(
@@ -113,6 +128,8 @@ def zone_thresholds(
         return (cfg.early_min_confidence, cfg.early_min_z, cfg.early_min_edge)
     if zone == "primary":
         return (min_confidence, cfg.primary_min_z, min_edge)
+    if zone == "terminal":
+        return (cfg.terminal_min_confidence, cfg.terminal_min_z, cfg.terminal_min_edge)
     return (cfg.late_min_confidence, cfg.late_min_z, max(min_edge, cfg.late_min_edge))
 
 
@@ -130,6 +147,7 @@ def decide_candle_trade(
     min_edge: float = DEFAULT_MIN_EDGE,
     skip_dead_zone: bool = True,
     zone_config: ZoneConfig | None = None,
+    cross_asset_boost: float = 0.0,
 ) -> CandleDecision | SkipReason:
     """Decide whether to enter a candle trade.
 
@@ -137,13 +155,23 @@ def decide_candle_trade(
     Pure function — no side effects, no time.time(), no I/O.
 
     Same logic used in live (CandlePipeline._scan_loop) and backtest.
+
+    Args:
+        cross_asset_boost: confidence boost from a reference asset (e.g. BTC
+            for ETH/SOL contracts). Applied as a flat reduction to zone
+            confidence and z-score thresholds when positive.
     """
     cfg = zone_config or _DEFAULT_ZONE_CONFIG
 
-    # ── 3-Zone entry timing ──────────────────────────────────────
+    # ── 4-Zone entry timing ──────────────────────────────────────
     elapsed_pct = minutes_elapsed / window_minutes if window_minutes > 0 else 1.0
     zone = zone_for(elapsed_pct)
     z_min_conf, z_min_z, z_min_edge = zone_thresholds(zone, min_confidence, min_edge, cfg)
+
+    # Cross-asset boost lowers thresholds when a reference asset strongly agrees
+    if cross_asset_boost > 0:
+        z_min_conf = max(0.40, z_min_conf - cross_asset_boost)
+        z_min_z = max(0.1, z_min_z - cross_asset_boost)
 
     # ── Confidence and z-score gates ────────────────────────────
     if signal.confidence < z_min_conf:
@@ -196,8 +224,11 @@ def decide_candle_trade(
 
     edge = fair_value - market_price
 
-    # Cap edges that signal stale data
-    if edge > cfg.edge_cap:
+    # Cap edges that signal stale data — but NOT in terminal zone.
+    # At very short time horizons (<15s), BS fair value is nearly binary
+    # (close to 0.0 or 1.0) for any directional move, producing edges
+    # of ~0.50. These are real edges (outcome is ~determined), not stale.
+    if zone != "terminal" and edge > cfg.edge_cap:
         return SkipReason(
             reason="edge_too_high_stale",
             zone=zone,
@@ -235,6 +266,9 @@ def zone_config_from_settings() -> ZoneConfig:
         late_min_confidence=settings.candle_zone_late_min_confidence,
         late_min_z=settings.candle_zone_late_min_z,
         late_min_edge=settings.candle_zone_late_min_edge,
+        terminal_min_confidence=settings.candle_zone_terminal_min_confidence,
+        terminal_min_z=settings.candle_zone_terminal_min_z,
+        terminal_min_edge=settings.candle_zone_terminal_min_edge,
         dead_zone_lo=settings.candle_dead_zone_lo,
         dead_zone_hi=settings.candle_dead_zone_hi,
         min_price=settings.candle_min_price,

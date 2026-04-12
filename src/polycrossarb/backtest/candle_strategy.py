@@ -60,11 +60,15 @@ class StrategyConfig:
     min_edge: float = 0.07
     realized_vol: float = 0.50
     position_size_usd: float = 5.0
-    fee_rate: float = 0.072
+    fee_rate: float = 0.072       # taker fee (7.2%)
+    maker_fee_rate: float = 0.0   # maker fee (0% on Polymarket)
+    prefer_maker: bool = False    # if True, orders carry maker_fee_rate for MakerFillModel
     use_implied_vol: bool = False  # if True, vol is recomputed from BTC history
     vol_lookback_seconds: float = 3600.0
     skip_dead_zone: bool = True
     zone_config: ZoneConfig | None = None
+    cross_asset_enabled: bool = False
+    cross_asset_confidence_boost: float = 0.10
 
 
 class CandleStrategyAdapter:
@@ -106,10 +110,17 @@ class CandleStrategyAdapter:
         registry: CandleRegistry,
         btc_history: BTCHistory,
         config: StrategyConfig | None = None,
+        asset_histories: dict[str, BTCHistory] | None = None,
     ):
         self.registry = registry
         self.btc_history = btc_history
         self.config = config or StrategyConfig()
+
+        # Optional per-asset histories for cross-asset backtesting.
+        # Keys are asset names ("ETH", "SOL"). When present, non-BTC
+        # contracts use their own asset's history for momentum instead
+        # of BTC prices. Falls back to btc_history if not provided.
+        self._asset_histories: dict[str, BTCHistory] = asset_histories or {}
 
         # Snap to live settings.candle_zone_* if the caller didn't pin a
         # ZoneConfig — keeps backtest semantics aligned with live .env.
@@ -119,8 +130,11 @@ class CandleStrategyAdapter:
         else:
             self._zone_config = self.config.zone_config
 
+        # Per-asset momentum detectors — mirrors the live pipeline pattern
+        self._momentum_detectors: dict[str, MomentumDetector] = {}
         self._momentum = MomentumDetector(realized_vol=self.config.realized_vol)
         self._momentum.set_realized_vol(self.config.realized_vol)
+        self._momentum_detectors["BTC"] = self._momentum
 
         # Window state, keyed by condition_id
         self.windows: dict[str, WindowState] = {}
@@ -149,6 +163,20 @@ class CandleStrategyAdapter:
     def _btc_at(self, ts_s: float) -> float:
         """Lookup BTC price from history, falling back to 0 if missing."""
         self.btc_lookups += 1
+        return self.btc_history.price_at_seconds(ts_s)
+
+    def _get_momentum(self, asset: str) -> MomentumDetector:
+        """Get or create a momentum detector for the given asset."""
+        if asset not in self._momentum_detectors:
+            det = MomentumDetector(realized_vol=self.config.realized_vol)
+            det.set_realized_vol(self.config.realized_vol)
+            self._momentum_detectors[asset] = det
+        return self._momentum_detectors[asset]
+
+    def _asset_price_at(self, asset: str, ts_s: float) -> float:
+        """Get asset price at timestamp. Uses asset-specific history if available."""
+        if asset != "BTC" and asset in self._asset_histories:
+            return self._asset_histories[asset].price_at_seconds(ts_s)
         return self.btc_history.price_at_seconds(ts_s)
 
     def _vol_at(self, ts_s: float) -> float:
@@ -195,23 +223,37 @@ class CandleStrategyAdapter:
         minutes_remaining = (contract.end_time_s - ts_s) / 60.0
         minutes_elapsed = contract.window_minutes - minutes_remaining
 
-        # Need at least 30 seconds of window elapsed for momentum to work
+        # Need at least 30 seconds of window elapsed for momentum to work.
+        # Floor at 5s remaining (0.083 min) — must be strictly below the
+        # terminal zone threshold so terminal-zone trades can fire.
         if minutes_elapsed < 0.5:
             return []
+        if minutes_remaining <= 0.083:
+            return []
 
-        # Get BTC at this moment
+        # Resolve the asset for this contract
+        asset = getattr(contract, "asset", "BTC")
+
+        # Get BTC price (always needed for reference / fallback)
         btc_price = self._btc_at(ts_s)
         if btc_price <= 0:
             return []
 
-        # Initialize window open BTC on first sight
-        if window.open_btc == 0:
-            window.open_btc = self._btc_at(contract.start_time_s)
-            if window.open_btc == 0:
-                window.open_btc = btc_price
-            self._momentum.set_window_open(contract.condition_id, window.open_btc)
+        # Get the asset's own price (ETH/SOL from their history, or BTC)
+        asset_price = self._asset_price_at(asset, ts_s)
+        if asset_price <= 0:
+            asset_price = btc_price  # fallback
 
-        window.last_btc = btc_price
+        # Initialize window open price from the correct asset on first sight
+        if window.open_btc == 0:
+            open_p = self._asset_price_at(asset, contract.start_time_s)
+            if open_p == 0:
+                open_p = asset_price
+            window.open_btc = open_p
+            asset_det = self._get_momentum(asset)
+            asset_det.set_window_open(contract.condition_id, open_p)
+
+        window.last_btc = asset_price
 
         # Throttle BOTH the tick feed AND the decision pass at 2Hz per
         # condition. The live scan loop fires at 2Hz, so the backtest
@@ -221,16 +263,36 @@ class CandleStrategyAdapter:
         last_tick = self._last_tick_ts.get(contract.condition_id, 0.0)
         if ts_s - last_tick < 0.5:
             return []
-        self._momentum.add_tick(btc_price, timestamp=ts_s)
+        # Feed the correct asset's tick to its own detector
+        asset_det = self._get_momentum(asset)
+        asset_det.add_tick(asset_price, timestamp=ts_s)
+        # Feed BTC ticks for cross-asset reference (only when enabled)
+        if asset != "BTC" and self.config.cross_asset_enabled:
+            self._momentum.add_tick(btc_price, timestamp=ts_s)
         self._last_tick_ts[contract.condition_id] = ts_s
 
-        # Compute the momentum signal — pass historical timestamp
-        signal = self._momentum.detect(
+        # ── Cross-asset: compute BTC reference signal for non-BTC ──
+        btc_ref_signal = None
+        cross_boost = 0.0
+        if asset != "BTC" and self.config.cross_asset_enabled and btc_price > 0:
+            btc_ref_signal = self._momentum.detect(
+                contract_id=f"__btc_ref_{contract.condition_id}",
+                window_start_ago_minutes=minutes_elapsed,
+                minutes_remaining=minutes_remaining,
+                current_price=btc_price,
+                now_ts=ts_s,
+            )
+            if btc_ref_signal and btc_ref_signal.confidence >= 0.60:
+                cross_boost = self.config.cross_asset_confidence_boost
+
+        # Compute the momentum signal from the asset's own detector
+        signal = asset_det.detect(
             contract_id=contract.condition_id,
             window_start_ago_minutes=minutes_elapsed,
             minutes_remaining=minutes_remaining,
-            current_price=btc_price,
+            current_price=asset_price,
             now_ts=ts_s,
+            reference_signal=btc_ref_signal,
         )
         if signal is None:
             return []
@@ -259,13 +321,14 @@ class CandleStrategyAdapter:
             window_minutes=contract.window_minutes,
             up_price=up_mid,
             down_price=down_mid,
-            btc_price=btc_price,
+            btc_price=asset_price,
             open_btc=window.open_btc,
             implied_vol=self._vol_at(ts_s),
             min_confidence=self.config.min_confidence,
             min_edge=self.config.min_edge,
             skip_dead_zone=self.config.skip_dead_zone,
             zone_config=self._zone_config,
+            cross_asset_boost=cross_boost,
         )
 
         if isinstance(decision, SkipReason):
@@ -288,6 +351,7 @@ class CandleStrategyAdapter:
             size=round(size, 1),
             order_type="market",
             fee_rate=self.config.fee_rate,
+            maker_fee_rate=self.config.maker_fee_rate if self.config.prefer_maker else self.config.fee_rate,
         )
 
         window.traded = True

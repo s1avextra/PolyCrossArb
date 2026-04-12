@@ -16,7 +16,11 @@ from polycrossarb.crypto.decision import (
     zone_for,
     zone_thresholds,
 )
-from polycrossarb.crypto.momentum import MomentumSignal
+from polycrossarb.crypto.momentum import (
+    MomentumSignal,
+    VolatilityRegime,
+    classify_vol_regime,
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -95,8 +99,11 @@ def call_decide(
     (0.40, "primary"),
     (0.79, "primary"),
     (0.80, "late"),
-    (1.00, "late"),
-    (1.50, "late"),
+    (0.94, "late"),
+    (0.95, "terminal"),
+    (0.99, "terminal"),
+    (1.00, "terminal"),
+    (1.50, "terminal"),
 ])
 def test_zone_for_boundaries(elapsed_pct: float, expected_zone: str) -> None:
     assert zone_for(elapsed_pct) == expected_zone
@@ -347,7 +354,7 @@ def test_zone_config_override_late_min_edge_lifts() -> None:
     assert res.zone == "late"
 
 
-def test_zero_window_minutes_falls_into_late_zone() -> None:
+def test_zero_window_minutes_falls_into_terminal_zone() -> None:
     sig = make_signal(confidence=0.75, z_score=2.0)
     res = call_decide(
         sig,
@@ -355,11 +362,206 @@ def test_zero_window_minutes_falls_into_late_zone() -> None:
         minutes_remaining=0.0,
         window_minutes=0.0,
     )
-    # window_minutes=0 → elapsed_pct = 1.0 → late zone
+    # window_minutes=0 → elapsed_pct = 1.0 → terminal zone
     # minutes_remaining=0 means BS days_remaining=0 — fair value clamps but
     # we still get a deterministic skip or decision. Either way the zone tag
-    # must be "late".
+    # must be "terminal".
     if isinstance(res, SkipReason):
-        assert res.zone == "late"
+        assert res.zone == "terminal"
     else:
-        assert res.zone == "late"
+        assert res.zone == "terminal"
+
+
+# ── Terminal zone ──────────────────────────────────────────────────
+
+
+def test_zone_thresholds_default_terminal() -> None:
+    cfg = ZoneConfig()
+    conf, z, edge = zone_thresholds("terminal", min_confidence=0.60, min_edge=0.07, cfg=cfg)
+    assert (conf, z, edge) == (0.55, 0.3, 0.03)
+
+
+def test_terminal_zone_relaxed_confidence_admits_trade() -> None:
+    """Terminal zone accepts confidence 0.56, which late zone would reject."""
+    sig = make_signal(direction="up", confidence=0.56, z_score=0.5)
+    # 4.8 min elapsed of 5 min → 96% → terminal zone
+    res = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.8, minutes_remaining=0.2, window_minutes=5.0,
+    )
+    # Terminal thresholds: conf >= 0.55, z >= 0.3, edge >= 0.03
+    # This signal passes all three.
+    assert isinstance(res, CandleDecision), f"got {res}"
+    assert res.zone == "terminal"
+    assert res.confidence == 0.56
+
+
+def test_terminal_zone_relaxed_z_admits_trade() -> None:
+    """Terminal zone accepts z_score=0.4, which late zone requires >= 0.5."""
+    sig = make_signal(direction="up", confidence=0.70, z_score=0.4)
+    res = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.8, minutes_remaining=0.2, window_minutes=5.0,
+    )
+    assert isinstance(res, CandleDecision), f"got {res}"
+    assert res.zone == "terminal"
+
+
+def test_terminal_zone_rejects_below_thresholds() -> None:
+    """Even terminal zone has floors — confidence 0.40 is rejected."""
+    sig = make_signal(direction="up", confidence=0.40, z_score=0.2)
+    res = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.8, minutes_remaining=0.2, window_minutes=5.0,
+    )
+    assert isinstance(res, SkipReason)
+    assert res.zone == "terminal"
+    assert res.reason == "low_confidence"
+
+
+def test_terminal_zone_low_z_rejected() -> None:
+    """Terminal zone z_score floor is 0.3."""
+    sig = make_signal(direction="up", confidence=0.70, z_score=0.2)
+    res = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.8, minutes_remaining=0.2, window_minutes=5.0,
+    )
+    assert isinstance(res, SkipReason)
+    assert res.zone == "terminal"
+    assert res.reason == "low_z_score"
+
+
+def test_terminal_zone_boundary_at_95pct() -> None:
+    """At exactly 95% elapsed, zone switches from late to terminal."""
+    sig = make_signal(direction="up", confidence=0.56, z_score=0.4)
+    # 94% → late zone, confidence 0.56 < late's 0.65 → rejected
+    res_late = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.7, minutes_remaining=0.3, window_minutes=5.0,
+    )
+    assert isinstance(res_late, SkipReason)
+    assert res_late.zone == "late"
+
+    # 96% → terminal zone, same signal now passes
+    res_term = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.8, minutes_remaining=0.2, window_minutes=5.0,
+    )
+    assert isinstance(res_term, CandleDecision), f"got {res_term}"
+    assert res_term.zone == "terminal"
+
+
+def test_zone_config_override_terminal_thresholds() -> None:
+    """Terminal thresholds can be overridden via ZoneConfig."""
+    cfg = ZoneConfig(terminal_min_confidence=0.80, terminal_min_z=1.0, terminal_min_edge=0.10)
+    sig = make_signal(direction="up", confidence=0.70, z_score=0.5)
+    res = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.8, minutes_remaining=0.2, window_minutes=5.0,
+        zone_config=cfg,
+    )
+    assert isinstance(res, SkipReason)
+    assert res.zone == "terminal"
+    assert res.reason == "low_confidence"
+
+
+# ── Cross-asset boost ─────────────────────────────────────────────
+
+
+def test_cross_asset_boost_lowers_confidence_threshold() -> None:
+    """A signal that fails confidence gate without boost passes with it."""
+    sig = make_signal(direction="up", confidence=0.55, z_score=2.0)
+    # Primary zone min_confidence default = 0.60, so 0.55 fails
+    res_no_boost = call_decide(
+        sig,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=3.0, minutes_remaining=2.0, window_minutes=5.0,
+    )
+    assert isinstance(res_no_boost, SkipReason)
+    assert res_no_boost.reason == "low_confidence"
+
+    # With 0.10 cross_asset_boost, threshold drops to 0.50 → signal passes
+    res_boosted = decide_candle_trade(
+        signal=sig,
+        minutes_elapsed=3.0, minutes_remaining=2.0, window_minutes=5.0,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        implied_vol=0.50,
+        min_confidence=0.60, min_edge=0.03,
+        cross_asset_boost=0.10,
+    )
+    assert isinstance(res_boosted, CandleDecision), f"got {res_boosted}"
+
+
+def test_cross_asset_boost_zero_has_no_effect() -> None:
+    """Zero boost should be identical to no boost."""
+    sig = make_signal(direction="up", confidence=0.55, z_score=2.0)
+    res = decide_candle_trade(
+        signal=sig,
+        minutes_elapsed=3.0, minutes_remaining=2.0, window_minutes=5.0,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        implied_vol=0.50,
+        min_confidence=0.60, min_edge=0.03,
+        cross_asset_boost=0.0,
+    )
+    assert isinstance(res, SkipReason)
+    assert res.reason == "low_confidence"
+
+
+def test_cross_asset_boost_has_confidence_floor() -> None:
+    """Even with maximum boost, confidence threshold doesn't drop below 0.40."""
+    sig = make_signal(direction="up", confidence=0.42, z_score=2.0)
+    res = decide_candle_trade(
+        signal=sig,
+        minutes_elapsed=3.0, minutes_remaining=2.0, window_minutes=5.0,
+        up_price=0.40, down_price=0.60,
+        btc_price=60_005.0, open_btc=60_000.0,
+        implied_vol=0.50,
+        min_confidence=0.60, min_edge=0.03,
+        cross_asset_boost=0.50,  # huge boost
+    )
+    # 0.60 - 0.50 = 0.10, clamped to 0.40. Signal 0.42 >= 0.40, passes.
+    assert isinstance(res, CandleDecision), f"got {res}"
+
+
+# ── VolatilityRegime classification ───────────────────────────────
+
+
+@pytest.mark.parametrize("short,baseline,expected", [
+    (0.50, 0.50, VolatilityRegime.NORMAL),  # ratio 1.0
+    (0.20, 0.50, VolatilityRegime.LOW),      # ratio 0.4
+    (0.80, 0.50, VolatilityRegime.HIGH),     # ratio 1.6
+    (1.50, 0.50, VolatilityRegime.EXTREME),  # ratio 3.0
+    (0.0, 0.50, VolatilityRegime.NORMAL),    # zero short → NORMAL
+    (0.50, 0.0, VolatilityRegime.NORMAL),    # zero baseline → NORMAL
+])
+def test_classify_vol_regime(short: float, baseline: float, expected: VolatilityRegime) -> None:
+    assert classify_vol_regime(short, baseline) == expected
+
+
+def test_vol_regime_boundary_high() -> None:
+    """Exactly at 1.5 ratio is HIGH, below is NORMAL."""
+    assert classify_vol_regime(0.75, 0.50) == VolatilityRegime.NORMAL  # 1.5 exactly
+    assert classify_vol_regime(0.76, 0.50) == VolatilityRegime.HIGH    # 1.52 > 1.5
+
+
+def test_vol_regime_boundary_extreme() -> None:
+    """Exactly at 2.5 ratio is HIGH, above is EXTREME."""
+    assert classify_vol_regime(1.25, 0.50) == VolatilityRegime.HIGH     # 2.5 exactly
+    assert classify_vol_regime(1.26, 0.50) == VolatilityRegime.EXTREME  # 2.52 > 2.5
