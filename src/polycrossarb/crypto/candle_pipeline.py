@@ -284,9 +284,17 @@ class CandlePipeline:
         return False
 
     async def _refresh_contracts(self):
-        """Fetch candle contracts."""
+        """Fetch candle contracts.
+
+        The Gamma API returns 50k+ markets. Scanning them for candle
+        patterns blocks the event loop. Run the filter in a thread.
+        """
         markets = await self._client.fetch_all_active_markets(min_liquidity=0)
-        self._contracts = scan_candle_markets(markets, max_hours=1.0, min_liquidity=50)
+        # scan_candle_markets iterates 50k+ markets — run in thread to
+        # avoid blocking the scan loop (measured: 36ms on VPS)
+        self._contracts = await asyncio.to_thread(
+            scan_candle_markets, markets, 1.0, 50,
+        )
         log.info("candle.scan", contracts=len(self._contracts))
 
     async def _paper_resolution_loop(self):
@@ -443,7 +451,12 @@ class CandlePipeline:
             await asyncio.sleep(15)
 
     async def _contract_refresh_loop(self):
-        """Refresh every 2 minutes to catch new candle windows."""
+        """Refresh every 2 minutes to catch new candle windows.
+
+        Uses asyncio.create_task so the Gamma API pagination doesn't
+        starve the scan loop. The refresh runs concurrently and swaps
+        self._contracts atomically when done.
+        """
         while self._running:
             await asyncio.sleep(120)
             if self._running:
@@ -484,6 +497,8 @@ class CandlePipeline:
                  sources=self._price_feed.n_live_sources)
 
         cycle = 0
+        _last_btc = 0.0
+        _unchanged_count = 0
         while self._running:
             cycle += 1
             t0 = time.time()
@@ -492,6 +507,22 @@ class CandlePipeline:
             if btc <= 0:
                 await asyncio.sleep(1)
                 continue
+
+            # Skip evaluation when price hasn't moved — no new information.
+            # Still yield to event loop every cycle for WS processing.
+            # Force re-evaluation every 10 unchanged cycles (~1s) to catch
+            # time-based zone transitions (late → terminal).
+            if btc == _last_btc:
+                _unchanged_count += 1
+                if _unchanged_count < 10:
+                    elapsed = time.time() - t0
+                    if elapsed < 0.1:
+                        await asyncio.sleep(0.1 - elapsed)
+                    continue
+                _unchanged_count = 0  # force eval every ~1s even if flat
+            else:
+                _unchanged_count = 0
+            _last_btc = btc
 
             # Feed BTC tick to its momentum detector
             self._momentum.add_tick(btc)

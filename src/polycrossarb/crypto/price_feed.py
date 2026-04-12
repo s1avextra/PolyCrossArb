@@ -240,13 +240,17 @@ class CryptoPriceFeed:
         )
 
     async def start(self) -> None:
-        """Start all 9 exchange feeds + Deribit IV concurrently."""
+        """Start 8 exchange feeds + Deribit IV concurrently.
+
+        MEXC removed: reconnects every ~75s causing 50-100ms latency
+        spikes. 8 sources provides sufficient redundancy and geographic
+        diversity without the event loop jitter.
+        """
         self._running = True
         await asyncio.gather(
             self._binance_ws(),
             self._bybit_ws(),
             self._okx_ws(),
-            self._mexc_ws(),
             self._coinbase_ws(),
             self._kraken_ws(),
             self._gateio_ws(),

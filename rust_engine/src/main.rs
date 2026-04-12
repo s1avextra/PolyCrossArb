@@ -182,15 +182,8 @@ async fn main() {
             }
         });
     }
-    {
-        let s = state.clone();
-        tokio::spawn(async move {
-            loop {
-                exchange::mexc_feed(s.clone()).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        });
-    }
+    // MEXC removed: reconnects every ~75s, causing latency spikes.
+    // 3 BTC sources (Binance, Bybit, OKX) + Deribit IV is sufficient.
 
     // ETH + SOL price feeds (for cross-asset lead-lag)
     {

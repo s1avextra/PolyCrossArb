@@ -47,7 +47,7 @@ ssh "$VPS" "mkdir -p '$RELEASE_DIR'"
 rsync -avz --delete \
     --exclude '.env' \
     --exclude 'logs/' \
-    --exclude 'data/' \
+    --exclude '/data/' \
     --exclude 'rust_engine/target/' \
     --exclude '.git/' \
     --exclude '__pycache__/' \
