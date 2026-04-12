@@ -1,19 +1,23 @@
-"""Real-time BTC price feed from 4 exchanges via WebSocket.
+"""Real-time BTC price feed from 9 exchanges via WebSocket.
 
 Aggregates spot prices from:
-  - Binance  (wss://stream.binance.com, ~100ms updates)
-  - Bybit    (wss://stream.bybit.com, ~100ms updates)
-  - OKX      (wss://ws.okx.com, ~100ms updates)
-  - MEXC     (wss://wbs.mexc.com, ~200ms updates)
+  - Binance   (Singapore/global, ~100ms)
+  - Bybit     (Dubai/Singapore, ~100ms)
+  - OKX       (Hong Kong, ~100ms)
+  - MEXC      (Singapore, ~200ms)
+  - Coinbase  (US — San Francisco, ~200ms)
+  - Kraken    (EU — Frankfurt, ~500ms)
+  - Gate.io   (Asia — global, ~200ms)
+  - HTX/Huobi (Singapore, ~200ms, gzip-compressed)
+  - Bitget    (Singapore, ~200ms)
 
-All WebSocket feeds are free and require no API keys for public market data.
-API keys are only needed for trading — not for price feeds.
+Geographic diversity: US (Coinbase), EU (Kraken), Asia (Binance,
+Bybit, OKX, MEXC, Gate.io, HTX, Bitget). No single region failure
+can drop below MIN_SOURCES=2.
 
-The aggregator computes:
-  - Weighted mid-price across all sources
-  - Cross-exchange spread (max price - min price)
-  - Rolling volatility for fair-value calculations
-  - Price staleness detection
+All WebSocket feeds are free public streams — no API keys needed.
+Coinbase and Kraken stream BTC/USD (not USDT) — the ~0.01% USD/USDT
+basis is negligible for momentum detection.
 """
 from __future__ import annotations
 
@@ -51,7 +55,7 @@ class AggregatedPrice:
 
 
 class CryptoPriceFeed:
-    """Aggregated real-time BTC price from 4 exchanges.
+    """Aggregated real-time BTC price from 9 exchanges.
 
     All feeds are free public WebSocket streams — no API keys needed.
     """
@@ -144,13 +148,18 @@ class CryptoPriceFeed:
         )
 
     async def start(self) -> None:
-        """Start all 4 exchange feeds + Deribit IV concurrently."""
+        """Start all 9 exchange feeds + Deribit IV concurrently."""
         self._running = True
         await asyncio.gather(
             self._binance_ws(),
             self._bybit_ws(),
             self._okx_ws(),
             self._mexc_ws(),
+            self._coinbase_ws(),
+            self._kraken_ws(),
+            self._gateio_ws(),
+            self._htx_ws(),
+            self._bitget_ws(),
             self._deribit_iv_loop(),
             return_exceptions=True,
         )
@@ -331,3 +340,150 @@ class CryptoPriceFeed:
                     log.debug("MEXC WS: %s", e)
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 1.5, 30)  # backoff up to 30s
+
+    # ── Additional exchanges (geographic diversity) ──────────────
+
+    async def _coinbase_ws(self):
+        """Coinbase BTC-USD ticker (US — San Francisco)."""
+        url = "wss://ws-feed.exchange.coinbase.com"
+        sub = {"type": "subscribe", "channels": [{"name": "ticker", "product_ids": ["BTC-USD"]}]}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("Coinbase WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            d = json.loads(msg)
+                            if d.get("type") == "ticker":
+                                price = float(d.get("price", 0))
+                                bid = float(d.get("best_bid", 0))
+                                ask = float(d.get("best_ask", 0))
+                                if price > 0:
+                                    self._update_price("coinbase", price, bid, ask)
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("Coinbase WS: %s", e)
+                    await asyncio.sleep(5)
+
+    async def _kraken_ws(self):
+        """Kraken XBT/USD ticker (EU — Frankfurt)."""
+        url = "wss://ws.kraken.com/v2"
+        sub = {"method": "subscribe", "params": {"channel": "ticker", "symbol": ["BTC/USD"]}}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("Kraken WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            d = json.loads(msg)
+                            if d.get("channel") == "ticker":
+                                for tick in d.get("data", []):
+                                    price = float(tick.get("last", 0))
+                                    bid = float(tick.get("bid", 0))
+                                    ask = float(tick.get("ask", 0))
+                                    if price > 0:
+                                        self._update_price("kraken", price, bid, ask)
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("Kraken WS: %s", e)
+                    await asyncio.sleep(5)
+
+    async def _gateio_ws(self):
+        """Gate.io BTC_USDT ticker (Asia — global)."""
+        url = "wss://api.gateio.ws/ws/v4/"
+        sub = {"time": int(time.time()), "channel": "spot.tickers", "event": "subscribe", "payload": ["BTC_USDT"]}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("Gate.io WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            d = json.loads(msg)
+                            if d.get("channel") == "spot.tickers" and d.get("event") == "update":
+                                result = d.get("result", {})
+                                price = float(result.get("last", 0))
+                                bid = float(result.get("highest_bid", 0))
+                                ask = float(result.get("lowest_ask", 0))
+                                if price > 0:
+                                    self._update_price("gateio", price, bid, ask)
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("Gate.io WS: %s", e)
+                    await asyncio.sleep(5)
+
+    async def _htx_ws(self):
+        """HTX (Huobi) btcusdt ticker (Asia — Singapore). Sends gzip."""
+        import gzip
+        url = "wss://api.huobi.pro/ws"
+        sub = {"sub": "market.btcusdt.ticker", "id": "btc1"}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=None) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("HTX WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            if isinstance(msg, bytes):
+                                msg = gzip.decompress(msg).decode()
+                            d = json.loads(msg)
+                            if "ping" in d:
+                                await ws.send(json.dumps({"pong": d["ping"]}))
+                                continue
+                            tick = d.get("tick", {})
+                            price = float(tick.get("close", 0))
+                            bid = float(tick.get("bid", [0])[0] if isinstance(tick.get("bid"), list) else tick.get("bid", 0))
+                            ask = float(tick.get("ask", [0])[0] if isinstance(tick.get("ask"), list) else tick.get("ask", 0))
+                            if price > 0:
+                                self._update_price("htx", price, bid, ask)
+                        except (json.JSONDecodeError, ValueError, TypeError, OSError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("HTX WS: %s", e)
+                    await asyncio.sleep(5)
+
+    async def _bitget_ws(self):
+        """Bitget BTCUSDT ticker (Asia — Singapore)."""
+        url = "wss://ws.bitget.com/v2/ws/public"
+        sub = {"op": "subscribe", "args": [{"instType": "SPOT", "channel": "ticker", "instId": "BTCUSDT"}]}
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    await ws.send(json.dumps(sub))
+                    log.info("Bitget WS connected")
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            d = json.loads(msg)
+                            data_list = d.get("data", [])
+                            if data_list and isinstance(data_list, list):
+                                tick = data_list[0]
+                                price = float(tick.get("lastPr", 0))
+                                bid = float(tick.get("bidPr", 0))
+                                ask = float(tick.get("askPr", 0))
+                                if price > 0:
+                                    self._update_price("bitget", price, bid, ask)
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+            except Exception as e:
+                if self._running:
+                    log.debug("Bitget WS: %s", e)
+                    await asyncio.sleep(5)
