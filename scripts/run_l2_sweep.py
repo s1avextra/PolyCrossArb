@@ -114,6 +114,7 @@ def _run_cell(cell: dict) -> dict:
         min_confidence=cell["min_confidence"],
         min_edge=cell["min_edge"],
         realized_vol=cell["vol"],
+        noise_z_threshold=cell.get("noise_z", 0.3),
         position_size_usd=_position_size,
         fee_rate=_fee_rate,
         prefer_maker=_prefer_maker,
@@ -172,6 +173,9 @@ def main() -> int:
     parser.add_argument("--confidences", default="0.60")
     parser.add_argument("--edges", default="0.07")
     parser.add_argument("--vols", default="0.50")
+    # Momentum noise filter
+    parser.add_argument("--noise-zs", default="0.3",
+                        help="z-score noise threshold (below → 60%% confidence penalty)")
     # Late-zone gates
     parser.add_argument("--late-confidences", default="0.65")
     parser.add_argument("--late-zs", default="0.5")
@@ -200,6 +204,7 @@ def main() -> int:
     confidences = parse_floats(args.confidences)
     edges = parse_floats(args.edges)
     vols = parse_floats(args.vols)
+    noise_zs = parse_floats(args.noise_zs)
     late_confs = parse_floats(args.late_confidences)
     late_zs = parse_floats(args.late_zs)
     late_edges = parse_floats(args.late_edges)
@@ -213,25 +218,27 @@ def main() -> int:
     for conf in confidences:
         for edge in edges:
             for vol in vols:
-                for lc in late_confs:
-                    for lz in late_zs:
-                        for le in late_edges:
-                            for pz in primary_zs:
-                                for tc in terminal_confs:
-                                    for tz in terminal_zs:
-                                        for te in terminal_edges:
-                                            cells.append({
-                                                "min_confidence": conf,
-                                                "min_edge": edge,
-                                                "vol": vol,
-                                                "late_min_confidence": lc,
-                                                "late_min_z": lz,
-                                                "late_min_edge": le,
-                                                "primary_min_z": pz,
-                                                "terminal_min_confidence": tc,
-                                                "terminal_min_z": tz,
-                                                "terminal_min_edge": te,
-                                            })
+                for nz in noise_zs:
+                    for lc in late_confs:
+                        for lz in late_zs:
+                            for le in late_edges:
+                                for pz in primary_zs:
+                                    for tc in terminal_confs:
+                                        for tz in terminal_zs:
+                                            for te in terminal_edges:
+                                                cells.append({
+                                                    "min_confidence": conf,
+                                                    "min_edge": edge,
+                                                    "vol": vol,
+                                                    "noise_z": nz,
+                                                    "late_min_confidence": lc,
+                                                    "late_min_z": lz,
+                                                    "late_min_edge": le,
+                                                    "primary_min_z": pz,
+                                                    "terminal_min_confidence": tc,
+                                                    "terminal_min_z": tz,
+                                                    "terminal_min_edge": te,
+                                                })
     n_runs = len(cells)
 
     print(f"\n  L2 MEGASWEEP (parallel)")

@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     candle_edge_cap: float = 0.25
     candle_skip_dead_zone: bool = True
 
+    # ── Momentum noise filter ────────────────────────────────────
+    # z-scores below this threshold get 60% confidence penalty.
+    # At IV=47%, BTC=$70k, 5-min window: z=0.3 requires ~$31 move.
+    # Lower to 0.15 to allow trades on ~$15 moves in flat markets.
+    candle_noise_z_threshold: float = 0.3
+
     # ── Volatility regime sizing ─────────────────────────────────
     candle_vol_high_multiplier: float = 1.5
     candle_vol_extreme_multiplier: float = 2.0

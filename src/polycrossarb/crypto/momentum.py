@@ -89,10 +89,11 @@ class MomentumDetector:
     Uses volatility-normalized signals instead of fixed dollar thresholds.
     """
 
-    def __init__(self, realized_vol: float | None = None):
+    def __init__(self, realized_vol: float | None = None, noise_z_threshold: float = 0.3):
         self._ticks: deque[tuple[float, float]] = deque(maxlen=5000)  # (timestamp, price)
         self._window_opens: dict[str, float] = {}  # contract_id -> open price
         self._realized_vol: float = realized_vol or 0.50  # annualized, updated externally
+        self._noise_z: float = noise_z_threshold  # below this z, confidence *= 0.4
 
     @property
     def realized_vol(self) -> float:
@@ -242,8 +243,8 @@ class MomentumDetector:
         elif minutes_remaining < 1.0 and z_score > 0.5:
             confidence = min(0.95, confidence + 0.20)
 
-        # Reduce if move is sub-0.3 sigma (noise)
-        if z_score < 0.3:
+        # Reduce if move is sub-threshold sigma (noise)
+        if z_score < self._noise_z:
             confidence *= 0.4
 
         # Cross-asset agreement is factored in by the decision function

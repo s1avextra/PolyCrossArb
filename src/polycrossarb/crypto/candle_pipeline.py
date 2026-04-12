@@ -92,8 +92,9 @@ class CandlePipeline:
         self._price_feed = CryptoPriceFeed()
         # Per-asset momentum detectors — BTC always present, ETH/SOL
         # created on first use. Each asset needs its own tick history.
+        self._noise_z = settings.candle_noise_z_threshold
         self._momentum_detectors: dict[str, MomentumDetector] = {
-            "BTC": MomentumDetector(),
+            "BTC": MomentumDetector(noise_z_threshold=self._noise_z),
         }
         self._momentum = self._momentum_detectors["BTC"]  # backwards compat
 
@@ -135,7 +136,9 @@ class CandlePipeline:
     def _get_momentum(self, asset: str) -> MomentumDetector:
         """Get or create a momentum detector for the given asset."""
         if asset not in self._momentum_detectors:
-            self._momentum_detectors[asset] = MomentumDetector()
+            self._momentum_detectors[asset] = MomentumDetector(
+                noise_z_threshold=self._noise_z,
+            )
         return self._momentum_detectors[asset]
 
     def _kill_switch_active(self) -> bool:

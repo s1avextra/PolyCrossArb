@@ -58,6 +58,7 @@ class StrategyConfig:
     """
     min_confidence: float = 0.60
     min_edge: float = 0.07
+    noise_z_threshold: float = 0.3
     realized_vol: float = 0.50
     position_size_usd: float = 5.0
     fee_rate: float = 0.072       # taker fee (7.2%)
@@ -132,7 +133,11 @@ class CandleStrategyAdapter:
 
         # Per-asset momentum detectors — mirrors the live pipeline pattern
         self._momentum_detectors: dict[str, MomentumDetector] = {}
-        self._momentum = MomentumDetector(realized_vol=self.config.realized_vol)
+        self._noise_z = self.config.noise_z_threshold
+        self._momentum = MomentumDetector(
+            realized_vol=self.config.realized_vol,
+            noise_z_threshold=self._noise_z,
+        )
         self._momentum.set_realized_vol(self.config.realized_vol)
         self._momentum_detectors["BTC"] = self._momentum
 
@@ -168,7 +173,10 @@ class CandleStrategyAdapter:
     def _get_momentum(self, asset: str) -> MomentumDetector:
         """Get or create a momentum detector for the given asset."""
         if asset not in self._momentum_detectors:
-            det = MomentumDetector(realized_vol=self.config.realized_vol)
+            det = MomentumDetector(
+                realized_vol=self.config.realized_vol,
+                noise_z_threshold=self._noise_z,
+            )
             det.set_realized_vol(self.config.realized_vol)
             self._momentum_detectors[asset] = det
         return self._momentum_detectors[asset]
