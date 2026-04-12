@@ -73,7 +73,9 @@ if [ ! -e "$APP_DIR/current" ]; then
 fi
 
 # 6. Python deps and rust build (out of `current`)
-cd "$APP_DIR/current" && uv pip install --system ".[execution,dev]"
+# Create venv if it doesn't exist, then install into it
+[ -d "$APP_DIR/.venv" ] || uv venv "$APP_DIR/.venv" --python python3
+cd "$APP_DIR/current" && uv pip install --python "$APP_DIR/.venv/bin/python" ".[execution,dev]"
 cd "$APP_DIR/current/rust_engine" && cargo build --release \
     && cp target/release/polycrossarb-engine "$APP_DIR/"
 

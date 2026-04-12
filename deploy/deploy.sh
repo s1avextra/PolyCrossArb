@@ -71,8 +71,8 @@ set -euo pipefail
 # Fix ownership (rsync preserves macOS uid which polycrossarb can't write to)
 chown -R polycrossarb:polycrossarb '$RELEASE_DIR'
 
-# Install Python deps
-cd '$RELEASE_DIR' && uv pip install --system '.[execution]'
+# Install Python deps into the project venv
+cd '$RELEASE_DIR' && uv pip install --python /opt/polycrossarb/.venv/bin/python '.[execution]'
 
 # Optionally rebuild Rust
 $RUST_CMDS
