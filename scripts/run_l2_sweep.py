@@ -67,6 +67,7 @@ _prefer_maker: bool = False
 _position_size: float = 5.0
 _fee_rate: float = 0.072
 _token_ids: list[str] | None = None  # filtered token_ids for the sweep
+_asset_histories: dict | None = None  # per-asset BTCHistory for ETH/SOL
 
 
 def parse_dt(s: str) -> datetime:
@@ -121,6 +122,7 @@ def _run_cell(cell: dict) -> dict:
     )
     adapter = CandleStrategyAdapter(
         registry=_registry, btc_history=_btc, config=cfg,
+        asset_histories=_asset_histories,
     )
     engine = L2BacktestEngine(loader=_loader, latency=_latency)
 
@@ -154,6 +156,7 @@ def _run_cell(cell: dict) -> dict:
 def main() -> int:
     global _btc, _registry, _loader, _latency, _base_zone
     global _start, _end, _prefer_maker, _position_size, _fee_rate, _token_ids
+    global _asset_histories
 
     parser = argparse.ArgumentParser(
         description="Parallel L2 parameter sweep across all CPU cores",
@@ -262,6 +265,19 @@ def main() -> int:
             interval="1m",
         )
     print(f"  BTC ticks:      {_btc.n_ticks} ({time.time()-t0:.1f}s)")
+
+    # Load per-asset price histories for ETH/SOL if available
+    _asset_histories = {}
+    _alt_csvs = {"ETH": "data/ethusdt_1s_7d.csv", "SOL": "data/solusdt_1s_7d.csv"}
+    for alt, csv_path in _alt_csvs.items():
+        if Path(csv_path).exists():
+            h = BTCHistory()
+            n = h.load_csv(csv_path)
+            if n > 0:
+                _asset_histories[alt] = h
+                print(f"  {alt} ticks:      {n} ({csv_path})")
+    if not _asset_histories:
+        print("  Alt assets:     none (ETH/SOL will use BTC prices as proxy)")
 
     t1 = time.time()
     _registry = CandleRegistry()
