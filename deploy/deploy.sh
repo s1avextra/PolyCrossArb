@@ -84,8 +84,11 @@ ln -sfn '$RELEASE_DIR' '$APP_DIR/current.new' && mv -Tf '$APP_DIR/current.new' '
 # Restart active services only
 systemctl restart polycrossarb-candle
 
-# Prune old releases keeping last $KEEP
-cd '$APP_DIR/releases' && ls -1t | tail -n +$((KEEP + 1)) | xargs -r -I {} rm -rf '{}'
+# Prune old releases keeping last \$KEEP.
+# Sort by ISO8601 name (reverse = newest-first) not by mtime — rsync
+# preserves source mtimes so the new release can appear "older" than
+# old ones and get incorrectly pruned.
+cd '$APP_DIR/releases' && ls -1 | sort -r | tail -n +$((KEEP + 1)) | xargs -r -I {} rm -rf '{}'
 DEPLOY_EOF
 
 echo "=== Deployed $RELEASE_ID. Rollback: ssh $VPS '$APP_DIR/current/deploy/rollback.sh' ==="
