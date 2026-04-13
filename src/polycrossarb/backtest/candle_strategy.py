@@ -112,10 +112,15 @@ class CandleStrategyAdapter:
         btc_history: BTCHistory,
         config: StrategyConfig | None = None,
         asset_histories: dict[str, BTCHistory] | None = None,
+        strategy=None,
     ):
         self.registry = registry
         self.btc_history = btc_history
         self.config = config or StrategyConfig()
+        # Optional swappable strategy — when None, uses decide_candle_trade
+        # with the adapter's config. Strategies are defined in
+        # polycrossarb.backtest.strategies and plugged in by the harness.
+        self.strategy = strategy
 
         # Optional per-asset histories for cross-asset backtesting.
         # Keys are asset names ("ETH", "SOL"). When present, non-BTC
@@ -282,6 +287,11 @@ class CandleStrategyAdapter:
             self._momentum.add_tick(btc_price, timestamp=ts_s)
         self._last_tick_ts[contract.condition_id] = ts_s
 
+        # Update swappable strategy's internal state (e.g. EWMA vol).
+        # Only fed BTC ticks since the strategy is regime-classifying BTC.
+        if self.strategy is not None and asset == "BTC":
+            self.strategy.on_tick(ts_s, asset_price)
+
         # ── Cross-asset: compute BTC reference signal for non-BTC ──
         btc_ref_signal = None
         cross_boost = 0.0
@@ -324,23 +334,37 @@ class CandleStrategyAdapter:
         if up_mid <= 0 or down_mid <= 0:
             return []
 
-        # Run the SAME decision function as live, with the same zone gates.
-        decision = decide_candle_trade(
-            signal=signal,
-            minutes_elapsed=minutes_elapsed,
-            minutes_remaining=minutes_remaining,
-            window_minutes=contract.window_minutes,
-            up_price=up_mid,
-            down_price=down_mid,
-            btc_price=asset_price,
-            open_btc=window.open_btc,
-            implied_vol=self._vol_at(ts_s),
-            min_confidence=self.config.min_confidence,
-            min_edge=self.config.min_edge,
-            skip_dead_zone=self.config.skip_dead_zone,
-            zone_config=self._zone_config,
-            cross_asset_boost=cross_boost,
-        )
+        # Run either the swappable strategy or the default decision function.
+        if self.strategy is not None:
+            decision = self.strategy.decide(
+                signal=signal,
+                minutes_elapsed=minutes_elapsed,
+                minutes_remaining=minutes_remaining,
+                window_minutes=contract.window_minutes,
+                up_price=up_mid,
+                down_price=down_mid,
+                btc_price=asset_price,
+                open_btc=window.open_btc,
+                implied_vol=self._vol_at(ts_s),
+                cross_asset_boost=cross_boost,
+            )
+        else:
+            decision = decide_candle_trade(
+                signal=signal,
+                minutes_elapsed=minutes_elapsed,
+                minutes_remaining=minutes_remaining,
+                window_minutes=contract.window_minutes,
+                up_price=up_mid,
+                down_price=down_mid,
+                btc_price=asset_price,
+                open_btc=window.open_btc,
+                implied_vol=self._vol_at(ts_s),
+                min_confidence=self.config.min_confidence,
+                min_edge=self.config.min_edge,
+                skip_dead_zone=self.config.skip_dead_zone,
+                zone_config=self._zone_config,
+                cross_asset_boost=cross_boost,
+            )
 
         if isinstance(decision, SkipReason):
             window.skip_history.append(decision)
