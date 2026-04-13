@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 import time
@@ -21,6 +22,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, "src")
+
+# Flush print immediately so progress is visible when stdout is redirected
+print = functools.partial(print, flush=True)
 
 from polycrossarb.monitoring.logging_config import configure_logging
 
@@ -252,6 +256,8 @@ def main() -> int:
     parser.add_argument("--hours", type=int, default=4)
     parser.add_argument("--position-size", type=float, default=1.0)
     parser.add_argument("--fee-rate", type=float, default=0.02)
+    parser.add_argument("--asset", default="ALL",
+                        help="Filter contracts by asset: BTC, ETH, SOL, or ALL")
     parser.add_argument("--btc-csv", default="data/btcusdt_1s_7d.csv")
     parser.add_argument("--cache-dir", default="data/pmxt_cache")
     parser.add_argument("--output", default="logs/strategy_harness.json")
@@ -294,6 +300,7 @@ def main() -> int:
     print(f"  Oracle:    {len(oracle._samples)} regime samples ({time.time()-t0:.1f}s)")
 
     # Define strategies to test
+    # For fast iteration, default is 2 strategies. Expand for deeper runs.
     strategies = [
         BaselineStrategy(
             name="baseline",
@@ -303,35 +310,6 @@ def main() -> int:
             name="ewma_15min",
             fast_half_life_min=15.0,
             slow_half_life_min=240.0,
-        ),
-        EwmaVolStrategy(
-            name="ewma_5min",
-            fast_half_life_min=5.0,
-            slow_half_life_min=60.0,
-        ),
-        EwmaVolStrategy(
-            name="ewma_60min",
-            fast_half_life_min=60.0,
-            slow_half_life_min=1440.0,
-        ),
-        RegimeConditionalStrategy(
-            name="regime_lowered_low",
-            # LOW regime: relax thresholds since moves are smaller
-            low_config=ZoneConfig(
-                early_min_confidence=0.45,
-                early_min_z=1.5,
-                early_min_edge=0.02,
-                primary_min_z=0.7,
-                late_min_confidence=0.55,
-                late_min_z=0.3,
-                late_min_edge=0.05,
-                terminal_min_confidence=0.45,
-                terminal_min_z=0.2,
-                terminal_min_edge=0.02,
-            ),
-            normal_config=ZoneConfig(),
-            high_config=ZoneConfig(),
-            extreme_config=ZoneConfig(),
         ),
     ]
 

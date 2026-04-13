@@ -196,6 +196,10 @@ class EwmaVolStrategy:
         v = math.sqrt(max(0.0, self._fast_var * seconds_per_year))
         return max(self._floor_vol, min(5.0, v))
 
+    def get_current_vol(self) -> float | None:
+        """Exposed to the adapter — used to update momentum detector's sigma."""
+        return self.fast_vol_annualized
+
     @property
     def slow_vol_annualized(self) -> float:
         if not self._warmed_up:
@@ -330,6 +334,9 @@ class RegimeConditionalStrategy:
     @property
     def current_regime(self) -> VolatilityRegime:
         return self._current_regime
+
+    def get_current_vol(self) -> float | None:
+        return self._vol.fast_vol_annualized
 
     def decide(
         self,

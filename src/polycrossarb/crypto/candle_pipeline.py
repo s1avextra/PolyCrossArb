@@ -53,7 +53,7 @@ from polycrossarb.monitoring.alerter import (
 )
 from polycrossarb.monitoring.session_monitor import SessionMonitor
 from polycrossarb.risk.manager import RiskManager
-from polycrossarb.solver.linear import TradeOrder
+from polycrossarb.execution.orders import TradeOrder
 
 log = structlog.get_logger(__name__)
 

@@ -15,7 +15,7 @@ import pytest
 from polycrossarb.execution.executor import SingleLegExecutor, SingleLegResult
 from polycrossarb.monitoring import alerter
 from polycrossarb.risk.manager import RiskManager
-from polycrossarb.solver.linear import SolverResult, TradeOrder
+from polycrossarb.execution.orders import SolverResult, TradeOrder
 
 
 # ── Fakes ──────────────────────────────────────────────────────────

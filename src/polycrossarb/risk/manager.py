@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from polycrossarb.config import settings
-from polycrossarb.solver.linear import SolverResult, TradeOrder
+from polycrossarb.execution.orders import SolverResult, TradeOrder
 
 log = logging.getLogger(__name__)
 

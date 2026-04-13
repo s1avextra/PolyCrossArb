@@ -289,8 +289,15 @@ class CandleStrategyAdapter:
 
         # Update swappable strategy's internal state (e.g. EWMA vol).
         # Only fed BTC ticks since the strategy is regime-classifying BTC.
+        # After on_tick, if the strategy exposes a current_vol, push it
+        # into the momentum detector so z-score uses the fresh estimate.
         if self.strategy is not None and asset == "BTC":
             self.strategy.on_tick(ts_s, asset_price)
+            get_vol = getattr(self.strategy, "get_current_vol", None)
+            if get_vol is not None:
+                v = get_vol()
+                if v is not None and v > 0:
+                    asset_det.set_realized_vol(v)
 
         # ── Cross-asset: compute BTC reference signal for non-BTC ──
         btc_ref_signal = None

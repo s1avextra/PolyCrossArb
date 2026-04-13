@@ -18,46 +18,17 @@ class Settings(BaseSettings):
     private_key: str = ""
     polygon_rpc_url: str = "https://polygon-rpc.com"
 
-    # Arb detection
-    min_arb_margin: float = 0.02
-    min_profit_usd: float = 0.10
-    max_position_usd: float = 20.0
-    scan_interval_seconds: float = 30.0
-
     # Risk — bankroll_usd=0 means auto-detect from wallet USDC.e balance
     bankroll_usd: float = 0.0
     max_total_exposure_usd: float = 80.0
     max_position_per_market_usd: float = 20.0
     cooldown_seconds: float = 120.0
+    min_profit_usd: float = 0.10
 
-    # Max days until resolution — skip events that lock capital too long
-    max_resolution_days: float = 3.0
-
-    # Strategy safety limits
-    max_legs_per_trade: int = 4        # max outcomes per arb (2-4 realistic)
-    min_leg_probability: float = 0.05  # skip outcomes below 5% (illiquid lottery tickets)
-    min_leg_bid_depth_usd: float = 50   # each leg must have $50+ bid depth (exitable)
-    min_leg_value_usd: float = 5.0     # each leg order must be >= $5 (not dust)
-    min_leg_volume_usd: float = 500    # each leg must have $500+ volume (real trading activity)
-
-    # When on-chain merge is disabled, only trade OVERPRICED events.
-    # With merge enabled, underpriced arbs are safely exitable via
-    # mergePositions (buy all tokens on CLOB → redeem for $1.00 on-chain).
-    only_overpriced: bool = True
-
-    # On-chain split/merge execution (requires web3)
-    enable_onchain_execution: bool = False  # safety flag — enable after testing
-
-    # Kelly fraction: 0.25 = quarter Kelly (academic optimal for prediction markets)
-    # Full Kelly maximises growth but has 50% chance of 50% drawdown.
-    # Quarter Kelly: ~94% of growth rate, max drawdown ~12%.
+    # Kelly fraction: 0.25 = quarter Kelly (academic optimal).
     kelly_fraction: float = 0.25
 
-    # Weather strategy
-    min_weather_confidence: float = 0.80
-    max_weather_position_pct: float = 0.15
-
-    # Crypto strategy
+    # Crypto strategy edge threshold
     min_crypto_edge: float = 0.03
     max_crypto_position_pct: float = 0.10
 
@@ -134,7 +105,7 @@ class Settings(BaseSettings):
             raise ValueError(f"kelly_fraction must be in (0, 1], got {v}")
         return v
 
-    @field_validator("min_arb_margin", "min_profit_usd", "cooldown_seconds", "scan_interval_seconds")
+    @field_validator("min_profit_usd", "cooldown_seconds")
     @classmethod
     def must_be_non_negative(cls, v: float, info) -> float:
         if v < 0:

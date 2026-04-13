@@ -17,11 +17,35 @@ from polycrossarb.data.models import Market
 
 log = logging.getLogger(__name__)
 
-# Patterns for candle markets
+# Patterns for candle markets — extended to cover all crypto assets
+# with active "Up or Down" candle contracts on Polymarket.
+_SUPPORTED_ASSETS = (
+    ("Bitcoin", "BTC"),
+    ("Ethereum", "ETH"),
+    ("Solana", "SOL"),
+    ("BNB", "BNB"),
+    ("XRP", "XRP"),
+    ("Dogecoin", "DOGE"),
+    ("Hyperliquid", "HYPE"),
+    ("Monero", "XMR"),
+    ("Cardano", "ADA"),
+    ("Avalanche", "AVAX"),
+    ("Chainlink", "LINK"),
+)
+
+_ASSET_PATTERN = "|".join(
+    re.escape(name) for pair in _SUPPORTED_ASSETS for name in pair
+)
 _CANDLE_RE = re.compile(
-    r"(?:Bitcoin|BTC|Ethereum|ETH|Solana|SOL)\s+Up or Down\s*[-–—]\s*(.+?)(?:\?|$)",
+    rf"({_ASSET_PATTERN})\s+Up or Down\s*[-–—]\s*(.+?)(?:\?|$)",
     re.IGNORECASE,
 )
+
+# Map lowercased prefix → canonical symbol
+_PREFIX_TO_ASSET: dict[str, str] = {}
+for long_name, symbol in _SUPPORTED_ASSETS:
+    _PREFIX_TO_ASSET[long_name.lower()] = symbol
+    _PREFIX_TO_ASSET[symbol.lower()] = symbol
 
 
 @dataclass
@@ -66,16 +90,9 @@ def scan_candle_markets(
         if not match:
             continue
 
-        window_desc = match.group(1).strip()
-
-        # Identify the underlying asset
-        q_lower = m.question.lower()
-        if q_lower.startswith(("ethereum", "eth")):
-            asset = "ETH"
-        elif q_lower.startswith(("solana", "sol")):
-            asset = "SOL"
-        else:
-            asset = "BTC"
+        asset_match = match.group(1).lower()
+        window_desc = match.group(2).strip()
+        asset = _PREFIX_TO_ASSET.get(asset_match, "BTC")
 
         # Must have exactly 2 outcomes (Up/Down)
         if len(m.outcomes) != 2:

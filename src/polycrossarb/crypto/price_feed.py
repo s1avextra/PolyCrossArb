@@ -323,9 +323,23 @@ class CryptoPriceFeed:
 
     # ── Exchange WebSocket Feeds ──────────────────────────────────
 
+    _BINANCE_ALT_SYMBOLS = {
+        "ETHUSDT": "ETH",
+        "SOLUSDT": "SOL",
+        "BNBUSDT": "BNB",
+        "XRPUSDT": "XRP",
+        "DOGEUSDT": "DOGE",
+        "ADAUSDT": "ADA",
+        "AVAXUSDT": "AVAX",
+        "LINKUSDT": "LINK",
+    }
+
     async def _binance_ws(self):
-        """Binance BTC+ETH+SOL/USDT tickers (free, ~100ms)."""
-        url = "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker"
+        """Binance multi-asset tickers (BTC + altcoin candles assets)."""
+        streams = "btcusdt@ticker/" + "/".join(
+            f"{s.lower()}@ticker" for s in self._BINANCE_ALT_SYMBOLS
+        )
+        url = f"wss://stream.binance.com:9443/stream?streams={streams}"
         while self._running:
             try:
                 async with websockets.connect(url, ping_interval=20) as ws:
@@ -342,10 +356,9 @@ class CryptoPriceFeed:
                             ask = float(data.get("a", 0))
                             if symbol == "BTCUSDT":
                                 self._update_price("binance", price, bid, ask)
-                            elif symbol == "ETHUSDT":
-                                self._update_asset_price("ETH", "binance", price)
-                            elif symbol == "SOLUSDT":
-                                self._update_asset_price("SOL", "binance", price)
+                            elif symbol in self._BINANCE_ALT_SYMBOLS:
+                                asset = self._BINANCE_ALT_SYMBOLS[symbol]
+                                self._update_asset_price(asset, "binance", price)
                         except (json.JSONDecodeError, ValueError, TypeError):
                             pass
             except Exception as e:

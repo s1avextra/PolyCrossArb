@@ -89,23 +89,76 @@ class MomentumDetector:
     Uses volatility-normalized signals instead of fixed dollar thresholds.
     """
 
-    def __init__(self, realized_vol: float | None = None, noise_z_threshold: float = 0.3):
+    def __init__(
+        self,
+        realized_vol: float | None = None,
+        noise_z_threshold: float = 0.3,
+        fast_vol_half_life_min: float = 15.0,
+        slow_vol_half_life_min: float = 240.0,
+        floor_vol: float = 0.10,
+    ):
         self._ticks: deque[tuple[float, float]] = deque(maxlen=5000)  # (timestamp, price)
         self._window_opens: dict[str, float] = {}  # contract_id -> open price
-        self._realized_vol: float = realized_vol or 0.50  # annualized, updated externally
         self._noise_z: float = noise_z_threshold  # below this z, confidence *= 0.4
+
+        # Backwards-compat seed: if caller passes realized_vol explicitly,
+        # use it until the EWMA estimator warms up.
+        self._seed_vol: float = realized_vol if realized_vol and realized_vol > 0 else 0.50
+
+        # EWMA fast/slow realized vol estimators.
+        # Fast (~15 min half-life): primary sigma input for z-score.
+        # Slow (~4h half-life):      baseline for regime ratio.
+        # Floor prevents degenerate z explosions when vol collapses.
+        self._fast_tau_s = fast_vol_half_life_min * 60.0 / math.log(2)
+        self._slow_tau_s = slow_vol_half_life_min * 60.0 / math.log(2)
+        self._floor_vol: float = floor_vol
+        self._fast_var: float = 0.0      # EWMA of per-second variance
+        self._slow_var: float = 0.0
+        self._ewma_warmed: bool = False
 
     @property
     def realized_vol(self) -> float:
-        return self._realized_vol
+        """Current sigma source — EWMA fast when warm, seed otherwise.
+
+        This is the value consumed by ``detect()`` for z-score computation.
+        It replaces the old externally-set 24h rolling estimate.
+        """
+        if not self._ewma_warmed:
+            return self._seed_vol
+        seconds_per_year = 365.25 * 86400
+        v = math.sqrt(max(0.0, self._fast_var * seconds_per_year))
+        return max(self._floor_vol, min(5.0, v))
+
+    @property
+    def slow_realized_vol(self) -> float:
+        """Slow EWMA vol (4h half-life) — baseline for regime ratio."""
+        if not self._ewma_warmed:
+            return self._seed_vol
+        seconds_per_year = 365.25 * 86400
+        v = math.sqrt(max(0.0, self._slow_var * seconds_per_year))
+        return max(self._floor_vol, min(5.0, v))
+
+    @property
+    def vol_ratio(self) -> float:
+        """fast/slow — regime indicator. >1.5 HIGH, <0.5 LOW."""
+        slow = self.slow_realized_vol
+        if slow <= 0:
+            return 1.0
+        return self.realized_vol / slow
 
     def set_realized_vol(self, vol: float):
-        """Update realized volatility from price feed."""
-        if vol > 0:
-            self._realized_vol = vol
+        """Legacy setter — updates the seed used before EWMA warms up.
+
+        After EWMA has seen enough ticks (~20), ``realized_vol`` is
+        computed internally from the tick stream and this setter has
+        no effect. Kept for backwards compatibility with the live
+        pipeline's ``set_realized_vol(price_feed.volatility)`` call.
+        """
+        if vol > 0 and not self._ewma_warmed:
+            self._seed_vol = vol
 
     def add_tick(self, price: float, timestamp: float | None = None):
-        """Record a new price tick.
+        """Record a new price tick and update EWMA vol estimators.
 
         Args:
             price: BTC spot
@@ -113,6 +166,25 @@ class MomentumDetector:
                        Backtest replay must pass historical timestamps.
         """
         ts = timestamp if timestamp is not None else time.time()
+
+        # Update EWMA of squared log returns before appending the new tick.
+        # Hot path — keep branches minimal.
+        if self._ticks:
+            last_ts, last_price = self._ticks[-1]
+            dt = ts - last_ts
+            if dt > 0 and last_price > 0 and price > 0:
+                log_return = math.log(price / last_price)
+                r2_rate = (log_return * log_return) / dt  # per-second squared return
+                if self._ewma_warmed:
+                    fast_alpha = 1.0 - math.exp(-dt / self._fast_tau_s)
+                    slow_alpha = 1.0 - math.exp(-dt / self._slow_tau_s)
+                    self._fast_var = (1 - fast_alpha) * self._fast_var + fast_alpha * r2_rate
+                    self._slow_var = (1 - slow_alpha) * self._slow_var + slow_alpha * r2_rate
+                else:
+                    self._fast_var = r2_rate
+                    self._slow_var = r2_rate
+                    self._ewma_warmed = True
+
         self._ticks.append((ts, price))
 
     def set_window_open(self, contract_id: str, price: float):
@@ -209,9 +281,11 @@ class MomentumDetector:
         total_window = minutes_elapsed + minutes_remaining
 
         # ── Volatility-normalized magnitude (z-score) ──────────────
-        # Expected move for this window based on realized vol
+        # Expected move for this window based on EWMA fast realized vol
+        # (self-calibrating — adapts to current regime in ~15 min).
         # sigma_window = price × annual_vol × sqrt(window_minutes / minutes_per_year)
-        sigma_window = open_price * self._realized_vol * math.sqrt(total_window / 525600)
+        current_vol = self.realized_vol
+        sigma_window = open_price * current_vol * math.sqrt(total_window / 525600)
         sigma_window = max(sigma_window, 1.0)  # floor at $1 to avoid div-by-zero
         z_score = abs(price_change) / sigma_window
 
