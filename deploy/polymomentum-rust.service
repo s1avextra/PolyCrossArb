@@ -1,0 +1,30 @@
+[Unit]
+Description=PolyMomentum rust pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymomentum
+WorkingDirectory=/opt/polymomentum/current
+EnvironmentFile=/etc/polymomentum/env
+ExecStart=/opt/polymomentum/polymomentum-engine
+ExecStop=/bin/kill -SIGTERM $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+Environment=CLOB_DIRECT=1
+LimitNOFILE=65536
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polymomentum /tmp/polymomentum
+
+[Install]
+WantedBy=multi-user.target

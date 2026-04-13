@@ -58,7 +58,7 @@ Check `logs/sessions/` for:
 ### 3a. One-time setup
 ```bash
 uv run python -c "
-from polycrossarb.execution.onchain import OnChainExecutor
+from polymomentum.execution.onchain import OnChainExecutor
 oc = OnChainExecutor()
 # Approve USDC.e for ConditionalTokens contract (unlimited, one-time)
 oc.approve_usdc('0x4D97DCd97eC945f40cF65F87097ACe5EA0476045')

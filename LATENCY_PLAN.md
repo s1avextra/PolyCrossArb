@@ -17,10 +17,10 @@ Pure Python changes to existing code paths. Testable immediately with L2 backtes
 In the final 15-30 seconds of a 5-min candle, BTC outcome is ~90%+ determined but the MM may still show stale prices. Add a "terminal" zone with relaxed thresholds.
 
 **Files:**
-- `src/polycrossarb/crypto/decision.py` — add `terminal` to `zone_for()` (line 95-101) for `elapsed_pct >= 0.95`; add terminal thresholds to `ZoneConfig`: `terminal_min_confidence=0.55`, `terminal_min_z=0.3`, `terminal_min_edge=0.03`; add terminal branch to `zone_thresholds()` (line 104-116)
-- `src/polycrossarb/config.py` — add `candle_zone_terminal_*` settings fields
-- `src/polycrossarb/crypto/candle_pipeline.py` — lower `minutes_left > 0.5` floor to `0.25` for terminal zone only (line 549)
-- `src/polycrossarb/backtest/candle_strategy.py` — same floor adjustment
+- `src/polymomentum/crypto/decision.py` — add `terminal` to `zone_for()` (line 95-101) for `elapsed_pct >= 0.95`; add terminal thresholds to `ZoneConfig`: `terminal_min_confidence=0.55`, `terminal_min_z=0.3`, `terminal_min_edge=0.03`; add terminal branch to `zone_thresholds()` (line 104-116)
+- `src/polymomentum/config.py` — add `candle_zone_terminal_*` settings fields
+- `src/polymomentum/crypto/candle_pipeline.py` — lower `minutes_left > 0.5` floor to `0.25` for terminal zone only (line 549)
+- `src/polymomentum/backtest/candle_strategy.py` — same floor adjustment
 - `tests/test_candle_decision.py` — add terminal zone golden tests
 
 ### 1B. Volatility regime dynamic sizing (+$11/day estimated)
@@ -28,10 +28,10 @@ In the final 15-30 seconds of a 5-min candle, BTC outcome is ~90%+ determined bu
 During high-vol events (FOMC, liquidation cascades), MM lag widens and edge per trade increases. Scale position size with realized vol.
 
 **Files:**
-- `src/polycrossarb/crypto/momentum.py` — add `VolatilityRegime` enum (`LOW`, `NORMAL`, `HIGH`, `EXTREME`) based on trailing 15-min realized vol vs 24h average
-- `src/polycrossarb/crypto/candle_pipeline.py` — in `_execute_candle_trade()` (line 697), multiply position by vol-regime multiplier: HIGH=1.5x, EXTREME=2.0x
-- `src/polycrossarb/config.py` — add `candle_vol_high_multiplier`, `candle_vol_extreme_multiplier`
-- `src/polycrossarb/risk/manager.py` — circuit breaker must use % drawdown (already does), not absolute dollars
+- `src/polymomentum/crypto/momentum.py` — add `VolatilityRegime` enum (`LOW`, `NORMAL`, `HIGH`, `EXTREME`) based on trailing 15-min realized vol vs 24h average
+- `src/polymomentum/crypto/candle_pipeline.py` — in `_execute_candle_trade()` (line 697), multiply position by vol-regime multiplier: HIGH=1.5x, EXTREME=2.0x
+- `src/polymomentum/config.py` — add `candle_vol_high_multiplier`, `candle_vol_extreme_multiplier`
+- `src/polymomentum/risk/manager.py` — circuit breaker must use % drawdown (already does), not absolute dollars
 
 ### 1-Validation
 - Run L2 backtest on 48h dataset with terminal zone enabled: `scripts/run_l2_sweep.py` with new terminal params
@@ -43,11 +43,11 @@ During high-vol events (FOMC, liquidation cascades), MM lag widens and edge per 
 Use BTC momentum as a LEADING indicator for ETH/SOL candle contracts. ETH/SOL MMs lag even more than BTC MM (lower volume).
 
 **Files:**
-- `src/polycrossarb/crypto/momentum.py` — add `reference_asset_signal` parameter to `detect()`: when evaluating an ETH/SOL contract, accept a BTC `MomentumSignal` as a cross-asset boost to confidence
-- `src/polycrossarb/crypto/candle_pipeline.py` — in `_scan_loop()`, when evaluating non-BTC contracts, pass the current BTC momentum signal as the reference; add lead-lag correlation filter (disable when 30s rolling correlation < 0.70)
-- `src/polycrossarb/crypto/price_feed.py` — already tracks ETH/SOL from 9 exchanges via `_update_asset_price()` (line 86-95)
-- `src/polycrossarb/crypto/decision.py` — add optional `cross_asset_boost` parameter to `decide_candle_trade()` that lowers zone thresholds by a configurable amount when the reference asset strongly agrees
-- `src/polycrossarb/backtest/candle_strategy.py` — wire BTC history as reference signal for ETH/SOL adapters
+- `src/polymomentum/crypto/momentum.py` — add `reference_asset_signal` parameter to `detect()`: when evaluating an ETH/SOL contract, accept a BTC `MomentumSignal` as a cross-asset boost to confidence
+- `src/polymomentum/crypto/candle_pipeline.py` — in `_scan_loop()`, when evaluating non-BTC contracts, pass the current BTC momentum signal as the reference; add lead-lag correlation filter (disable when 30s rolling correlation < 0.70)
+- `src/polymomentum/crypto/price_feed.py` — already tracks ETH/SOL from 9 exchanges via `_update_asset_price()` (line 86-95)
+- `src/polymomentum/crypto/decision.py` — add optional `cross_asset_boost` parameter to `decide_candle_trade()` that lowers zone thresholds by a configurable amount when the reference asset strongly agrees
+- `src/polymomentum/backtest/candle_strategy.py` — wire BTC history as reference signal for ETH/SOL adapters
 - `rust_engine/src/exchange.rs` — add ETH/USDT and SOL/USDT feeds on Binance and Bybit
 
 ### 2-Validation
@@ -72,10 +72,10 @@ The Rust `clob.rs` already has pre-warmed HTTP connection pool with TCP nodelay,
 
 **Files:**
 - `rust_engine/src/ipc.rs` (NEW) — UDS server with length-prefixed msgpack framing. Messages Python→Rust: `ContractUpdate`, `ConfigUpdate`, `RiskUpdate{available_capital}`, `Shutdown`. Messages Rust→Python: `TradeSignal`, `FillReport{order_id, latency_us, fill_price}`, `LatencyReport`.
-- `src/polycrossarb/ipc/bridge.py` (NEW) — async UDS client mirroring Rust protocol. `connect()`, `send_contracts()`, `send_risk_update()`, `read_fills()`. Heartbeat every 5s; auto-reconnect.
+- `src/polymomentum/ipc/bridge.py` (NEW) — async UDS client mirroring Rust protocol. `connect()`, `send_contracts()`, `send_risk_update()`, `read_fills()`. Heartbeat every 5s; auto-reconnect.
 - `rust_engine/src/main.rs` — replace stdin/stdout with UDS; replace 50ms polling loop with event-driven `tokio::select!` across exchange WS + Polymarket WS + UDS + timer fallback (200ms)
 - `scripts/run_latency.py` — replace subprocess Popen + stdin with UDS client
-- `src/polycrossarb/crypto/candle_pipeline.py` — add `use_rust_engine` flag; when True, delegate scan loop to Rust via bridge, keep only resolution/monitoring/contract discovery in Python
+- `src/polymomentum/crypto/candle_pipeline.py` — add `use_rust_engine` flag; when True, delegate scan loop to Rust via bridge, keep only resolution/monitoring/contract discovery in Python
 
 ### 3C. Polymarket WebSocket L2 Feed in Rust
 
@@ -95,11 +95,11 @@ The Rust `clob.rs` already has pre-warmed HTTP connection pool with TCP nodelay,
 With sub-10ms order placement, post GTC maker orders (0% fee) instead of crossing as taker (7.2% fee). Saves ~$0.09 per $5 trade.
 
 **Files:**
-- `src/polycrossarb/execution/executor.py` — add maker mode to `SingleLegExecutor`: post at `best_ask - 1 tick`, set 3-5s fill timeout, fallback to taker if unfilled
+- `src/polymomentum/execution/executor.py` — add maker mode to `SingleLegExecutor`: post at `best_ask - 1 tick`, set 3-5s fill timeout, fallback to taker if unfilled
 - `rust_engine/src/edge.rs` — emit signals with `order_type` field ("maker" for normal, "taker_fok" for terminal-zone high-urgency)
 - `rust_engine/src/clob.rs` — existing `place_maker_order()` already uses GTC; add `place_taker_order()` with FOK
-- `src/polycrossarb/config.py` — add `candle_prefer_maker: bool = True`
-- `src/polycrossarb/backtest/fill_model.py` — add `MakerFillModel`: fills at limit price with 65% probability, taker fallback with 35%
+- `src/polymomentum/config.py` — add `candle_prefer_maker: bool = True`
+- `src/polymomentum/backtest/fill_model.py` — add `MakerFillModel`: fills at limit price with 65% probability, taker fallback with 35%
 
 ### 4-Validation
 - Run L2 backtest comparing MakerFillModel vs OneTickTakerFillModel
@@ -111,15 +111,15 @@ With sub-10ms order placement, post GTC maker orders (0% fee) instead of crossin
 ### 5A. Paper-live parity verification
 
 **Files:**
-- `src/polycrossarb/crypto/candle_pipeline.py` — add `_compare_predictions()`: for each Rust trade signal, also run Python `decide_candle_trade()`, log agreement
-- `src/polycrossarb/monitoring/session_monitor.py` — add `record_latency_breakdown()` (signal_detect_us, sign_us, post_us, server_us, total_us); add `record_comparison()` (paper prediction vs actual outcome)
+- `src/polymomentum/crypto/candle_pipeline.py` — add `_compare_predictions()`: for each Rust trade signal, also run Python `decide_candle_trade()`, log agreement
+- `src/polymomentum/monitoring/session_monitor.py` — add `record_latency_breakdown()` (signal_detect_us, sign_us, post_us, server_us, total_us); add `record_comparison()` (paper prediction vs actual outcome)
 - `tests/test_paper_live_parity.py` (NEW) — replay recorded session through both paths, verify identical decisions
 
 ### 5B. Latency measurement + alerting
 
 **Files:**
 - `rust_engine/src/latency.rs` — add per-stage timestamps: price_read → edge_calc → signing → http_post → server_ack; add per-strategy buckets
-- `src/polycrossarb/monitoring/alerter.py` — add `alert_latency_degradation()` triggered when p99 > 20ms for 5 consecutive 30s windows
+- `src/polymomentum/monitoring/alerter.py` — add `alert_latency_degradation()` triggered when p99 > 20ms for 5 consecutive 30s windows
 - `scripts/benchmark_latency.py` (NEW) — end-to-end latency benchmark against mock CLOB
 
 ### 5C. Stress testing
@@ -182,7 +182,7 @@ CANDLE_CROSS_ASSET_CONFIDENCE_BOOST=0.10
 
 # Phase 3
 IPC_MODE=uds
-IPC_SOCKET_PATH=/tmp/polycrossarb/engine.sock
+IPC_SOCKET_PATH=/tmp/polymomentum/engine.sock
 SCAN_MODE=hybrid
 CLOB_DIRECT=1
 

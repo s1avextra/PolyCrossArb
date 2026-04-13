@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from polycrossarb.crypto.decision import (
+from polymomentum.crypto.decision import (
     CandleDecision,
     SkipReason,
     ZoneConfig,
@@ -16,7 +16,7 @@ from polycrossarb.crypto.decision import (
     zone_for,
     zone_thresholds,
 )
-from polycrossarb.crypto.momentum import (
+from polymomentum.crypto.momentum import (
     MomentumSignal,
     VolatilityRegime,
     classify_vol_regime,

@@ -24,7 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 /// Default socket path
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/polycrossarb/engine.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/tmp/polymomentum/engine.sock";
 
 // ── Wire messages ──────────────────────────────────────────────────
 

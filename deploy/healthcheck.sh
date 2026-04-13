@@ -1,18 +1,18 @@
 #!/bin/bash
-# PolyCrossArb healthcheck — invoked by polycrossarb-healthcheck.timer.
+# PolyMomentum healthcheck — invoked by polymomentum-healthcheck.timer.
 # Checks: services up, HTTP /health, disk, kill switch present, recent
 # trade activity, circuit breaker state, alerter cooldown.
 set -uo pipefail
 
-APP_DIR="${POLYCROSSARB_DIR:-/opt/polycrossarb}"
-SERVICES="${POLYCROSSARB_SERVICES:-polycrossarb-candle polycrossarb-rust}"
+APP_DIR="${POLYMOMENTUM_DIR:-/opt/polymomentum}"
+SERVICES="${POLYMOMENTUM_SERVICES:-polymomentum-candle polymomentum-rust}"
 WEBHOOK_URL="${ALERT_WEBHOOK_URL:-}"
-KILL_FILE="${KILL_FILE:-/tmp/polycrossarb/KILL}"
+KILL_FILE="${KILL_FILE:-/tmp/polymomentum/KILL}"
 STATE_DB="${STATE_DB:-$APP_DIR/logs/state.db}"
 INACTIVE_HOURS="${INACTIVE_HOURS:-2}"
 
 # Track per-category cooldowns so we don't spam.
-COOLDOWN_DIR="${COOLDOWN_DIR:-/var/tmp/polycrossarb-healthcheck}"
+COOLDOWN_DIR="${COOLDOWN_DIR:-/var/tmp/polymomentum-healthcheck}"
 mkdir -p "$COOLDOWN_DIR"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-1800}"
 
@@ -30,7 +30,7 @@ alert() {
         fi
     fi
     echo "$now" > "$last_file"
-    logger -t polycrossarb "HEALTH[$category]: $msg"
+    logger -t polymomentum "HEALTH[$category]: $msg"
     if [ -n "$WEBHOOK_URL" ]; then
         curl -s -X POST "$WEBHOOK_URL" \
             -H 'Content-Type: application/json' \

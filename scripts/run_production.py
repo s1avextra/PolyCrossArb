@@ -27,12 +27,12 @@ import time
 
 sys.path.insert(0, "src")
 
-from polycrossarb.config import settings
-from polycrossarb.execution.executor import ExecutionMode
-from polycrossarb.crypto.candle_pipeline import CandlePipeline
-from polycrossarb.monitoring.logging_config import configure_logging
-from polycrossarb.risk.manager import RiskManager
-from polycrossarb.backtest.collector import DataCollector
+from polymomentum.config import settings
+from polymomentum.execution.executor import ExecutionMode
+from polymomentum.crypto.candle_pipeline import CandlePipeline
+from polymomentum.monitoring.logging_config import configure_logging
+from polymomentum.risk.manager import RiskManager
+from polymomentum.backtest.collector import DataCollector
 
 configure_logging()
 
@@ -41,7 +41,7 @@ async def main(mode: str, bankroll: float | None, duration: int | None = None):
     exec_mode = ExecutionMode.LIVE if mode == "live" else ExecutionMode.PAPER
 
     # Read on-chain balance
-    from polycrossarb.execution.wallet import get_wallet_balances, detect_bankroll
+    from polymomentum.execution.wallet import get_wallet_balances, detect_bankroll
 
     balances = get_wallet_balances()
     on_chain = balances["usdc_e"]

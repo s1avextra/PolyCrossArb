@@ -10,15 +10,15 @@ fail.
 """
 from __future__ import annotations
 
-from polycrossarb.backtest.btc_history import BTCHistory
-from polycrossarb.backtest.candle_registry import CandleContract, CandleRegistry
-from polycrossarb.backtest.candle_strategy import CandleStrategyAdapter, StrategyConfig
-from polycrossarb.backtest.l2_replay import TokenBook
-from polycrossarb.crypto.decision import (
+from polymomentum.backtest.btc_history import BTCHistory
+from polymomentum.backtest.candle_registry import CandleContract, CandleRegistry
+from polymomentum.backtest.candle_strategy import CandleStrategyAdapter, StrategyConfig
+from polymomentum.backtest.l2_replay import TokenBook
+from polymomentum.crypto.decision import (
     CandleDecision,
     decide_candle_trade,
 )
-from polycrossarb.crypto.momentum import MomentumDetector
+from polymomentum.crypto.momentum import MomentumDetector
 
 
 def make_registry(
@@ -29,7 +29,7 @@ def make_registry(
     start_s: float = 1_000_000.0,
     window_minutes: float = 5.0,
 ) -> CandleRegistry:
-    reg = CandleRegistry(cache_dir="/tmp/polycrossarb-test-registry")
+    reg = CandleRegistry(cache_dir="/tmp/polymomentum-test-registry")
     reg.add(CandleContract(
         condition_id=condition_id,
         question="Bitcoin Up or Down — test window",

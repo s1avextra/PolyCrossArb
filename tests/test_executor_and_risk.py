@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from polycrossarb.execution.executor import SingleLegExecutor, SingleLegResult
-from polycrossarb.monitoring import alerter
-from polycrossarb.risk.manager import RiskManager
-from polycrossarb.execution.orders import SolverResult, TradeOrder
+from polymomentum.execution.executor import SingleLegExecutor, SingleLegResult
+from polymomentum.monitoring import alerter
+from polymomentum.risk.manager import RiskManager
+from polymomentum.execution.orders import SolverResult, TradeOrder
 
 
 # ── Fakes ──────────────────────────────────────────────────────────

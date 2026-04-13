@@ -31,7 +31,7 @@ from pathlib import Path
 from threading import Thread
 
 ROOT = Path(__file__).resolve().parent.parent
-ENGINE_BIN = ROOT / "rust_engine" / "target" / "release" / "polycrossarb-engine"
+ENGINE_BIN = ROOT / "rust_engine" / "target" / "release" / "polymomentum-engine"
 
 
 class MockCLOBHandler(BaseHTTPRequestHandler):
@@ -93,8 +93,8 @@ def main():
     n_iterations = 1000
 
     # 1. Measure decision function latency
-    from polycrossarb.crypto.decision import decide_candle_trade, ZoneConfig
-    from polycrossarb.crypto.momentum import MomentumSignal
+    from polymomentum.crypto.decision import decide_candle_trade, ZoneConfig
+    from polymomentum.crypto.momentum import MomentumSignal
 
     sig = MomentumSignal(
         direction="up", confidence=0.75, price_change=50.0,
@@ -133,7 +133,7 @@ def main():
     print()
 
     # 2. Measure momentum detection latency
-    from polycrossarb.crypto.momentum import MomentumDetector
+    from polymomentum.crypto.momentum import MomentumDetector
 
     detector = MomentumDetector(realized_vol=0.50)
     # Populate with 300 ticks (simulating a 5-min window at 1Hz)
@@ -165,7 +165,7 @@ def main():
     print()
 
     # 3. Measure vol regime classification latency
-    from polycrossarb.crypto.momentum import classify_vol_regime
+    from polymomentum.crypto.momentum import classify_vol_regime
 
     latencies = []
     for _ in range(n_iterations):

@@ -1,15 +1,15 @@
 #!/bin/bash
-# Roll the /opt/polycrossarb/current symlink back to a previous release
+# Roll the /opt/polymomentum/current symlink back to a previous release
 # and restart all services. Usage:
 #   deploy/rollback.sh                 # roll back to the immediately prior release
 #   deploy/rollback.sh release-id      # roll back to a specific release id
 #   deploy/rollback.sh --list          # show available releases
 set -euo pipefail
 
-APP_DIR="${POLYCROSSARB_DIR:-/opt/polycrossarb}"
+APP_DIR="${POLYMOMENTUM_DIR:-/opt/polymomentum}"
 RELEASES_DIR="$APP_DIR/releases"
 CURRENT_LINK="$APP_DIR/current"
-SERVICES="${POLYCROSSARB_SERVICES:-polycrossarb-candle polycrossarb-rust}"
+SERVICES="${POLYMOMENTUM_SERVICES:-polymomentum-candle polymomentum-rust}"
 
 if [ ! -d "$RELEASES_DIR" ]; then
     echo "ERROR: $RELEASES_DIR does not exist — no versioned deploys yet" >&2

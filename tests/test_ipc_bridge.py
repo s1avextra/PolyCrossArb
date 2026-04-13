@@ -96,8 +96,8 @@ class TestConcurrentSignals:
 
     def test_ten_contracts_within_50ms(self):
         """10 simultaneous trade decisions complete within 50ms total."""
-        from polycrossarb.crypto.decision import decide_candle_trade, ZoneConfig
-        from polycrossarb.crypto.momentum import MomentumSignal
+        from polymomentum.crypto.decision import decide_candle_trade, ZoneConfig
+        from polymomentum.crypto.momentum import MomentumSignal
 
         signals = []
         for i in range(10):
@@ -139,7 +139,7 @@ class TestConcurrentSignals:
 
     def test_momentum_detection_throughput(self):
         """MomentumDetector can handle 100 detect() calls in under 100ms."""
-        from polycrossarb.crypto.momentum import MomentumDetector
+        from polymomentum.crypto.momentum import MomentumDetector
 
         detector = MomentumDetector(realized_vol=0.50)
         base_time = time.time()
@@ -167,7 +167,7 @@ class TestMakerFillModel:
 
     def test_maker_fill_rate_converges(self):
         """Over many trials, maker fill rate should be near fill_prob."""
-        from polycrossarb.backtest.fill_model import MakerFillModel
+        from polymomentum.backtest.fill_model import MakerFillModel
 
         model = MakerFillModel(fill_prob=0.65, seed=42)
         n = 1000
@@ -183,7 +183,7 @@ class TestMakerFillModel:
 
     def test_maker_fill_has_price_improvement(self):
         """Maker fills at best_ask - 1 tick (price improvement over touch)."""
-        from polycrossarb.backtest.fill_model import MakerFillModel
+        from polymomentum.backtest.fill_model import MakerFillModel
 
         model = MakerFillModel(fill_prob=1.0, seed=42)  # force maker fill
         result = model.fill("buy", 10.0, 0.45, 0.55)
@@ -193,7 +193,7 @@ class TestMakerFillModel:
 
     def test_taker_fallback_has_adverse_move(self):
         """Taker fallback should have one-tick adverse slippage."""
-        from polycrossarb.backtest.fill_model import MakerFillModel
+        from polymomentum.backtest.fill_model import MakerFillModel
 
         model = MakerFillModel(fill_prob=0.0, seed=42)  # force taker fallback
         result = model.fill("buy", 10.0, 0.45, 0.55)
@@ -209,7 +209,7 @@ class TestVolRegimeIntegration:
 
     def test_vol_regime_with_price_feed_data(self):
         """Classify vol regime from synthetic price history."""
-        from polycrossarb.crypto.momentum import classify_vol_regime, VolatilityRegime
+        from polymomentum.crypto.momentum import classify_vol_regime, VolatilityRegime
 
         # Normal conditions: short_vol ≈ baseline_vol
         assert classify_vol_regime(0.50, 0.50) == VolatilityRegime.NORMAL

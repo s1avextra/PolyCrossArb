@@ -18,7 +18,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-from polycrossarb.backtest.collector import DataCollector
+from polymomentum.backtest.collector import DataCollector
 
 
 async def main():

@@ -26,28 +26,28 @@ sys.path.insert(0, "src")
 # Flush print immediately so progress is visible when stdout is redirected
 print = functools.partial(print, flush=True)
 
-from polycrossarb.monitoring.logging_config import configure_logging
+from polymomentum.monitoring.logging_config import configure_logging
 
 configure_logging()
 
-from polycrossarb.backtest.btc_history import BTCHistory
-from polycrossarb.backtest.candle_registry import CandleRegistry
-from polycrossarb.backtest.candle_resolver import (
+from polymomentum.backtest.btc_history import BTCHistory
+from polymomentum.backtest.candle_registry import CandleRegistry
+from polymomentum.backtest.candle_resolver import (
     BacktestResults,
     format_report,
     resolve_backtest,
 )
-from polycrossarb.backtest.candle_strategy import CandleStrategyAdapter, StrategyConfig
-from polycrossarb.backtest.l2_replay import L2BacktestEngine
-from polycrossarb.backtest.latency_model import preset_dublin_vps
-from polycrossarb.backtest.pmxt_loader import PMXTLoader
-from polycrossarb.backtest.strategies import (
+from polymomentum.backtest.candle_strategy import CandleStrategyAdapter, StrategyConfig
+from polymomentum.backtest.l2_replay import L2BacktestEngine
+from polymomentum.backtest.latency_model import preset_dublin_vps
+from polymomentum.backtest.pmxt_loader import PMXTLoader
+from polymomentum.backtest.strategies import (
     BaselineStrategy,
     EwmaVolStrategy,
     RegimeConditionalStrategy,
 )
-from polycrossarb.crypto.decision import ZoneConfig
-from polycrossarb.crypto.momentum import VolatilityRegime
+from polymomentum.crypto.decision import ZoneConfig
+from polymomentum.crypto.momentum import VolatilityRegime
 
 
 def parse_dt(s: str) -> datetime:
@@ -88,7 +88,7 @@ class RegimeOracle:
     def _warm_up_and_sample(
         self, btc: BTCHistory, start_ts: float, end_ts: float, interval_s: float
     ) -> None:
-        from polycrossarb.crypto.momentum import classify_vol_regime
+        from polymomentum.crypto.momentum import classify_vol_regime
 
         # Extract ticks within [start - 1h, end]
         warm_start_ms = int((start_ts - 3600) * 1000)

@@ -1,4 +1,4 @@
-# PolyCrossArb
+# PolyMomentum
 
 Quantitative cross-market arbitrage system for Polymarket prediction markets.
 
@@ -38,7 +38,7 @@ Subscribes to real-time price changes. Detects arbs within <1 second of a price 
 
 ```bash
 # Setup
-cd PolyCrossArb
+cd PolyMomentum
 cp .env.example .env
 uv venv && uv pip install -e ".[dev]"
 
@@ -91,7 +91,7 @@ When `BANKROLL_USD=0`, the bot reads your wallet's USDC.e balance at startup and
 ## Project structure
 
 ```
-src/polycrossarb/
+src/polymomentum/
 ├── config.py              # Settings from .env
 ├── pipeline.py            # REST polling orchestrator
 ├── pipeline_ws.py         # WebSocket event-driven orchestrator

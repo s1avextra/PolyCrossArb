@@ -1,4 +1,4 @@
-//! PolyCrossArb Rust Latency Engine v0.2
+//! PolyMomentum Rust Latency Engine v0.2
 //!
 //! Ultra-low-latency candle trading pipeline:
 //! 1. WebSocket price feeds from 4 exchanges (~100ms updates)
@@ -146,7 +146,7 @@ struct InputMessage {
 
 #[tokio::main]
 async fn main() {
-    eprintln!("PolyCrossArb Latency Engine v0.2.0");
+    eprintln!("PolyMomentum Latency Engine v0.2.0");
     eprintln!("Strategy: detect stale MM prices, accumulate edge, scale in");
 
     let state = Arc::new(RwLock::new(PriceState::new()));

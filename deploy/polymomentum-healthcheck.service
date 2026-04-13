@@ -1,0 +1,10 @@
+[Unit]
+Description=PolyMomentum healthcheck (one-shot, fired by .timer)
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/polymomentum/env
+ExecStart=/opt/polymomentum/current/deploy/healthcheck.sh
+StandardOutput=journal
+StandardError=journal

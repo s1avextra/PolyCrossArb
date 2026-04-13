@@ -33,14 +33,14 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import structlog
-from polycrossarb.config import settings
-from polycrossarb.data.client import PolymarketClient
-from polycrossarb.crypto.candle_scanner import scan_candle_markets
-from polycrossarb.crypto.price_feed import CryptoPriceFeed
-from polycrossarb.execution.executor import ExecutionMode, SingleLegExecutor
-from polycrossarb.ipc.bridge import EngineBridge
-from polycrossarb.risk.manager import RiskManager
-from polycrossarb.monitoring.session_monitor import SessionMonitor
+from polymomentum.config import settings
+from polymomentum.data.client import PolymarketClient
+from polymomentum.crypto.candle_scanner import scan_candle_markets
+from polymomentum.crypto.price_feed import CryptoPriceFeed
+from polymomentum.execution.executor import ExecutionMode, SingleLegExecutor
+from polymomentum.ipc.bridge import EngineBridge
+from polymomentum.risk.manager import RiskManager
+from polymomentum.monitoring.session_monitor import SessionMonitor
 
 structlog.configure(
     processors=[
@@ -52,12 +52,12 @@ structlog.configure(
     logger_factory=structlog.PrintLoggerFactory(),
 )
 logging.basicConfig(level=logging.WARNING)
-logging.getLogger("polycrossarb").setLevel(logging.INFO)
+logging.getLogger("polymomentum").setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 log = structlog.get_logger(__name__)
 
-RUST_ENGINE = Path("rust_engine/target/release/polycrossarb-engine")
+RUST_ENGINE = Path("rust_engine/target/release/polymomentum-engine")
 LOG_DIR = Path("logs")
 
 

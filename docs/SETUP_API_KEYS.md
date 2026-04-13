@@ -25,7 +25,7 @@ The API key, secret, and passphrase are **derived from your private key** using 
 ### Option A: MetaMask (easiest)
 
 1. Open MetaMask → click your account icon → **Create Account**
-2. Name it something like "PolyCrossArb Trading"
+2. Name it something like "PolyMomentum Trading"
 3. Switch to the **Polygon network**:
    - Network name: `Polygon Mainnet`
    - RPC URL: `https://polygon-rpc.com`

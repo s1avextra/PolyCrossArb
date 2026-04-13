@@ -25,26 +25,26 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 
-from polycrossarb.monitoring.logging_config import configure_logging
+from polymomentum.monitoring.logging_config import configure_logging
 
 configure_logging()
 
 import structlog
-from polycrossarb.backtest.btc_history import BTCHistory
-from polycrossarb.backtest.candle_registry import CandleRegistry
-from polycrossarb.backtest.candle_resolver import format_report, resolve_backtest
-from polycrossarb.backtest.candle_strategy import (
+from polymomentum.backtest.btc_history import BTCHistory
+from polymomentum.backtest.candle_registry import CandleRegistry
+from polymomentum.backtest.candle_resolver import format_report, resolve_backtest
+from polymomentum.backtest.candle_strategy import (
     CandleStrategyAdapter,
     StrategyConfig,
 )
-from polycrossarb.backtest.l2_replay import L2BacktestEngine
-from polycrossarb.backtest.latency_model import (
+from polymomentum.backtest.l2_replay import L2BacktestEngine
+from polymomentum.backtest.latency_model import (
     StaticLatencyConfig,
     preset_dublin_vps,
     preset_macbook_us,
     preset_swiss_vps,
 )
-from polycrossarb.backtest.pmxt_loader import PMXTLoader
+from polymomentum.backtest.pmxt_loader import PMXTLoader
 
 log = structlog.get_logger(__name__)
 

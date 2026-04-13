@@ -18,7 +18,7 @@ import math
 
 import pytest
 
-from polycrossarb.crypto.fair_value import _norm_cdf, compute_fair_value
+from polymomentum.crypto.fair_value import _norm_cdf, compute_fair_value
 
 
 # ── norm_cdf parity ──────────────────────────────────────────────

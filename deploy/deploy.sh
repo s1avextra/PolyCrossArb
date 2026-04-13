@@ -7,7 +7,7 @@
 #   deploy/deploy.sh user@vps-ip [--rust] [--keep N]
 #
 # Layout on VPS:
-#   /opt/polycrossarb/
+#   /opt/polymomentum/
 #     releases/
 #       2026-04-11T141500Z/        ← rsync target
 #       2026-04-11T120000Z/
@@ -15,7 +15,7 @@
 #     current → releases/2026-04-11T141500Z/   ← atomic symlink
 #     .env                                       ← stays out of releases
 #     logs/                                       ← stays out of releases
-#     polycrossarb-engine                         ← rust binary, copied per release
+#     polymomentum-engine                         ← rust binary, copied per release
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-APP_DIR="/opt/polycrossarb"
+APP_DIR="/opt/polymomentum"
 RELEASE_ID="$(date -u +%Y-%m-%dT%H%M%SZ)"
 RELEASE_DIR="$APP_DIR/releases/$RELEASE_ID"
 
@@ -61,19 +61,19 @@ rsync -avz --delete \
 RUST_CMDS=""
 if $REBUILD_RUST; then
     RUST_CMDS="
-cd '$RELEASE_DIR/rust_engine' && cargo build --release && cp target/release/polycrossarb-engine '$APP_DIR/'
-systemctl restart polycrossarb-rust"
+cd '$RELEASE_DIR/rust_engine' && cargo build --release && cp target/release/polymomentum-engine '$APP_DIR/'
+systemctl restart polymomentum-rust"
 fi
 
 ssh "$VPS" bash -s <<DEPLOY_EOF
 set -euo pipefail
 source \$HOME/.cargo/env 2>/dev/null || true
 
-# Fix ownership (rsync preserves macOS uid which polycrossarb can't write to)
-chown -R polycrossarb:polycrossarb '$RELEASE_DIR'
+# Fix ownership (rsync preserves macOS uid which polymomentum can't write to)
+chown -R polymomentum:polymomentum '$RELEASE_DIR'
 
 # Install Python deps into the project venv
-cd '$RELEASE_DIR' && uv pip install --python /opt/polycrossarb/.venv/bin/python '.[execution]'
+cd '$RELEASE_DIR' && uv pip install --python /opt/polymomentum/.venv/bin/python '.[execution]'
 
 # Optionally rebuild Rust
 $RUST_CMDS
@@ -82,7 +82,7 @@ $RUST_CMDS
 ln -sfn '$RELEASE_DIR' '$APP_DIR/current.new' && mv -Tf '$APP_DIR/current.new' '$APP_DIR/current'
 
 # Restart active services only
-systemctl restart polycrossarb-candle
+systemctl restart polymomentum-candle
 
 # Prune old releases keeping last \$KEEP.
 # Sort by ISO8601 name (reverse = newest-first) not by mtime — rsync

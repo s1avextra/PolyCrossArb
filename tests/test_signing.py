@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from polycrossarb.crypto.momentum import VolatilityRegime, classify_vol_regime
+from polymomentum.crypto.momentum import VolatilityRegime, classify_vol_regime
 
 
 # ── EIP-712 domain separator constants ────────────────────────────
