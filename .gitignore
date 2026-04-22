@@ -17,3 +17,4 @@ state.db
 *.db-shm
 rust_engine/target/
 data/
+.claude/

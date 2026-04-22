@@ -1,2 +1,0 @@
-- [User Goal](user_goal.md) — Maximize profitability of Polymarket cross-arb bot
-- [User Location](user_location.md) — Not US resident; Kalshi excluded, Hyperliquid OK
