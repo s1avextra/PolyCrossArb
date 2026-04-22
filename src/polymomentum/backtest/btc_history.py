@@ -62,8 +62,15 @@ class BTCHistory:
         """Load BTC price data from a CSV.
 
         Auto-detects schema:
-          - Binance kline:    timestamp,open,high,low,close,volume
-          - Collector ticks:  timestamp_ms,source,price,...
+          - Binance kline:    timestamp,open,high,low,close,volume (timestamp = open_time)
+          - Collector ticks:  timestamp_ms,source,price,... (timestamp = observation time)
+
+        For kline schemas we index by close_time (= open_time + interval), so
+        price_at(T) never returns information that wasn't observable at T.
+        The interval is auto-detected from the min gap between consecutive
+        rows. For tick schemas the timestamp IS the observation time so no
+        shift is applied.
+
         Returns rows added.
         """
         p = Path(path)
@@ -82,12 +89,14 @@ class BTCHistory:
             ts_idx = 0
             price_idx = -1
             schema = ""
+            is_kline = False
 
             if "timestamp" in header and "close" in header:
                 # Binance kline
                 ts_idx = header.index("timestamp")
                 price_idx = header.index("close")
                 schema = "binance_kline"
+                is_kline = True
             elif "timestamp_ms" in header and "price" in header:
                 # Collector tick format
                 ts_idx = header.index("timestamp_ms")
@@ -97,10 +106,12 @@ class BTCHistory:
                 ts_idx = header.index("timestamp")
                 price_idx = 4  # close column in standard kline
                 schema = "kline_no_header_close"
+                is_kline = True
             else:
                 log.warning("Unknown CSV schema in %s: %s", p.name, header)
                 return 0
 
+            raw_rows: list[tuple[int, float]] = []
             for row in reader:
                 if len(row) <= max(ts_idx, price_idx):
                     continue
@@ -111,15 +122,50 @@ class BTCHistory:
                     continue
                 if price <= 0:
                     continue
+                raw_rows.append((ts, price))
+
+        if not raw_rows:
+            return 0
+
+        raw_rows.sort(key=lambda r: r[0])
+
+        if is_kline:
+            # Detect interval as the modal gap between consecutive open_times.
+            diffs = [raw_rows[i + 1][0] - raw_rows[i][0] for i in range(len(raw_rows) - 1)]
+            positive_diffs = [d for d in diffs if d > 0]
+            if positive_diffs:
+                interval_ms = min(positive_diffs)
+            else:
+                # Single row or constant ts — assume 1 second as safest default
+                interval_ms = 1000
+            # Shift to close_time so price_at(T) never returns a price from the
+            # future: the kline's close price is only observable at close_time.
+            for ts, price in raw_rows:
+                self._timestamps.append(ts + interval_ms)
+                self._prices.append(price)
+            schema = f"{schema}(interval={interval_ms}ms)"
+        else:
+            for ts, price in raw_rows:
                 self._timestamps.append(ts)
                 self._prices.append(price)
-                added += 1
+            added = len(raw_rows)
 
-        # Sort by timestamp in case the CSV was unordered
-        if added > 0:
+        added = len(raw_rows)
+
+        # Sort + dedupe if we had pre-existing entries from another load_*
+        if self._timestamps != sorted(self._timestamps):
             paired = sorted(zip(self._timestamps, self._prices))
-            self._timestamps = [p[0] for p in paired]
-            self._prices = [p[1] for p in paired]
+            seen = set()
+            uniq_ts: list[int] = []
+            uniq_p: list[float] = []
+            for ts, pr in paired:
+                if ts in seen:
+                    continue
+                seen.add(ts)
+                uniq_ts.append(ts)
+                uniq_p.append(pr)
+            self._timestamps = uniq_ts
+            self._prices = uniq_p
 
         log.info("Loaded %d BTC ticks from %s (%s)", added, p.name, schema)
         return added
@@ -176,12 +222,14 @@ class BTCHistory:
 
                 for k in klines:
                     # Binance kline: [open_time, o, h, l, c, v, close_time, ...]
+                    # Store at close_time so price_at(T) cannot return a value
+                    # that wasn't yet observable at T.
                     try:
-                        ts = int(k[0])
+                        close_time_ms = int(k[6])
                         close = float(k[4])
                     except (ValueError, TypeError, IndexError):
                         continue
-                    self._timestamps.append(ts)
+                    self._timestamps.append(close_time_ms)
                     self._prices.append(close)
                     added += 1
 
@@ -214,9 +262,15 @@ class BTCHistory:
         return added
 
     def price_at(self, timestamp_ms: int) -> float:
-        """Get the BTC price at or just before the given timestamp.
+        """Return the most recent observable BTC price at timestamp T.
 
-        Returns 0 if before the first tick or after the last.
+        Lookahead-free contract: the returned price is the last price whose
+        observation timestamp is ≤ T. For kline data this means we only
+        return a kline's close price once the close_time of that kline has
+        passed (stored timestamps are close_times, not open_times).
+
+        Returns 0 if we have no data observable at or before T, or if the
+        history is empty.
         """
         if not self._timestamps:
             return 0.0

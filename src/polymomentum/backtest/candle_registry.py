@@ -203,8 +203,9 @@ class CandleRegistry:
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
 
-        # Check disk cache first
-        cache_file = self._cache_dir / f"range_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.json"
+        # Check disk cache first — include hours so a narrower fetch doesn't
+        # poison a wider one (e.g. fetching 07-13 then 07-21 same day).
+        cache_file = self._cache_dir / f"range_{start.strftime('%Y%m%dT%H')}_{end.strftime('%Y%m%dT%H')}.json"
         if cache_file.exists():
             try:
                 with open(cache_file) as f:

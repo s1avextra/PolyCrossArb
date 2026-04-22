@@ -21,34 +21,61 @@ import pytest
 from polymomentum.crypto.fair_value import _norm_cdf, compute_fair_value
 
 
+def _rust_norm_cdf_reference(x: float) -> float:
+    """Reference values of the Rust norm_cdf (A&S 7.1.26 erf applied correctly).
+
+    These values are what the Rust implementation MUST return for parity.
+    Computed once via Python's math.erf so we can pin the Rust side without
+    round-tripping through the Rust binary every test run.
+    """
+    import math
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
 # ── norm_cdf parity ──────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("x,expected,tol", [
-    (0.0, 0.5, 1e-8),        # near-exact (A&S rounding)
-    (1.0, 0.8703, 0.01),     # A&S approximation (~3% from true 0.8413)
-    (-1.0, 0.1297, 0.01),
-    (2.0, 0.9827, 0.01),
-    (-2.0, 0.0173, 0.01),
-    (3.0, 0.9987, 0.01),
-    (-3.0, 0.0013, 0.01),
+@pytest.mark.parametrize("x,expected", [
+    (0.0, 0.5),
+    (1.0, 0.8413447460685429),
+    (-1.0, 0.15865525393145707),
+    (1.96, 0.9750021048517795),
+    (-1.96, 0.024997895148220484),
+    (2.0, 0.9772498680518208),
+    (-2.0, 0.02275013194817921),
+    (3.0, 0.9986501019683699),
+    (-3.0, 0.0013498980316301035),
 ])
-def test_norm_cdf_matches_abramowitz_stegun(x: float, expected: float, tol: float) -> None:
-    """Python norm_cdf matches the Abramowitz & Stegun approximation.
+def test_norm_cdf_exact(x: float, expected: float) -> None:
+    """Python norm_cdf is ULP-accurate via math.erf.
 
-    Both Python and Rust use the same A&S coefficients, so they produce
-    identical results. The approximation is ~1-3% from the true CDF at
-    the tails, which is acceptable for binary option pricing where the
-    relative ranking of edges matters more than absolute precision.
+    Expected values match scipy.stats.norm.cdf / Python's math.erf to
+    within machine precision. The previous hand-rolled Abramowitz & Stegun
+    implementation had up to 3.7 pp systematic error and is fixed.
     """
     result = _norm_cdf(x)
-    assert abs(result - expected) < tol, f"norm_cdf({x}) = {result}, expected ~{expected}"
+    assert abs(result - expected) < 1e-10, f"norm_cdf({x}) = {result}, expected {expected}"
 
 
 def test_norm_cdf_symmetry() -> None:
     """N(x) + N(-x) = 1 for all x."""
     for x in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
         assert abs(_norm_cdf(x) + _norm_cdf(-x) - 1.0) < 1e-10
+
+
+def test_python_matches_rust_semantics() -> None:
+    """Python _norm_cdf must agree with the Rust norm_cdf contract.
+
+    Rust uses A&S 7.1.26 erf with ≤1.5e-7 error. Python uses math.erf
+    (machine-precision). This test pins the difference tolerance at 2e-7
+    so any future regression (either side drifting) trips immediately.
+    """
+    for x in [-3.0, -1.96, -1.0, -0.25, 0.0, 0.25, 1.0, 1.96, 3.0]:
+        python = _norm_cdf(x)
+        rust_ref = _rust_norm_cdf_reference(x)
+        assert abs(python - rust_ref) < 2e-7, (
+            f"Python/Rust norm_cdf drift at x={x}: python={python} rust={rust_ref}"
+        )
 
 
 # ── BS binary option parity ──────────────────────────────────────

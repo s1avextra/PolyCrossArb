@@ -34,14 +34,17 @@ class FairValueResult:
 
 
 def _norm_cdf(x: float) -> float:
-    """Standard normal CDF approximation (Abramowitz & Stegun)."""
-    a1, a2, a3, a4, a5 = 0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429
-    p = 0.3275911
-    sign = 1 if x >= 0 else -1
-    x = abs(x)
-    t = 1.0 / (1.0 + p * x)
-    y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * math.exp(-x * x / 2)
-    return 0.5 * (1.0 + sign * y)
+    """Standard normal CDF using math.erf (ULP-accurate).
+
+    Previously used a hand-rolled Abramowitz & Stegun approximation that had
+    systematic errors up to 3.7 percentage points at moderate |x| because the
+    polynomial approximates erf(x), not N(x), and the argument must be
+    scaled by 1/sqrt(2). We now use Python's stdlib erf which is exact to
+    machine precision.
+
+    N(x) = (1 + erf(x / sqrt(2))) / 2
+    """
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def compute_fair_value(

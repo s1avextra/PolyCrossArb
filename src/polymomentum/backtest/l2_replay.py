@@ -179,7 +179,18 @@ class L2BacktestEngine:
             hist.pop(0)
 
     def _flush_pending_orders(self, current_ts: float) -> None:
-        """Simulate fills for any pending orders whose latency window has passed."""
+        """Fill any pending orders whose latency window has elapsed at current_ts.
+
+        Lookahead guard: this method MUST be called BEFORE the current event's
+        book update is applied, so the fill uses the book state as it was at
+        (order.timestamp + latency), not the post-event state. The caller in
+        `replay()` enforces this ordering.
+
+        The recorded fill_timestamp is clamped to `order.timestamp + latency`
+        rather than `current_ts` so trade-level analysis sees the intended
+        fill instant — not the arbitrary later event that happened to
+        trigger the flush.
+        """
         latency_s = self.latency.total_insert_ms() / 1000.0
         ready = [o for o in self._pending_orders if current_ts - o.timestamp >= latency_s]
         if not ready:
@@ -187,11 +198,12 @@ class L2BacktestEngine:
 
         for order in ready:
             self._pending_orders.remove(order)
+            fill_ts = order.timestamp + latency_s
             book = self._books.get(order.token_id)
             if book is None or book.best_bid <= 0 or book.best_ask <= 0:
                 self.fills.append(BacktestFill(
                     order=order,
-                    fill_timestamp=current_ts,
+                    fill_timestamp=fill_ts,
                     fill_price=0,
                     filled_size=0,
                     cost=0,
@@ -215,13 +227,13 @@ class L2BacktestEngine:
             if not result.success:
                 self.fills.append(BacktestFill(
                     order=order,
-                    fill_timestamp=current_ts,
+                    fill_timestamp=fill_ts,
                     fill_price=0,
                     filled_size=0,
                     cost=0,
                     fee=0,
                     slippage=0,
-                    book_age_ms=(current_ts - book.last_update_ts) * 1000,
+                    book_age_ms=(fill_ts - book.last_update_ts) * 1000,
                     success=False,
                     reason=result.reason,
                 ))
@@ -232,13 +244,13 @@ class L2BacktestEngine:
             fee = polymarket_fee(result.filled_size, result.fill_price, effective_rate)
             self.fills.append(BacktestFill(
                 order=order,
-                fill_timestamp=current_ts,
+                fill_timestamp=fill_ts,
                 fill_price=result.fill_price,
                 filled_size=result.filled_size,
                 cost=result.fill_cost,
                 fee=fee,
                 slippage=result.slippage_per_share,
-                book_age_ms=(current_ts - book.last_update_ts) * 1000,
+                book_age_ms=(fill_ts - book.last_update_ts) * 1000,
                 success=True,
             ))
 
@@ -267,23 +279,28 @@ class L2BacktestEngine:
             token_id = ""
             if event.snapshot:
                 token_id = event.snapshot.token_id
-                book = self._ensure_book(token_id)
-                book.apply_snapshot(event.snapshot)
             elif event.change:
                 token_id = event.change.token_id
-                book = self._ensure_book(token_id)
-                book.apply_change(event.change)
             else:
                 continue
+
+            # Flush pending orders BEFORE applying this event's update. This
+            # ensures a fill ready at (order.ts + latency) uses the book state
+            # from before `event` arrived — no lookahead from book changes
+            # that happened after the intended fill instant.
+            self._flush_pending_orders(event.timestamp)
+
+            book = self._ensure_book(token_id)
+            if event.snapshot:
+                book.apply_snapshot(event.snapshot)
+            elif event.change:
+                book.apply_change(event.change)
 
             mid = book.mid()
             if mid > 0:
                 self._record_history(token_id, event.timestamp, mid)
 
-            # Flush any pending orders whose latency has elapsed
-            self._flush_pending_orders(event.timestamp)
-
-            # Call strategy
+            # Call strategy with the (now updated) book
             orders = strategy(event.timestamp, token_id, book, self._history)
             for order in orders:
                 if order.fee_rate == 0.0:
