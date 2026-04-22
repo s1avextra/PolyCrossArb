@@ -181,6 +181,7 @@ def run_strategy(
     position_size: float = 1.0,
     fee_rate: float = 0.02,
     use_implied_vol: bool = False,
+    asset_histories: dict[str, BTCHistory] | None = None,
 ) -> dict:
     print(f"\n{'='*70}")
     print(f"  STRATEGY: {strategy.name}")
@@ -197,6 +198,7 @@ def run_strategy(
     adapter = CandleStrategyAdapter(
         registry=registry, btc_history=btc, config=config,
         strategy=strategy,
+        asset_histories=asset_histories or {},
     )
     engine = L2BacktestEngine(loader=loader, latency=preset_dublin_vps())
 
@@ -227,6 +229,30 @@ def run_strategy(
     print(f"\n  strategy state: {strat_snapshot}")
     print(f"  replay: {replay_s:.1f}s")
 
+    trades_dump = [
+        {
+            "asset": t.contract.asset,
+            "condition_id": t.contract.condition_id,
+            "window_min": t.contract.window_minutes,
+            "entry_ts": t.fill.fill_timestamp,
+            "close_ts": t.contract.end_time_s,
+            "hold_s": t.contract.end_time_s - t.fill.fill_timestamp,
+            "direction": t.decision.direction,
+            "zone": t.decision.zone,
+            "confidence": round(t.decision.confidence, 3),
+            "edge": round(t.decision.edge, 4),
+            "fill_price": round(t.fill.fill_price, 4),
+            "filled_size": round(t.fill.filled_size, 3),
+            "cost": round(t.fill.fill_price * t.fill.filled_size, 4),
+            "fee": round(t.fill.fee, 5),
+            "won": t.won,
+            "pnl": round(t.pnl, 5),
+            "pnl_after_fee": round(t.pnl_after_fee, 5),
+            "regime_at_entry": oracle.regime_at(t.fill.fill_timestamp).name,
+        }
+        for t in results.trades
+    ]
+
     return {
         "strategy": strategy.name,
         "snapshot": strat_snapshot,
@@ -244,6 +270,7 @@ def run_strategy(
         "skip_counts": dict(sorted(
             adapter.skip_counts.items(), key=lambda x: -x[1]
         )[:10]),
+        "trades": trades_dump,
     }
 
 
@@ -261,6 +288,12 @@ def main() -> int:
     parser.add_argument("--btc-csv", default="data/btcusdt_1s_7d.csv")
     parser.add_argument("--cache-dir", default="data/pmxt_cache")
     parser.add_argument("--output", default="logs/strategy_harness.json")
+    parser.add_argument("--strategies", default="baseline,ewma_15min",
+                        help="Comma-separated subset: baseline,ewma_15min,regime")
+    parser.add_argument("--kline-interval", default="1s",
+                        help="Binance kline interval for BTC/ETH/SOL fetch (1s, 1m, ...)")
+    parser.add_argument("--load-alt-csvs", action="store_true", default=True,
+                        help="Load per-asset histories for ETH/SOL so altcoin contracts use their own prices")
     args = parser.parse_args()
 
     start = parse_dt(args.start)
@@ -280,8 +313,34 @@ def main() -> int:
     if btc.n_ticks == 0 or btc.first_timestamp() > start_ms or btc.last_timestamp() < end_ms:
         fetch_start = start - timedelta(hours=2)
         fetch_end = end + timedelta(hours=1)
-        btc.load_from_binance(fetch_start, fetch_end, interval="1m")
+        btc.load_from_binance(fetch_start, fetch_end, interval=args.kline_interval)
     print(f"  BTC ticks: {btc.n_ticks} ({time.time()-t0:.1f}s)")
+
+    # Per-asset histories so altcoin contracts don't fall back to BTC prices
+    asset_histories: dict[str, BTCHistory] = {}
+    if args.load_alt_csvs:
+        alt_csv_paths = {
+            "ETH": "data/ethusdt_1s_7d.csv",
+            "SOL": "data/solusdt_1s_7d.csv",
+        }
+        for asset, csv_path in alt_csv_paths.items():
+            h = BTCHistory()
+            if Path(csv_path).exists():
+                h.load_csv(csv_path)
+            # Also fetch from Binance for the window so we have recent data
+            if (h.n_ticks == 0
+                    or h.first_timestamp() > start_ms
+                    or h.last_timestamp() < end_ms):
+                fetch_start = start - timedelta(hours=2)
+                fetch_end = end + timedelta(hours=1)
+                h.load_from_binance(
+                    fetch_start, fetch_end,
+                    symbol=f"{asset}USDT",
+                    interval=args.kline_interval,
+                )
+            if h.n_ticks > 0:
+                asset_histories[asset] = h
+                print(f"  {asset} ticks: {h.n_ticks}")
 
     t0 = time.time()
     registry = CandleRegistry()
@@ -299,19 +358,44 @@ def main() -> int:
     oracle = RegimeOracle(btc, start.timestamp(), end.timestamp())
     print(f"  Oracle:    {len(oracle._samples)} regime samples ({time.time()-t0:.1f}s)")
 
-    # Define strategies to test
-    # For fast iteration, default is 2 strategies. Expand for deeper runs.
-    strategies = [
-        BaselineStrategy(
+    # Terminal-only gate: block non-terminal zones by making their bars
+    # unreachable. Keeps terminal thresholds at their defaults so we're
+    # running *only* the zone that was profitable in the post-fix audit.
+    terminal_only_cfg = ZoneConfig(
+        early_min_confidence=0.99,
+        early_min_z=999.0,
+        early_min_edge=0.99,
+        primary_min_z=999.0,
+        late_min_confidence=0.99,
+        late_min_z=999.0,
+        late_min_edge=0.99,
+        # terminal_* all left at defaults
+    )
+
+    wanted = {s.strip() for s in args.strategies.split(",") if s.strip()}
+    strategy_catalog = {
+        "baseline": lambda: BaselineStrategy(
             name="baseline",
-            zone_config=ZoneConfig(),  # current production defaults
+            zone_config=ZoneConfig(),
         ),
-        EwmaVolStrategy(
+        "ewma_15min": lambda: EwmaVolStrategy(
             name="ewma_15min",
             fast_half_life_min=15.0,
             slow_half_life_min=240.0,
         ),
-    ]
+        "regime": lambda: RegimeConditionalStrategy(name="regime"),
+        "terminal_only": lambda: BaselineStrategy(
+            name="terminal_only",
+            zone_config=terminal_only_cfg,
+        ),
+        "ewma_terminal_only": lambda: EwmaVolStrategy(
+            name="ewma_terminal_only",
+            fast_half_life_min=15.0,
+            slow_half_life_min=240.0,
+            zone_config=terminal_only_cfg,
+        ),
+    }
+    strategies = [strategy_catalog[name]() for name in wanted if name in strategy_catalog]
 
     runs = []
     for strat in strategies:
@@ -322,6 +406,7 @@ def main() -> int:
             oracle=oracle,
             position_size=args.position_size,
             fee_rate=args.fee_rate,
+            asset_histories=asset_histories,
         )
         runs.append(run)
 
