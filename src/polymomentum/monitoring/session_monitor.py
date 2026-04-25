@@ -295,6 +295,108 @@ class SessionMonitor:
             "reason": reason,
         })
 
+    def record_signal_evaluation(
+        self,
+        contract_id: str,
+        asset: str,
+        timestamp_ms: int,
+        # MomentumSignal fields
+        open_price: float,
+        current_price: float,
+        price_change: float,
+        price_change_pct: float,
+        consistency: float,
+        z_score: float,
+        confidence: float,
+        minutes_elapsed: float,
+        minutes_remaining: float,
+        direction: str,
+        # Volatility state used in BS fair value
+        realized_vol: float,
+        slow_realized_vol: float,
+        # Cross-asset boost (0.0 if N/A)
+        cross_asset_boost: float,
+        # Book state at decision time
+        up_price: float,
+        down_price: float,
+        # Decision outcome
+        zone: str,
+        fair_value: float,
+        edge: float,
+        traded: bool,
+        skip_reason: str | None = None,
+        skip_detail: str | None = None,
+    ) -> None:
+        """Replay-grade signal evaluation log.
+
+        Fires once per contract per cycle that reaches the decision function,
+        whether the decision was a trade or a SkipReason. The schema is the
+        full set of inputs to `decide_candle_trade` plus the resulting outcome
+        — backtest should be able to consume these events plus the BTC tape
+        and reproduce identical trade selection and PnL.
+        """
+        self._write("signal", "evaluation", {
+            "ts_ms": int(timestamp_ms),
+            "cid": contract_id[:16],
+            "asset": asset,
+            # signal
+            "open": round(open_price, 4),
+            "px": round(current_price, 4),
+            "chg": round(price_change, 4),
+            "chg_pct": round(price_change_pct, 5),
+            "cons": round(consistency, 3),
+            "z": round(z_score, 3),
+            "conf": round(confidence, 3),
+            "elapsed_min": round(minutes_elapsed, 2),
+            "remaining_min": round(minutes_remaining, 2),
+            "dir": direction,
+            # vol state
+            "vol_fast": round(realized_vol, 4),
+            "vol_slow": round(slow_realized_vol, 4),
+            "cross_boost": round(cross_asset_boost, 4),
+            # book at decision (top of book; full L2 not yet captured live)
+            "up_price": round(up_price, 4),
+            "down_price": round(down_price, 4),
+            # decision
+            "zone": zone,
+            "fair": round(fair_value, 4),
+            "edge": round(edge, 4),
+            "traded": traded,
+            "skip_reason": skip_reason,
+            "skip_detail": skip_detail,
+        })
+
+    def record_oracle_resolution(
+        self,
+        contract_id: str,
+        our_actual: str,
+        our_open_btc: float,
+        our_close_btc: float,
+        polymarket_actual: str,
+        polymarket_outcome_prices: list[float],
+        polymarket_closed: bool,
+        agreed: bool,
+        delay_s: float,
+    ) -> None:
+        """Cross-check our resolution against Polymarket's oracle.
+
+        Polymarket resolves crypto candles using CoinDesk's CCIX BTC index.
+        Our resolution uses a multi-exchange aggregate. They usually agree
+        but can diverge by tens of dollars on volatile candles. Disagreement
+        is a real strategy risk — log both sides so we can quantify it.
+        """
+        self._write("oracle", "resolution", {
+            "cid": contract_id[:16],
+            "our_actual": our_actual,
+            "our_open_btc": round(our_open_btc, 2),
+            "our_close_btc": round(our_close_btc, 2),
+            "polymarket_actual": polymarket_actual,
+            "polymarket_outcome_prices": polymarket_outcome_prices,
+            "polymarket_closed": polymarket_closed,
+            "agreed": agreed,
+            "verification_delay_s": round(delay_s, 1),
+        })
+
     def top_skip_reasons(self, n: int = 5) -> dict[str, int]:
         """Return the n most common skip reasons as an ordered dict.
 

@@ -114,6 +114,10 @@ class CandlePipeline:
 
         # Paper resolution tracking: {contract_id -> {direction, entry_price, size, open_btc, end_time}}
         self._paper_positions: dict[str, dict] = {}
+        # Oracle verification: {contract_id -> {our_actual, our_open_btc, our_close_btc, end_time, attempts}}
+        # Populated when we resolve a position locally; drained by
+        # _oracle_verification_loop once Polymarket resolves the same market.
+        self._oracle_pending: dict[str, dict] = {}
         self._min_confidence = min_confidence
         self._min_edge = min_edge if min_edge is not None else settings.min_crypto_edge
         self._running = False
@@ -175,6 +179,7 @@ class CandlePipeline:
                 self._scan_loop(),
                 self._contract_refresh_loop(),
                 self._paper_resolution_loop(),
+                self._oracle_verification_loop(),
                 self._monitoring_loop(),
             )
         except asyncio.CancelledError:
@@ -390,6 +395,17 @@ class CandlePipeline:
                     close_btc=close_btc,
                 )
 
+                # Queue for Polymarket oracle cross-check (handled by
+                # _oracle_verification_loop). Lets us measure how often
+                # our BTC tape disagrees with Polymarket's CCIX oracle.
+                self._oracle_pending[cid] = {
+                    "our_actual": actual_direction,
+                    "our_open_btc": open_btc,
+                    "our_close_btc": close_btc,
+                    "end_time": pos["end_time"],
+                    "attempts": 0,
+                }
+
                 log.info(
                     "candle.resolved",
                     direction=predicted,
@@ -425,6 +441,97 @@ class CandlePipeline:
                             wins=self._wins, losses=self._losses,
                             realized=f"${self._realized_profit:.2f}")
                 self.stop()
+
+    async def _oracle_verification_loop(self):
+        """Cross-check our paper resolutions against Polymarket's oracle.
+
+        Polymarket resolves crypto candles using CoinDesk's CCIX BTC index;
+        we resolve with our 8-exchange aggregate. Disagreement = real
+        strategy risk (a paper "win" by our tape can be a Polymarket
+        "loss"). This loop polls Gamma every 60s for each pending
+        verification, comparing outcomePrices to our_actual.
+
+        A market is considered "verified" once `closed=true` AND
+        outcomePrices contains a 1.0/0.0 split. Gives up after 30
+        attempts (~30 minutes) — the candle should resolve well within
+        that window.
+        """
+        POLL_INTERVAL_S = 60
+        MAX_ATTEMPTS = 30
+        while self._running:
+            await asyncio.sleep(POLL_INTERVAL_S)
+            if not self._oracle_pending:
+                continue
+
+            for cid in list(self._oracle_pending.keys()):
+                pending = self._oracle_pending[cid]
+                pending["attempts"] += 1
+
+                try:
+                    market = await self._client.fetch_market_by_condition_id(cid)
+                except Exception:
+                    log.exception("candle.oracle.fetch_failed", cid=cid[:16])
+                    if pending["attempts"] >= MAX_ATTEMPTS:
+                        del self._oracle_pending[cid]
+                    continue
+
+                if market is None:
+                    if pending["attempts"] >= MAX_ATTEMPTS:
+                        log.warning("candle.oracle.gave_up",
+                                    cid=cid[:16],
+                                    attempts=pending["attempts"])
+                        del self._oracle_pending[cid]
+                    continue
+
+                # Has Polymarket actually resolved? outcomePrices == [1,0]
+                # or [0,1] indicates resolved; otherwise still trading.
+                prices = [o.price for o in market.outcomes]
+                resolved = (
+                    market.closed
+                    and len(prices) >= 2
+                    and {round(p) for p in prices} == {0, 1}
+                )
+                if not resolved:
+                    if pending["attempts"] >= MAX_ATTEMPTS:
+                        log.warning("candle.oracle.gave_up",
+                                    cid=cid[:16],
+                                    attempts=pending["attempts"],
+                                    closed=market.closed,
+                                    prices=prices)
+                        del self._oracle_pending[cid]
+                    continue
+
+                # outcomes[0] is "Up" / "Yes"; price 1.0 means it won.
+                polymarket_actual = "up" if prices[0] >= 0.5 else "down"
+                agreed = polymarket_actual == pending["our_actual"]
+                delay_s = time.time() - pending["end_time"]
+
+                self._monitor.record_oracle_resolution(
+                    contract_id=cid,
+                    our_actual=pending["our_actual"],
+                    our_open_btc=pending["our_open_btc"],
+                    our_close_btc=pending["our_close_btc"],
+                    polymarket_actual=polymarket_actual,
+                    polymarket_outcome_prices=prices,
+                    polymarket_closed=market.closed,
+                    agreed=agreed,
+                    delay_s=delay_s,
+                )
+
+                if not agreed:
+                    log.warning("candle.oracle.disagreement",
+                                cid=cid[:16],
+                                ours=pending["our_actual"],
+                                polymarket=polymarket_actual,
+                                our_open=pending["our_open_btc"],
+                                our_close=pending["our_close_btc"])
+                else:
+                    log.info("candle.oracle.agreed",
+                             cid=cid[:16],
+                             actual=polymarket_actual,
+                             delay_s=f"{delay_s:.0f}")
+
+                del self._oracle_pending[cid]
 
     async def _monitoring_loop(self):
         """Record price feed and risk state every 15 seconds."""
@@ -737,9 +844,28 @@ class CandlePipeline:
                     cross_asset_boost=cross_boost,
                 )
 
+                # Replay-grade evaluation log — fires for every decision
+                # (trade OR skip) with the FULL state needed for backtest
+                # reproduction. Captured BEFORE the trade fires so even
+                # crashes between here and execute_single() leave a record.
+                eval_ts_ms = int(time.time() * 1000)
                 if isinstance(decision, SkipReason):
                     self._monitor.record_signal_skip(
                         cid, f"{decision.reason}_{decision.zone}_{decision.detail}"
+                    )
+                    self._monitor.record_signal_evaluation(
+                        contract_id=cid, asset=asset, timestamp_ms=eval_ts_ms,
+                        open_price=signal.open_price, current_price=signal.current_price,
+                        price_change=signal.price_change, price_change_pct=signal.price_change_pct,
+                        consistency=signal.consistency, z_score=signal.z_score,
+                        confidence=signal.confidence, minutes_elapsed=signal.minutes_elapsed,
+                        minutes_remaining=signal.minutes_remaining, direction=signal.direction,
+                        realized_vol=asset_momentum.realized_vol,
+                        slow_realized_vol=asset_momentum.slow_realized_vol,
+                        cross_asset_boost=cross_boost,
+                        up_price=contract.up_price, down_price=contract.down_price,
+                        zone=decision.zone, fair_value=0.0, edge=0.0, traded=False,
+                        skip_reason=decision.reason, skip_detail=decision.detail,
                     )
                     continue
 
@@ -774,6 +900,22 @@ class CandlePipeline:
                     traded=True,
                 )
 
+                # Replay-grade evaluation log for the trade case
+                self._monitor.record_signal_evaluation(
+                    contract_id=cid, asset=asset, timestamp_ms=eval_ts_ms,
+                    open_price=signal.open_price, current_price=signal.current_price,
+                    price_change=signal.price_change, price_change_pct=signal.price_change_pct,
+                    consistency=signal.consistency, z_score=signal.z_score,
+                    confidence=signal.confidence, minutes_elapsed=signal.minutes_elapsed,
+                    minutes_remaining=signal.minutes_remaining, direction=signal.direction,
+                    realized_vol=asset_momentum.realized_vol,
+                    slow_realized_vol=asset_momentum.slow_realized_vol,
+                    cross_asset_boost=cross_boost,
+                    up_price=contract.up_price, down_price=contract.down_price,
+                    zone=zone, fair_value=fair_value, edge=edge, traded=True,
+                    skip_reason=None, skip_detail=None,
+                )
+
                 # Execute trade
                 await self._execute_candle_trade(contract, signal, token_id,
                                                   market_price, fair_value, edge, zone)
@@ -782,6 +924,10 @@ class CandlePipeline:
             if cycle % 30 == 0:
                 agg = self._price_feed.get_aggregated()
                 top_skips = self._monitor.top_skip_reasons(n=5)
+                # Cycle wall time — backtest assumes Dublin static latency,
+                # paper measures real loop timing so we can calibrate the
+                # gap. Includes all per-contract eval + book/price reads.
+                cycle_ms = (time.time() - t0) * 1000.0
                 log.info("candle.cycle",
                          cycle=cycle,
                          btc=f"${btc:,.0f}",
@@ -790,7 +936,9 @@ class CandlePipeline:
                          contracts=len(self._contracts),
                          trades=self._trade_count,
                          skips=self._monitor.signal_skip_count(),
-                         top_skips=top_skips if top_skips else None)
+                         top_skips=top_skips if top_skips else None,
+                         cycle_ms=round(cycle_ms, 2),
+                         price_staleness_ms=round(agg.staleness_ms, 1))
 
             # 100ms interval — 10Hz evaluation. Lowered from 500ms (2Hz) to
             # reduce detection lag. For paper mode this cuts avg detection
@@ -888,21 +1036,29 @@ class CandlePipeline:
         shares = position / market_price
 
         if self.mode == ExecutionMode.PAPER:
-            # Realistic paper model: blend maker (0% fee, 65% fill) and
-            # taker (2% effective fee, 35% fill) to match expected live
-            # execution with prefer_maker enabled.
+            # Paper fill model — same fee math as live so backtest replay
+            # of paper trades produces identical PnL.
+            #
+            # Slippage: maker gets -10bps price improvement (limit at
+            # best_ask - tick), taker gets +30bps adverse (limit at
+            # best_ask + tick). Both clamped to [0.01, 0.99].
+            #
+            # Fee: polymarket_fee(shares, price, rate) = shares*rate*p*(1-p),
+            # where rate is 0% for maker fills (rebate) and the live
+            # category rate (default 7.2% for crypto) for taker. This is
+            # the SAME formula executor.py:_record_fill uses for live, so
+            # paper fills are directly comparable.
+            from polymomentum.execution.fees import polymarket_fee
             if settings.candle_prefer_maker:
-                # Maker fill: best_ask - 1 tick, 0% fee
-                slippage_bps = -10  # negative = price improvement
-                fee_rate = 0.0
+                slippage_bps = -10
+                fee_rate = 0.0  # maker rebate
             else:
-                # Taker fill: 1 tick adverse, ~2% effective fee
-                slippage_bps = 30  # 30 bps taker impact
-                fee_rate = 0.02    # ~2% effective taker fee at typical prices
+                slippage_bps = 30
+                fee_rate = 0.072  # crypto category default; falls back to fallback schedule
             slipped_price = market_price * (1 + slippage_bps / 10000)
             slipped_price = max(0.01, min(slipped_price, 0.99))
-            shares = position / slipped_price  # recalc with slipped price
-            fee = position * fee_rate
+            shares = position / slipped_price
+            fee = polymarket_fee(shares, slipped_price, fee_rate)
             expected_profit = shares * (fair_value - slipped_price) - fee
             log.info("candle.trade.paper",
                      direction=signal.direction,

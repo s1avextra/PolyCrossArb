@@ -116,6 +116,25 @@ class PolymarketClient:
             return data
         return data.get("data", data.get("markets", []))
 
+    async def fetch_market_by_condition_id(self, condition_id: str) -> Market | None:
+        """Fetch a single market by its condition_id, returning the parsed Market.
+
+        Used by the oracle verification loop to check Polymarket's resolution
+        of a candle window against ours. Includes closed=true|false in case
+        the market has resolved (and is therefore no longer active).
+        """
+        if not condition_id:
+            return None
+        params: dict[str, Any] = {
+            "condition_ids": condition_id,
+            "limit": 1,
+        }
+        data = await self._request(self._gamma_url, _GAMMA_MARKETS, params)
+        items = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+        if not items:
+            return None
+        return self._parse_gamma_market(items[0])
+
     async def fetch_all_active_markets(
         self,
         min_volume: float = 0.0,
