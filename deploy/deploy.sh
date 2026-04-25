@@ -72,6 +72,28 @@ source \$HOME/.cargo/env 2>/dev/null || true
 # Fix ownership (rsync preserves macOS uid which polymomentum can't write to)
 chown -R polymomentum:polymomentum '$RELEASE_DIR'
 
+# Symlink logs/ and data/ to shared paths so state.db, JSONL sessions,
+# candle_trades.jsonl, and collector CSVs persist across deploys. Without
+# this, each release gets a fresh empty state.db and any in-flight paper
+# positions become orphaned in the previous release dir on symlink swap.
+mkdir -p '$APP_DIR/logs/candle' '$APP_DIR/logs/sessions' '$APP_DIR/data/live'
+chown -R polymomentum:polymomentum '$APP_DIR/logs' '$APP_DIR/data'
+
+# One-shot migration: if the currently-active release has real logs/ or data/
+# dirs (pre-fix), copy any files not yet in the shared dir before we swap.
+# Uses cp -n so existing shared files win (safe to run on every deploy).
+if [ -d '$APP_DIR/current/logs' ] && [ ! -L '$APP_DIR/current/logs' ]; then
+    cp -rn '$APP_DIR/current/logs/.' '$APP_DIR/logs/' 2>/dev/null || true
+fi
+if [ -d '$APP_DIR/current/data' ] && [ ! -L '$APP_DIR/current/data' ]; then
+    cp -rn '$APP_DIR/current/data/.' '$APP_DIR/data/' 2>/dev/null || true
+fi
+chown -R polymomentum:polymomentum '$APP_DIR/logs' '$APP_DIR/data'
+
+rm -rf '$RELEASE_DIR/logs' '$RELEASE_DIR/data'
+ln -sfn '$APP_DIR/logs' '$RELEASE_DIR/logs'
+ln -sfn '$APP_DIR/data' '$RELEASE_DIR/data'
+
 # Install Python deps into the project venv
 cd '$RELEASE_DIR' && uv pip install --python /opt/polymomentum/.venv/bin/python '.[execution]'
 

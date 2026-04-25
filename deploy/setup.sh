@@ -20,9 +20,14 @@ command -v cargo &>/dev/null || (
 command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 3. Service user, app dirs, releases dir, kill-switch dir
+# logs/ and data/ live OUTSIDE release dirs so state.db, candle_trades.jsonl,
+# session JSONL, and collector CSVs persist across deploys. Each release
+# gets logs/ and data/ as symlinks (see deploy.sh).
 id polymomentum &>/dev/null || useradd -r -s /bin/false -d "$APP_DIR" polymomentum
 mkdir -p \
-    "$APP_DIR/logs/"{arb,candle,weather,sessions} \
+    "$APP_DIR/logs/"{candle,sessions} \
+    "$APP_DIR/data/live" \
+    "$APP_DIR/data/pmxt_cache" \
     "$APP_DIR/releases" \
     "$KILL_DIR"
 chown -R polymomentum:polymomentum "$APP_DIR" "$KILL_DIR"
