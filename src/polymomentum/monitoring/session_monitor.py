@@ -295,6 +295,20 @@ class SessionMonitor:
             "reason": reason,
         })
 
+    def top_skip_reasons(self, n: int = 5) -> dict[str, int]:
+        """Return the n most common skip reasons as an ordered dict.
+
+        Used by the live pipeline cycle log to surface why trades aren't
+        firing during paper runs. The full breakdown is also in
+        get_summary()['signals']['skip_reasons'].
+        """
+        return dict(
+            sorted(self._skip_reasons.items(), key=lambda x: -x[1])[:n]
+        )
+
+    def signal_skip_count(self) -> int:
+        return self._signal_skip_count
+
     # ── Resolution & P&L ────────────────────────────────────────
 
     def record_resolution(

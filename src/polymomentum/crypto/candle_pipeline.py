@@ -781,13 +781,16 @@ class CandlePipeline:
             # Log every 30 cycles
             if cycle % 30 == 0:
                 agg = self._price_feed.get_aggregated()
+                top_skips = self._monitor.top_skip_reasons(n=5)
                 log.info("candle.cycle",
                          cycle=cycle,
                          btc=f"${btc:,.0f}",
                          sources=agg.n_sources,
                          spread=f"${agg.spread:.2f}",
                          contracts=len(self._contracts),
-                         trades=self._trade_count)
+                         trades=self._trade_count,
+                         skips=self._monitor.signal_skip_count(),
+                         top_skips=top_skips if top_skips else None)
 
             # 100ms interval — 10Hz evaluation. Lowered from 500ms (2Hz) to
             # reduce detection lag. For paper mode this cuts avg detection
