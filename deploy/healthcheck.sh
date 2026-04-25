@@ -48,7 +48,11 @@ for svc in $SERVICES; do
 done
 
 # 2. HTTP /health endpoint (if the bot exposes one).
-HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health 2>/dev/null || echo "000")
+# `-w "%{http_code}"` already prints "000" on connection failure, so the
+# previous `|| echo "000"` was concatenating two zeros into "000000" and
+# tripping the alert every cycle when no /health endpoint exists.
+HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health 2>/dev/null)
+HTTP="${HTTP:-000}"
 if [ "$HTTP" != "200" ] && [ "$HTTP" != "000" ]; then
     alert "http_health" "endpoint returned $HTTP"
 fi
