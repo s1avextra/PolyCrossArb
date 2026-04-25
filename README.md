@@ -1,197 +1,109 @@
 # PolyMomentum
 
-Quantitative cross-market arbitrage system for Polymarket prediction markets.
+Single-strategy bot trading **"Up or Down" 5/15-min crypto candle markets on Polymarket**. Multi-exchange momentum signal → BS-binary fair-value mispricing detection → CLOB execution.
 
-Detects logical pricing inconsistencies across interdependent markets (e.g. "Who will win X?" split into multiple binary YES/NO markets), computes optimal trade sizes via LP solver, and executes through paper or live trading.
+> **Status (2026-04-25):** Paper mode running 24/7 on a shared VPS. Post-audit backtests show break-even — terminal-zone-only is the one sub-strategy with positive bias. **No live trades have been placed.** Wallet is funded ($6.03 USDC.e + ~5.37 POL) but only as a tip in the water.
 
-## How it works
+## What it does
 
-1. **Fetch** all active markets (~25,000+) from Polymarket's Gamma API
-2. **Group** markets by event — Polymarket splits multi-outcome events into separate binary YES/NO markets sharing the same event
-3. **Detect** arbitrage — for mutually exclusive events (`neg_risk=true`), the sum of YES prices should equal 1.0. Any deviation is guaranteed profit
-4. **Solve** optimal positions using LP (PuLP/CBC) with executable order book prices, correct neg_risk collateral, and all fees deducted
-5. **Execute** trades (paper or live) with dynamic bankroll management, exposure limits, and cooldowns
+For each active candle window:
 
-## Two pipeline modes
+1. **Subscribe** to 8-exchange spot WS feeds (Binance, Bybit, OKX, Coinbase, Bitget, HTX, Gate.io, Kraken) for the underlying asset (BTC primary; ETH/SOL alts).
+2. **Detect momentum** via `MomentumDetector`: z-score of the move from window-open against EWMA fast/slow realized vol, plus consistency.
+3. **Compute BS fair value** of the binary "above strike" using observed implied vol from Deribit + window time-to-expiry.
+4. **Compare to market** (top of book on the candle's YES/NO Polymarket tokens). Mispricing > threshold + zone-conditional confidence/edge gates → trade.
+5. **Hold to resolution** (window close), then mark won/lost vs our BTC tape AND cross-check against Polymarket's CCIX oracle.
 
-### REST Pipeline (polling)
-Scans all markets every 30 seconds. Simpler, good for getting started.
-```bash
-.venv/bin/python scripts/run_pipeline.py --mode paper --cycles 10 --interval 30
-```
+Zone gates split the window into **early / primary / late / terminal** bands with independent thresholds. The post-audit reality is that **only terminal-zone (last 5%) entries showed profit** in our backtests; the other zones are break-even or losing.
 
-### WebSocket Pipeline (event-driven) — recommended
-Subscribes to real-time price changes. Detects arbs within <1 second of a price move.
-```bash
-.venv/bin/python scripts/run_ws_pipeline.py --mode paper --duration 600
-```
-
-| | REST Pipeline | WebSocket Pipeline |
-|---|---|---|
-| Latency | ~200s per cycle | <1s reaction time |
-| Market coverage | 25,000+ per cycle | Top 100 arb candidates monitored |
-| Data freshness | Stale between cycles | Real-time order book updates |
-| Capital events | Polled | Instant resolution detection |
-| Best for | Scanning, backtesting | Live trading |
-
-## Quick start
-
-```bash
-# Setup
-cd PolyMomentum
-cp .env.example .env
-uv venv && uv pip install -e ".[dev]"
-
-# Scan for arbs right now (no API keys needed)
-.venv/bin/python scripts/scan_once.py --min-margin 0.02 --top 20
-
-# Paper trade with WebSocket (recommended)
-.venv/bin/python scripts/run_ws_pipeline.py --mode paper --duration 600
-
-# Paper trade with REST polling
-.venv/bin/python scripts/run_pipeline.py --mode paper --cycles 10
-
-# Backtest
-.venv/bin/python scripts/backtest.py collect --interval 300 --max 288
-.venv/bin/python scripts/backtest.py replay --snapshot-dir snapshots/
-
-# Run tests
-.venv/bin/pytest tests/ -v
-```
-
-## API keys and .env
-
-**Paper trading and scanning require NO API keys.** Market data is public.
-
-For live trading, see **[docs/SETUP_API_KEYS.md](docs/SETUP_API_KEYS.md)** or run:
-```bash
-.venv/bin/python scripts/derive_api_keys.py
-```
-
-### Configuration
-
-```env
-# Capital — set to 0 to auto-detect from wallet USDC.e balance
-BANKROLL_USD=0
-MAX_POSITION_PER_MARKET_USD=20.0  # cap per event (also scales to 20% of bankroll)
-KELLY_FRACTION=0.25               # Quarter Kelly (safest compounding)
-
-# Detection thresholds
-MIN_ARB_MARGIN=0.02               # 2%+ deviations only
-MIN_PROFIT_USD=0.10               # Skip trades under $0.10
-COOLDOWN_SECONDS=120
-SCAN_INTERVAL_SECONDS=30          # REST pipeline only
-```
-
-When `BANKROLL_USD=0`, the bot reads your wallet's USDC.e balance at startup and uses that as the initial bankroll. All limits scale dynamically:
-- **Max exposure**: 80% of effective bankroll
-- **Max per event**: 20% of effective bankroll (capped by `MAX_POSITION_PER_MARKET_USD`)
-- **Effective bankroll**: initial balance + realized P&L (compounds automatically)
-
-## Project structure
+## What's running
 
 ```
-src/polymomentum/
-├── config.py              # Settings from .env
-├── pipeline.py            # REST polling orchestrator
-├── pipeline_ws.py         # WebSocket event-driven orchestrator
-├── data/
-│   ├── client.py          # Polymarket Gamma + CLOB REST client
-│   ├── models.py          # Market, Outcome, OrderBook dataclasses
-│   └── websocket.py       # Real-time WebSocket client
-├── graph/
-│   ├── screener.py        # Rule-based dependency detection
-│   └── dependency.py      # NetworkX dependency graph
-├── arb/
-│   ├── detector.py        # Single + cross-market arb detection
-│   ├── polytope.py        # Marginal polytope constraints
-│   └── projection.py      # KL/Bregman projection
-├── solver/
-│   ├── linear.py          # Tier 1: LP solver (PuLP/CBC)
-│   └── frank_wolfe.py     # Tier 2: Frank-Wolfe + ILP oracle
-├── execution/
-│   ├── fees.py            # Live fee rates (API + fallback)
-│   ├── sizing.py          # Fractional Kelly position sizing
-│   ├── liquidity.py       # Order book depth & slippage
-│   └── executor.py        # Paper + live trade execution
-└── risk/
-    └── manager.py         # Dynamic bankroll, exposure, P&L
+VPS (193.24.234.202, alias `vps`):
+  /opt/polymomentum/current → releases/2026-04-25T110627Z
+  
+  systemd:
+    polymomentum-rust.service         (Rust latency engine, WS feeds, CLOB signing)
+    polymomentum-candle.service       (Python pipeline, --mode paper)
+    polymomentum-healthcheck.timer    (every 60s)
 
-scripts/
-├── scan_once.py           # One-shot arb scanner
-├── run_pipeline.py        # REST pipeline runner
-├── run_ws_pipeline.py     # WebSocket pipeline runner
-├── backtest.py            # Snapshot collector + replayer
-└── derive_api_keys.py     # Polymarket API key generator
+  Coexistence caps (multibot host shared with adgts + polyarbitrage):
+    CPUQuota=80%  MemoryMax=512M  TasksMax=256  per unit
 ```
 
-## Key concepts
+See [memory/project_state.md](https://github.com/s1avextra/PolyMomentum/blob/main/.claude/projects/-Users-ttoomm-Documents-PolyMomentum/memory/project_state.md) — wait, that's gitignored. The handoff doc lives at `~/.claude/projects/-Users-ttoomm-Documents-PolyMomentum/memory/project_state.md` on the operator's machine.
 
-### Cross-market arbitrage on neg_risk events
-
-Polymarket's binary markets are efficiently priced (YES + NO = 1.0). But multi-outcome events are split into separate markets that can drift:
-
-| Market | YES price |
-|--------|-----------|
-| "Will Candidate A win?" | 0.40 |
-| "Will Candidate B win?" | 0.35 |
-| "Will Candidate C win?" | 0.30 |
-| **Sum** | **1.05** |
-
-Since exactly one wins (confirmed by `neg_risk=true`), selling YES on all three pockets $0.05 per set.
-
-### Cost-aware solver
-
-Every trade accounts for:
-- **Order book executable prices** (best bid for selling, best ask for buying)
-- **Spread costs** — arbs that don't survive the bid-ask spread are rejected
-- **Trading fees** — live from Polymarket API, auto-updates when rates change
-- **Gas fees** — live from Polygon gas station + POL price
-- **Correct neg_risk collateral** — selling YES requires `(1-price)` per share, not flat $1
-
-### Dynamic bankroll
-
-The system tracks `effective_bankroll = initial + realized_pnl`. Profits compound automatically — bigger bankroll means bigger positions and faster growth. Losses shrink exposure to protect capital.
-
-### Capital turnover optimization
-
-Trades are scored by **profit per dollar per day**, not just total profit. Faster-resolving events compound bankroll growth because capital is freed sooner.
-
-### Fractional Kelly (0.25x)
-
-Position sizing uses quarter-Kelly. Full Kelly maximises growth but has 50% chance of 50% drawdown. At 0.25x Kelly, growth rate is ~94% of full Kelly but max drawdown drops to ~12%.
-
-### Early exit
-
-When an arb corrects (prices converge back to sum=1.0), all positions in that event are closed automatically to free capital for new opportunities. Without this, capital can be locked for months waiting for event resolution.
-
-### Portfolio-aware allocation
-
-If a new arb shares market outcomes with existing positions, its allocation is halved to prevent correlated risk concentration.
-
-### Crash recovery
-
-All state (positions, P&L, fees, cooldowns) is persisted to `logs/state.json` after every trade. On restart, state is restored automatically — no trades lost.
-
-### Live execution safety
-
-- Leg-by-leg with abort: if any leg fails to fill (95%+ required), all remaining orders are cancelled
-- Order ID validation: rejects trades if exchange doesn't return a valid order ID
-- Fill polling with timeout: 30s per leg, cancels on timeout
-- Input validation: config values, WebSocket data, API responses all validated
-
-## Testing
+## Operational commands
 
 ```bash
-.venv/bin/pytest tests/ -v   # 45 tests, ~2s
+# Health
+ssh vps 'systemctl is-active polymomentum-rust polymomentum-candle adgts polyarbitrage'
+
+# Live cycle log (cycle_ms, price_staleness_ms, top_skips, trade count)
+ssh vps 'journalctl -u polymomentum-candle -f -n 5 | grep candle.cycle'
+
+# Trade tape
+ssh vps 'journalctl -u polymomentum-candle | grep -E "candle.trade.paper|candle.resolved"'
+
+# Kill switch (halts trading within ~100ms)
+ssh vps 'touch /tmp/polymomentum/KILL'
+ssh vps 'rm /tmp/polymomentum/KILL && systemctl restart polymomentum-candle'
+
+# Deploy
+bash deploy/deploy.sh vps           # Python only (~10s)
+bash deploy/deploy.sh vps --rust    # also rebuild Rust binary (~2.5min)
+
+# Rollback
+ssh vps '/opt/polymomentum/current/deploy/rollback.sh'
 ```
 
-Covers: arb detection, polytope constraints, KL projection, LP solver, Kelly sizing, execution probability.
+## Replay-grade data collection
 
-## Recommended workflow
+Paper-mode design goal: paper run logs replayable through the backtest harness producing **identical PnL**, AND paper fills representative of live fills. As of `19b82b8`:
 
-1. **Scan** — `scan_once.py` to see current arb landscape
-2. **Paper trade (WS)** — `run_ws_pipeline.py --mode paper` for 1+ week
-3. **Backtest** — `backtest.py collect` then `replay` on historical data
-4. **Go live** — set up API keys ([docs/SETUP_API_KEYS.md](docs/SETUP_API_KEYS.md)), switch to `--mode live`
-5. **Scale** — increase `BANKROLL_USD` after consistent positive P&L
+- **Per-evaluation JSONL** (`logs/sessions/session_*.jsonl`) — `cat=signal type=evaluation` events fire on every contract evaluation (trade or skip), with full state: open price, current price, z-score, confidence, EWMA fast/slow vol, cross-asset boost, top of book, decision zone, fair value, edge, traded flag, skip reason + detail.
+- **Cycle latency** — `cycle_ms` + `price_staleness_ms` per cycle so we can calibrate the backtest's static-latency assumption.
+- **Polymarket oracle cross-check** — `cat=oracle type=resolution` events compare our BTC-tape resolution to Polymarket's actual settlement (their CCIX index). Disagreement = real strategy risk we now quantify.
+- **Persistent state** (`f61ff0a`): `logs/` and `data/` are symlinked to `/opt/polymomentum/{logs,data}` shared dirs, so SQLite + JSONL + CSV survive deploys.
+
+Validate a paper session against the backtest:
+```bash
+uv run python scripts/validate_paper_replay.py logs/sessions/session_*.jsonl
+```
+Exit 0 = clean, 1 = decision drift detected.
+
+## Critical files
+
+| | |
+|---|---|
+| Live entry | `scripts/run_production.py --mode paper\|live` |
+| Backtest harness | `scripts/run_strategy_harness.py` |
+| Replay validator | `scripts/validate_paper_replay.py` |
+| Live runtime | `src/polymomentum/crypto/candle_pipeline.py` |
+| Pure decision (live + backtest) | `src/polymomentum/crypto/decision.py` |
+| Momentum + EWMA vol | `src/polymomentum/crypto/momentum.py` |
+| BS pricer | `src/polymomentum/crypto/fair_value.py` |
+| Multi-exchange WS aggregator | `src/polymomentum/crypto/price_feed.py` |
+| Polymarket fee formula | `src/polymomentum/execution/fees.py` |
+| L2 backtest engine | `src/polymomentum/backtest/l2_replay.py` |
+| Rust latency engine | `rust_engine/src/main.rs`, `rust_engine/src/exchange.rs` |
+
+## Tests
+
+```bash
+uv sync --all-extras              # one-time install of dev + execution extras
+uv run pytest -q                  # 117 passed, 2 skipped
+cd rust_engine && cargo test      # 14 passed
+```
+
+## Multibot etiquette
+
+PolyMomentum shares the VPS with two other bots: **adgts** (XRP/USDT futures grid, port 9092) and **polyarbitrage** (port 127.0.0.1:9090). Don't touch their `/opt/<name>`, `/etc/<name>`, or systemd units. Coexistence caps applied via systemd drop-ins. Use `nice -n 10 cargo build --release` for Rust builds. See [docs/cross_bot_note_mexc_hardening.md](docs/cross_bot_note_mexc_hardening.md) for the cross-Claude coordination protocol.
+
+## Strategy reality check
+
+Post-audit (after fixing 4 lookahead/precision bugs): backtests show **break-even to losing** across baseline, ewma_15min, regime variants. The terminal-zone-only sub-strategy had +$7.66 on 13 trades in one window — promising but tiny sample. **Going live with capital today would be premature.** The current play is to collect 24h+ of replay-grade paper data, then iterate (entry-price filter, terminal-only deployment, more backtest windows) before flipping any live switch.
+
+---
+
+*Repository renamed from PolyCrossArb → PolyMomentum on 2026-04-13 when the cross-arb and weather strategies were deleted (-10,225 LOC).*
