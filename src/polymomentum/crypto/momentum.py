@@ -195,6 +195,18 @@ class MomentumDetector:
         """Get the opening price for a candle window."""
         return self._window_opens.get(contract_id)
 
+    def evict_stale_windows(self, active_contract_ids: set[str]) -> int:
+        """Drop window-open entries for contracts no longer in the active scan.
+
+        Called from the contract-refresh loop with the current contract set.
+        Without this, _window_opens grows forever (one entry per unique
+        contract_id ever seen). Returns the number of entries evicted.
+        """
+        stale = [cid for cid in self._window_opens if cid not in active_contract_ids]
+        for cid in stale:
+            del self._window_opens[cid]
+        return len(stale)
+
     def detect(
         self,
         contract_id: str,

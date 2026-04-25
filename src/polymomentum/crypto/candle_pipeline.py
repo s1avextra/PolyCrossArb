@@ -314,7 +314,25 @@ class CandlePipeline:
         self._contracts = await asyncio.to_thread(
             scan_candle_markets, markets, 1.0, 50,
         )
-        log.info("candle.scan", contracts=len(self._contracts))
+
+        # Trim per-contract state for windows that have resolved off-scan.
+        # _traded and each MomentumDetector._window_opens grow forever
+        # otherwise — bounded by total trade volume / unique contracts seen
+        # across the process lifetime. After 24h these are still small but
+        # eventually become a real footprint over weeks of uptime.
+        active_cids = {c.market.condition_id for c in self._contracts}
+        before_traded = len(self._traded)
+        self._traded &= active_cids
+        evicted_traded = before_traded - len(self._traded)
+
+        evicted_opens = 0
+        for det in self._momentum_detectors.values():
+            evicted_opens += det.evict_stale_windows(active_cids)
+
+        log.info("candle.scan",
+                 contracts=len(self._contracts),
+                 evicted_traded=evicted_traded,
+                 evicted_window_opens=evicted_opens)
 
     async def _paper_resolution_loop(self):
         """Resolve paper positions when their candle window expires.
@@ -850,8 +868,13 @@ class CandlePipeline:
                 # crashes between here and execute_single() leave a record.
                 eval_ts_ms = int(time.time() * 1000)
                 if isinstance(decision, SkipReason):
+                    # Aggregate by reason+zone only — the floating-point
+                    # detail ("0.10 < 0.55") is preserved on the
+                    # signal.evaluation JSONL event, but using it as a
+                    # dict key explodes cardinality (~50+ unique strings)
+                    # and clutters the top_skip_reasons cycle log.
                     self._monitor.record_signal_skip(
-                        cid, f"{decision.reason}_{decision.zone}_{decision.detail}"
+                        cid, f"{decision.reason}_{decision.zone}"
                     )
                     self._monitor.record_signal_evaluation(
                         contract_id=cid, asset=asset, timestamp_ms=eval_ts_ms,
