@@ -33,27 +33,96 @@ fn erf_abramowitz_stegun(x: f64) -> f64 {
     sign * y
 }
 
-/// Compute fair value of a binary "BTC > strike" contract
+/// Compute fair value of a binary "BTC > strike" contract.
 ///
-/// Returns probability [0.01, 0.99]
+/// Returns probability [0.01, 0.99]. Uses a 5% risk-free rate.
 pub fn binary_option_price(
     spot: f64,
     strike: f64,
     days_to_expiry: f64,
     volatility: f64,
 ) -> f64 {
-    if spot <= 0.0 || strike <= 0.0 || days_to_expiry <= 0.0 || volatility <= 0.0 {
+    binary_option_price_with_rate(spot, strike, days_to_expiry, volatility, 0.05)
+}
+
+/// Same as [`binary_option_price`] but with an explicit risk-free rate.
+pub fn binary_option_price_with_rate(
+    spot: f64,
+    strike: f64,
+    days_to_expiry: f64,
+    volatility: f64,
+    risk_free_rate: f64,
+) -> f64 {
+    if spot <= 0.0 || strike <= 0.0 || days_to_expiry <= 0.0 || volatility < 0.01 {
         return 0.5;
     }
 
     let t = days_to_expiry / 365.25;
-    let r = 0.05; // risk-free rate
     let sigma = volatility;
+    let r = risk_free_rate;
 
     let d2 = ((spot / strike).ln() + (r - 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
     let price = norm_cdf(d2);
 
     price.clamp(0.01, 0.99)
+}
+
+/// Detailed fair value result, mirrors Python's `FairValueResult`.
+#[derive(Debug, Clone, Copy)]
+pub struct FairValueResult {
+    pub fair_price: f64,
+    pub market_price: f64,
+    pub edge: f64,
+    pub edge_pct: f64,
+    pub d2: f64,
+    pub spot: f64,
+    pub strike: f64,
+    pub days_to_expiry: f64,
+    pub volatility: f64,
+}
+
+pub fn compute_fair_value(
+    spot: f64,
+    strike: f64,
+    days_to_expiry: f64,
+    volatility: f64,
+    market_price: f64,
+    risk_free_rate: f64,
+) -> FairValueResult {
+    if spot <= 0.0 || strike <= 0.0 || days_to_expiry <= 0.0 || volatility < 0.01 {
+        return FairValueResult {
+            fair_price: 0.5,
+            market_price,
+            edge: 0.0,
+            edge_pct: 0.0,
+            d2: 0.0,
+            spot,
+            strike,
+            days_to_expiry,
+            volatility,
+        };
+    }
+
+    let t = days_to_expiry / 365.25;
+    let sigma = volatility;
+    let r = risk_free_rate;
+    let d2 = ((spot / strike).ln() + (r - 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
+    let raw = norm_cdf(d2);
+    let fair_price = raw.clamp(0.01, 0.99);
+    let edge = fair_price - market_price;
+    let edge_pct = edge / market_price.max(0.01);
+
+    FairValueResult {
+        fair_price,
+        market_price,
+        edge,
+        edge_pct,
+        d2,
+        spot,
+        strike,
+        days_to_expiry,
+        volatility,
+    }
 }
 
 #[cfg(test)]

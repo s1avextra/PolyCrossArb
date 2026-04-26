@@ -1,0 +1,35 @@
+[Unit]
+Description=PolyMomentum Rust trading engine (paper/live)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymomentum
+WorkingDirectory=/opt/polymomentum
+EnvironmentFile=/etc/polymomentum/env
+Environment=RUST_LOG=info
+Environment=POLYMOMENTUM_DATA_DIR=/opt/polymomentum/data
+Environment=POLYMOMENTUM_LOGS_DIR=/opt/polymomentum/logs
+Environment=STATE_DB_PATH=/opt/polymomentum/logs/candle/state.db
+Environment=SESSION_LOG_DIR=/opt/polymomentum/logs/sessions
+Environment=KILL_SWITCH_PATH=/tmp/polymomentum/KILL
+ExecStart=/opt/polymomentum/polymomentum-engine live --mode paper
+ExecStop=/bin/kill -SIGTERM $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polymomentum /tmp/polymomentum
+
+[Install]
+WantedBy=multi-user.target

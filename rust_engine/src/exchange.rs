@@ -5,7 +5,7 @@
 //! to harden against MEXC-style quirks: idle disconnect at 60s, silent stalls
 //! after rapid reconnects, and TCP-reads-OK-but-no-frames behavior.
 
-use crate::PriceState;
+use crate::price_state::PriceState;
 use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
 use std::sync::Arc;

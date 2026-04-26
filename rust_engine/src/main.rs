@@ -1,622 +1,278 @@
-//! PolyMomentum Rust Latency Engine v0.2
+//! polymomentum-engine: unified Rust binary.
 //!
-//! Ultra-low-latency candle trading pipeline:
-//! 1. WebSocket price feeds from 4 exchanges (~100ms updates)
-//! 2. Polymarket contract prices from Python orchestrator (stdin)
-//! 3. Edge detection: our BS fair value vs stale MM price
-//! 4. Edge accumulation: scale into positions as edge grows
-//! 5. Trade signals output as JSON lines to stdout
-//! 6. Full latency instrumentation on stderr
+//! Subcommands:
+//!   live       — main runtime (paper/live)
+//!   harness    — backtest A/B harness
+//!   scan       — one-shot Gamma + scanner smoke test
+//!   wallet     — print wallet balances
+//!   ctf        — read CTF resolution for a condition_id
+//!   validate-replay <session.jsonl> — replay validator
 //!
-//! Protocol:
-//!   Python → stdin:  JSON lines with contract updates
-//!     {"type":"contracts", "data": [{contract_id, token_id, up_price, down_price, end_time_s, window_minutes}, ...]}
-//!     {"type":"config", "data": {min_btc_move, min_edge, ...}}
-//!   Rust → stdout:  JSON lines with trade signals (LatencySignal)
-//!   Rust → stderr:  Latency reports + diagnostics
+//! Environment-driven configuration (matches the Python `.env`).
 
 mod clob;
+mod config;
+mod data;
+mod debug;
+mod edge;
 mod exchange;
+mod execution;
 mod fair_value;
 mod ipc;
 mod latency;
-mod edge;
-mod debug;
+mod live;
+mod monitoring;
 mod polymarket_ws;
+mod price_state;
+mod risk;
 mod signing;
+mod strategy;
 
-use std::collections::HashMap;
-use std::io::BufRead;
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use clap::{Parser, Subcommand};
 
-pub use fair_value::norm_cdf;
+#[derive(Parser, Debug)]
+#[command(name = "polymomentum-engine", version, about = "PolyMomentum Rust trading engine")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 
-#[derive(Debug, Clone)]
-pub struct PriceState {
-    pub prices: HashMap<String, f64>,
-    pub last_update: Instant,
-    pub mid_price: f64,
-    pub spread: f64,
-    pub implied_vol: f64,
-    // Per-source timestamps for staleness tracking
-    pub source_timestamps: HashMap<String, Instant>,
-    // Multi-asset price tracking: "ETH" -> {source -> price}, "SOL" -> {source -> price}
-    pub alt_prices: HashMap<String, HashMap<String, f64>>,
-    pub alt_mid: HashMap<String, f64>,
-    pub alt_timestamps: HashMap<String, Instant>,
+    /// Override log level (e.g. info, debug, trace)
+    #[arg(long, env = "RUST_LOG", default_value = "info")]
+    log: String,
 }
 
-impl PriceState {
-    pub fn new() -> Self {
-        Self {
-            prices: HashMap::new(),
-            last_update: Instant::now(),
-            mid_price: 0.0,
-            spread: 0.0,
-            implied_vol: 0.50,
-            source_timestamps: HashMap::new(),
-            alt_prices: HashMap::new(),
-            alt_mid: HashMap::new(),
-            alt_timestamps: HashMap::new(),
-        }
-    }
-
-    pub fn update(&mut self, source: &str, price: f64) {
-        if price <= 0.0 { return; }
-        self.prices.insert(source.to_string(), price);
-        self.source_timestamps.insert(source.to_string(), Instant::now());
-        self.last_update = Instant::now();
-
-        // Filter stale sources (>10s old)
-        let now = Instant::now();
-        let live: Vec<f64> = self.prices.iter()
-            .filter(|(src, _)| {
-                self.source_timestamps.get(*src)
-                    .map(|t| now.duration_since(*t).as_secs() < 10)
-                    .unwrap_or(false)
-            })
-            .map(|(_, p)| *p)
-            .collect();
-
-        if !live.is_empty() {
-            self.mid_price = live.iter().sum::<f64>() / live.len() as f64;
-            let min = live.iter().cloned().fold(f64::MAX, f64::min);
-            let max = live.iter().cloned().fold(f64::MIN, f64::max);
-            self.spread = max - min;
-        }
-    }
-
-    /// Update price for an alt asset (ETH, SOL).
-    pub fn update_alt(&mut self, asset: &str, source: &str, price: f64) {
-        if price <= 0.0 { return; }
-        let key = format!("{}:{}", asset, source);
-        self.alt_timestamps.insert(key, Instant::now());
-
-        let sources = self.alt_prices.entry(asset.to_string()).or_default();
-        sources.insert(source.to_string(), price);
-
-        // Compute mid from live sources
-        let now = Instant::now();
-        let live: Vec<f64> = sources.iter()
-            .filter(|(src, _)| {
-                let key = format!("{}:{}", asset, src);
-                self.alt_timestamps.get(&key)
-                    .map(|t| now.duration_since(*t).as_secs() < 10)
-                    .unwrap_or(false)
-            })
-            .map(|(_, p)| *p)
-            .collect();
-
-        if !live.is_empty() {
-            self.alt_mid.insert(
-                asset.to_string(),
-                live.iter().sum::<f64>() / live.len() as f64,
-            );
-        }
-    }
-
-    pub fn n_live_sources(&self) -> usize {
-        let now = Instant::now();
-        self.source_timestamps.values()
-            .filter(|t| now.duration_since(**t).as_secs() < 10)
-            .count()
-    }
-}
-
-/// Contract info received from Python orchestrator
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ContractUpdate {
-    pub contract_id: String,
-    pub token_id: String,
-    pub up_price: f64,
-    pub down_price: f64,
-    pub end_time_s: f64,
-    pub window_minutes: f64,
-}
-
-/// Input message from Python
-#[derive(Debug, serde::Deserialize)]
-struct InputMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    data: serde_json::Value,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the candle trading runtime
+    Live {
+        /// Paper or live mode (live requires explicit confirmation flag)
+        #[arg(long, default_value = "paper")]
+        mode: String,
+        /// Allow live mode (default: paper-only safeguard).
+        #[arg(long)]
+        i_understand_live: bool,
+    },
+    /// Smoke-test scanner: fetch candle markets, print summary.
+    Scan {
+        #[arg(long, default_value_t = 2.0)]
+        max_hours: f64,
+        #[arg(long, default_value_t = 100.0)]
+        min_liquidity: f64,
+    },
+    /// Print wallet balances (USDC.e, native USDC, POL).
+    Wallet,
+    /// Read CTF resolution for a condition_id.
+    Ctf { condition_id: String },
+    /// Validate a paper session JSONL replays clean against the decision function.
+    ValidateReplay { path: String },
+    /// Run unit + integration tests embedded in the binary.
+    SelfTest,
 }
 
 #[tokio::main]
 async fn main() {
-    eprintln!("PolyMomentum Latency Engine v0.2.0");
-    eprintln!("Strategy: detect stale MM prices, accumulate edge, scale in");
+    let cli = Cli::parse();
+    init_tracing(&cli.log);
+    let settings = config::Settings::from_env();
 
-    let state = Arc::new(RwLock::new(PriceState::new()));
-    let monitor = Arc::new(RwLock::new(latency::LatencyMonitor::new()));
-
-    // Start exchange feeds with latency tracking
-    {
-        let (s, m) = (state.clone(), monitor.clone());
-        tokio::spawn(async move {
-            loop {
-                let t0 = Instant::now();
-                exchange::binance_feed(s.clone()).await;
-                // If we get here, connection dropped — reconnect
-                tokio::time::sleep(Duration::from_secs(3)).await;
+    match cli.command {
+        Command::Live { mode, i_understand_live } => {
+            if mode == "live" && !i_understand_live {
+                eprintln!("Refusing to run live mode without --i-understand-live (safety guard).");
+                std::process::exit(2);
             }
-        });
-    }
-    {
-        let s = state.clone();
-        tokio::spawn(async move {
-            loop {
-                exchange::bybit_feed(s.clone()).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        });
-    }
-    {
-        let s = state.clone();
-        tokio::spawn(async move {
-            loop {
-                exchange::okx_feed(s.clone()).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        });
-    }
-    // MEXC removed: reconnects every ~75s, causing latency spikes.
-    // 3 BTC sources (Binance, Bybit, OKX) + Deribit IV is sufficient.
-
-    // ETH + SOL price feeds (for cross-asset lead-lag)
-    {
-        let s = state.clone();
-        tokio::spawn(async move {
-            loop {
-                exchange::binance_alt_feed(s.clone()).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        });
-    }
-    {
-        let s = state.clone();
-        tokio::spawn(async move {
-            loop {
-                exchange::bybit_alt_feed(s.clone()).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        });
-    }
-
-    // Deribit IV loop
-    {
-        let s = state.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Some(iv) = exchange::fetch_deribit_iv().await {
-                    s.write().await.implied_vol = iv;
-                    eprintln!("IV: {:.1}%", iv * 100.0);
+            let m = match mode.as_str() {
+                "paper" => live::pipeline::Mode::Paper,
+                "live" => live::pipeline::Mode::Live,
+                other => {
+                    eprintln!("unknown mode: {other}");
+                    std::process::exit(2);
                 }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
-    }
-
-    // Wait for first price
-    loop {
-        if state.read().await.mid_price > 0.0 { break; }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    {
-        let ps = state.read().await;
-        eprintln!("Ready: BTC ${:.2}, {} sources, spread ${:.2}",
-            ps.mid_price, ps.n_live_sources(), ps.spread);
-    }
-
-    // CLOB client for direct order placement (hot path)
-    let clob_enabled = std::env::var("CLOB_DIRECT").unwrap_or_default() == "1";
-    let clob_client = if clob_enabled {
-        let base_url = std::env::var("POLY_BASE_URL")
-            .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
-        let api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
-        let api_secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
-        let api_passphrase = std::env::var("POLY_API_PASSPHRASE").unwrap_or_default();
-        if api_key.is_empty() {
-            eprintln!("CLOB_DIRECT=1 but POLY_API_KEY not set — falling back to signal-only mode");
-            None
-        } else {
-            let client = clob::create_shared_client(&base_url, &api_key, &api_secret, &api_passphrase);
-            // Set signing key for EIP-712 order signing
-            if let Ok(pk) = std::env::var("PRIVATE_KEY") {
-                client.write().await.set_signing_key(&pk);
-            } else {
-                eprintln!("Warning: PRIVATE_KEY not set — orders will fail EIP-712 signing");
-            }
-            // Pre-warm connection pool
-            client.write().await.warm_connection().await;
-            eprintln!("CLOB direct order placement ENABLED (EIP-712 signed, 0% maker fees)");
-            Some(client)
-        }
-    } else {
-        eprintln!("CLOB direct placement disabled (set CLOB_DIRECT=1 to enable)");
-        None
-    };
-
-    // Polymarket L2 book feed — real-time MM prices (replaces 30s-stale snapshots)
-    let book_state = polymarket_ws::new_shared_book();
-    let tracked_tokens: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
-    {
-        let bs = book_state.clone();
-        let tt = tracked_tokens.clone();
-        tokio::spawn(async move {
-            polymarket_ws::polymarket_book_feed(bs, tt).await;
-        });
-    }
-
-    // Edge accumulator with default config
-    let mut accumulator = edge::EdgeAccumulator::new(edge::EdgeConfig::default());
-
-    // Debug mode
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
-    let mut debug_stats = debug::DebugStats::new();
-    let mut btc_tracker = debug::BtcTracker::new();
-    let debug_start = Instant::now();
-    if debug_mode {
-        eprintln!("*** DEBUG MODE ENABLED — full diagnostics every 60s ***");
-    }
-
-    // Contract state (updated from stdin or IPC)
-    let mut contracts: Vec<ContractUpdate> = Vec::new();
-
-    // Read stdin in a background thread (non-blocking, kept for backward compat)
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            if let Ok(line) = line {
-                if tx.blocking_send(line).is_err() { break; }
-            }
-        }
-    });
-
-    // IPC: UDS server runs alongside stdin. Python can connect via either.
-    let (ipc_in_tx, mut ipc_in_rx) = tokio::sync::mpsc::channel::<ipc::InboundMessage>(100);
-    let (ipc_out_tx, ipc_out_rx) = tokio::sync::mpsc::channel::<ipc::OutboundMessage>(100);
-    let ipc_socket = std::env::var("IPC_SOCKET_PATH")
-        .unwrap_or_else(|_| ipc::DEFAULT_SOCKET_PATH.to_string());
-    {
-        let path = ipc_socket.clone();
-        tokio::spawn(async move {
-            ipc::serve_connection(&path, ipc_in_tx, ipc_out_rx).await;
-        });
-    }
-
-    eprintln!("Listening for contracts on stdin + IPC ({})...", ipc_socket);
-
-    // ── Event-driven main loop ──────────────────────────────────
-    // Instead of polling at 50ms (20Hz), we wake on:
-    //   1. Price state change (WS tick from any exchange)
-    //   2. stdin/IPC message (contract update from Python)
-    //   3. Timer fallback every 200ms (housekeeping)
-    //
-    // This eliminates the 25ms average polling latency. On a Dublin
-    // VPS, the WS tick-to-evaluation path is now <1ms.
-    let (tick_tx, mut tick_rx) = tokio::sync::mpsc::channel::<()>(64);
-    // Give the price state a notifier so WS feeds wake the main loop
-    {
-        let tx = tick_tx.clone();
-        let s = state.clone();
-        tokio::spawn(async move {
-            let mut last_price = 0.0_f64;
-            loop {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                let current = s.read().await.mid_price;
-                if (current - last_price).abs() > 0.01 {
-                    last_price = current;
-                    let _ = tx.try_send(());
-                }
-            }
-        });
-    }
-
-    let mut cycle: u64 = 0;
-    let report_interval_s = 30.0_f64;
-    let cleanup_interval_s = 5.0_f64;
-    let mut last_report = Instant::now();
-    let mut last_cleanup = Instant::now();
-    let mut fallback_timer = tokio::time::interval(Duration::from_millis(200));
-
-    let mut ipc_shutdown = false;
-
-    loop {
-        if ipc_shutdown { break; }
-
-        // Wait for any event: price tick, IPC message, or 200ms fallback
-        tokio::select! {
-            _ = tick_rx.recv() => {}
-            _ = fallback_timer.tick() => {}
-        }
-
-        cycle += 1;
-        let tick_start = Instant::now();
-
-        // Check for IPC updates (non-blocking)
-        while let Ok(msg) = ipc_in_rx.try_recv() {
-            match msg {
-                ipc::InboundMessage::ContractUpdate { data } => {
-                    contracts = data.into_iter().map(|d| ContractUpdate {
-                        contract_id: d.contract_id,
-                        token_id: d.token_id,
-                        up_price: d.up_price,
-                        down_price: d.down_price,
-                        end_time_s: d.end_time_s,
-                        window_minutes: d.window_minutes,
-                    }).collect();
-                    // Sync Polymarket WS subscriptions
-                    let ids: Vec<String> = contracts.iter().map(|c| c.token_id.clone()).collect();
-                    *tracked_tokens.write().await = ids;
-                    eprintln!("IPC: Updated {} contracts", contracts.len());
-                }
-                ipc::InboundMessage::ConfigUpdate { data } => {
-                    if let Some(bankroll) = data.get("bankroll_usd").and_then(|v| v.as_f64()) {
-                        let old = accumulator.config.bankroll_usd;
-                        accumulator.config.bankroll_usd = bankroll;
-                        eprintln!("IPC: Bankroll ${:.2} → ${:.2}", old, bankroll);
-                    } else if let Ok(cfg) = serde_json::from_value::<edge::EdgeConfig>(data) {
-                        eprintln!("IPC: Config updated");
-                        accumulator.config = cfg;
-                    }
-                }
-                ipc::InboundMessage::RiskUpdate { available_capital } => {
-                    let old = accumulator.config.bankroll_usd;
-                    accumulator.config.bankroll_usd = available_capital;
-                    eprintln!("IPC: Capital ${:.2} → ${:.2}", old, available_capital);
-                }
-                ipc::InboundMessage::Shutdown => {
-                    eprintln!("IPC: Shutdown requested");
-                    ipc_shutdown = true;
-                }
-            }
-        }
-
-        // Check for stdin updates (backward compat, non-blocking)
-        while let Ok(line) = rx.try_recv() {
-            if let Ok(msg) = serde_json::from_str::<InputMessage>(&line) {
-                match msg.msg_type.as_str() {
-                    "contracts" => {
-                        if let Ok(c) = serde_json::from_value::<Vec<ContractUpdate>>(msg.data) {
-                            // Sync Polymarket WS subscriptions
-                            let ids: Vec<String> = c.iter().map(|x| x.token_id.clone()).collect();
-                            *tracked_tokens.write().await = ids;
-                            contracts = c;
-                            eprintln!("Updated: {} contracts", contracts.len());
-                        }
-                    }
-                    "config" => {
-                        if let Some(bankroll) = msg.data.get("bankroll_usd").and_then(|v| v.as_f64()) {
-                            let old = accumulator.config.bankroll_usd;
-                            accumulator.config.bankroll_usd = bankroll;
-                            eprintln!("Bankroll: ${:.2} → ${:.2} (locked=${:.2} avail=${:.2})",
-                                old, bankroll, accumulator.capital_locked, accumulator.available_capital());
-                        } else if let Ok(cfg) = serde_json::from_value::<edge::EdgeConfig>(msg.data) {
-                            eprintln!("Config updated: min_move=${} min_edge={} entries={}",
-                                cfg.min_btc_move, cfg.min_edge, cfg.max_entries_per_window);
-                            accumulator.config = cfg;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Read price state
-        let agg_start = Instant::now();
-        let ps = state.read().await.clone();
-        let btc = ps.mid_price;
-        let vol = ps.implied_vol;
-        let n_sources = ps.n_live_sources();
-        let spread = ps.spread;
-        let agg_ns = agg_start.elapsed().as_nanos() as u64;
-        monitor.write().await.record("price_aggregation", agg_ns);
-
-        if btc <= 0.0 || contracts.is_empty() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-
-        let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-
-        // Record BTC for momentum lookback (reversal filter)
-        accumulator.record_btc(now_s, btc);
-
-        // Track BTC for debug
-        if debug_mode {
-            btc_tracker.record(now_s, btc);
-            debug_stats.tick_count += 1;
-            // Record BTC moves every second (not every tick)
-            if cycle % 20 == 0 {
-                debug_stats.btc_moves_5s.push(btc_tracker.move_over(5.0).abs());
-                debug_stats.btc_moves_15s.push(btc_tracker.move_over(15.0).abs());
-            }
-        }
-
-        // Evaluate every contract
-        let signal_start = Instant::now();
-        let mut tick_signals = 0_usize;
-
-        // Snapshot book state once per tick (avoid holding lock per contract)
-        let books_snapshot = book_state.read().await.clone();
-
-        for c in &contracts {
-            let minutes_remaining = (c.end_time_s - now_s) / 60.0;
-            if minutes_remaining <= 0.0 { continue; }
-
-            // Use real-time WS price when available, fall back to contract snapshot
-            let (up_price, down_price) = if let Some(book) = books_snapshot.get(&c.token_id) {
-                let age_s = (now_s * 1_000_000.0 - book.last_update_us as f64) / 1_000_000.0;
-                if age_s < 30.0 && book.mid > 0.0 {
-                    // Fresh WS data — use mid for up, infer down
-                    (book.mid, 1.0 - book.mid)
-                } else {
-                    (c.up_price, c.down_price)
-                }
-            } else {
-                (c.up_price, c.down_price)
             };
-
-            // Track MM staleness (using potentially-fresher price)
-            {
-                let mut mon = monitor.write().await;
-                mon.record_mm_price(&c.contract_id, up_price);
-            }
-            let mm_stale_s = monitor.read().await.mm_staleness_s(&c.contract_id);
-
-            let tick_ns = tick_start.elapsed().as_nanos() as u64;
-
-            if debug_mode {
-                debug_stats.total_contracts_evaluated += 1;
-            }
-
-            let ds = if debug_mode { Some(&mut debug_stats) } else { None };
-
-            if let Some(signal) = accumulator.evaluate(
-                &c.contract_id,
-                &c.token_id,
-                up_price,
-                down_price,
-                btc,
-                c.end_time_s,
-                c.window_minutes,
-                minutes_remaining,
-                mm_stale_s,
-                vol,
-                n_sources,
-                spread,
-                tick_ns,
-                ds,
-            ) {
-                // Output signal as JSON line to stdout (backward compat)
-                if let Ok(json) = serde_json::to_string(&signal) {
-                    println!("{}", json);
+            let pipeline = live::pipeline::Pipeline::new(settings.clone(), m).await;
+            match pipeline {
+                Ok(p) => {
+                    install_signal_handlers(p.handles().stop.clone());
+                    if let Err(e) = p.run().await {
+                        tracing::error!(error = %e, "pipeline exited with error");
+                        std::process::exit(1);
+                    }
                 }
-
-                // Send signal via IPC (if Python is connected)
-                let _ = ipc_out_tx.try_send(ipc::OutboundMessage::TradeSignal {
-                    contract_id: signal.contract_id.clone(),
-                    token_id: signal.token_id.clone(),
-                    direction: signal.direction.clone(),
-                    edge: signal.edge,
-                    fair_value: signal.fair_value,
-                    mm_price: signal.mm_price,
-                    size_usd: signal.size_usd,
-                });
-
-                // Direct CLOB order placement (hot path — bypasses Python)
-                if let Some(ref clob) = clob_client {
-                    let clob = clob.clone();
-                    let sig = signal.clone();
-                    tokio::spawn(async move {
-                        let tick = 0.01_f64;
-                        let price = (sig.mm_price / tick).round() * tick;
-                        let size = (sig.size_usd / price).round().max(1.0);
-
-                        let result = if sig.order_type == "taker_fok" {
-                            // Terminal zone: cross immediately (FOK), pay 2% fee
-                            clob.write().await.place_taker_order(
-                                &sig.token_id, price, size, "BUY", false,
-                            ).await
-                        } else {
-                            // Normal zone: post maker (GTC, 0% fee)
-                            let maker_result = clob.write().await.place_maker_order(
-                                &sig.token_id, price, size, "BUY", false,
-                            ).await;
-                            // If maker fails (rejected, price moved), fallback to taker
-                            if maker_result.is_err() {
-                                eprintln!("CLOB maker failed, taker fallback");
-                                clob.write().await.place_taker_order(
-                                    &sig.token_id, price, size, "BUY", false,
-                                ).await
-                            } else {
-                                maker_result
-                            }
-                        };
-
-                        match result {
-                            Ok(oid) => eprintln!("CLOB {} OK: {} edge={:.1}% id={}",
-                                sig.order_type, sig.direction, sig.edge * 100.0,
-                                &oid[..16.min(oid.len())]),
-                            Err(e) => eprintln!("CLOB {} FAIL: {}",
-                                sig.order_type, &e[..80.min(e.len())]),
-                        }
-                    });
-                }
-
-                tick_signals += 1;
-                if debug_mode {
-                    debug_stats.signals_emitted += 1;
+                Err(e) => {
+                    eprintln!("pipeline init failed: {e}");
+                    std::process::exit(1);
                 }
             }
         }
-        let signal_ns = signal_start.elapsed().as_nanos() as u64;
-        {
-            let mut mon = monitor.write().await;
-            mon.record("signal_generation", signal_ns);
-            mon.record("tick_to_signal", tick_start.elapsed().as_nanos() as u64);
+        Command::Scan { max_hours, min_liquidity } => {
+            cmd_scan(&settings, max_hours, min_liquidity).await;
         }
-
-        // Cleanup expired positions (every 5s)
-        if last_cleanup.elapsed().as_secs_f64() >= cleanup_interval_s {
-            accumulator.cleanup_expired(now_s);
-            last_cleanup = Instant::now();
+        Command::Wallet => cmd_wallet(&settings).await,
+        Command::Ctf { condition_id } => cmd_ctf(&settings, &condition_id).await,
+        Command::ValidateReplay { path } => cmd_validate_replay(&path).await,
+        Command::SelfTest => {
+            println!("self-test: this binary's tests run via `cargo test`. ok.");
         }
+    }
+}
 
-        // Periodic latency report (every 30s)
-        if last_report.elapsed().as_secs_f64() >= report_interval_s {
-            let mon = monitor.read().await;
-            eprintln!("{}", mon.report());
-            eprintln!(
-                "  positions={} signals={} btc=${:.0} sources={} spread=${:.2} vol={:.1}% locked=${:.2} avail=${:.2}",
-                accumulator.positions.len(),
-                accumulator.signal_count,
-                btc, n_sources, spread, vol * 100.0,
-                accumulator.capital_locked,
-                accumulator.available_capital(),
-            );
-            for (cid, pos) in &accumulator.positions {
-                eprintln!(
-                    "  POS {}: {} entries=${:.2} avg_entry={:.3} avg_edge={:.1}% age={:.0}s",
-                    &cid[..16.min(cid.len())], pos.direction, pos.total_size_usd,
-                    pos.avg_entry_price, pos.avg_edge() * 100.0, pos.time_in_position_s(),
+fn install_signal_handlers(stop: std::sync::Arc<tokio::sync::Notify>) {
+    tokio::spawn(async move {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM");
+        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("install SIGINT");
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM received, shutting down"),
+            _ = int.recv() => tracing::info!("SIGINT received, shutting down"),
+        }
+        stop.notify_one();
+    });
+}
+
+fn init_tracing(level: &str) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}
+
+async fn cmd_scan(s: &config::Settings, max_hours: f64, min_liquidity: f64) {
+    let client = data::gamma::GammaClient::new(&s.poly_gamma_url, &s.poly_base_url);
+    match client.fetch_markets_by_end_date(max_hours, min_liquidity).await {
+        Ok(markets) => {
+            let contracts =
+                data::scanner::scan_candle_markets(&markets, max_hours, min_liquidity);
+            println!("markets={} candle_contracts={}", markets.len(), contracts.len());
+            for c in contracts.iter().take(20) {
+                println!(
+                    "  {asset:5} {hours:5.2}h {q}",
+                    asset = c.asset,
+                    hours = c.hours_left,
+                    q = c.market.question,
                 );
             }
-            last_report = Instant::now();
         }
-
-        // Debug report every 60s
-        if debug_mode && last_report.elapsed().as_secs_f64() >= 60.0 {
-            let elapsed = debug_start.elapsed().as_secs_f64();
-            eprintln!("{}", debug_stats.report(elapsed));
-            debug_stats.reset();
+        Err(e) => {
+            eprintln!("scan failed: {e}");
+            std::process::exit(1);
         }
-
-        // No sleep — loop returns to tokio::select! which blocks
-        // until next WS tick, stdin message, or 200ms fallback.
     }
+}
+
+async fn cmd_wallet(s: &config::Settings) {
+    if s.private_key.is_empty() {
+        eprintln!("PRIVATE_KEY not set");
+        std::process::exit(1);
+    }
+    match data::wallet::WalletReader::new(&s.polygon_rpc_url, &s.private_key) {
+        Ok(reader) => match reader.fetch_balances().await {
+            Ok(b) => {
+                println!("address      {}", b.address);
+                println!("usdc_e       ${:.2}", b.usdc_e);
+                println!("usdc_native  ${:.2}", b.usdc_native);
+                println!("total_usdc   ${:.2}", b.total_usdc);
+                println!("pol          {:.4}", b.pol);
+            }
+            Err(e) => {
+                eprintln!("wallet fetch failed: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("wallet init failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_ctf(s: &config::Settings, condition_id: &str) {
+    let r = data::ctf::CtfReader::new(&s.polygon_rpc_url);
+    match r.get_resolution(condition_id).await {
+        Ok((res, [n0, n1])) => {
+            println!("resolution    {}", res.as_str());
+            println!("payout_num0   {}", n0);
+            println!("payout_num1   {}", n1);
+        }
+        Err(e) => {
+            eprintln!("ctf read failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_validate_replay(path: &str) {
+    use std::io::BufRead;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("open {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let reader = std::io::BufReader::new(f);
+    let mut total = 0u64;
+    let mut mismatches = 0u64;
+    for line in reader.lines().map_while(|l| l.ok()) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if v.get("cat").and_then(|x| x.as_str()) != Some("signal") {
+            continue;
+        }
+        if v.get("type").and_then(|x| x.as_str()) != Some("evaluation") {
+            continue;
+        }
+        total += 1;
+
+        // Build inputs
+        let signal = strategy::momentum::MomentumSignal {
+            direction: v.get("dir").and_then(|x| x.as_str()).unwrap_or("up").to_string(),
+            confidence: f64opt(&v, "conf").unwrap_or(0.0),
+            price_change: f64opt(&v, "chg").unwrap_or(0.0),
+            price_change_pct: f64opt(&v, "chg_pct").unwrap_or(0.0),
+            consistency: f64opt(&v, "cons").unwrap_or(0.0),
+            minutes_elapsed: f64opt(&v, "elapsed_min").unwrap_or(0.0),
+            minutes_remaining: f64opt(&v, "remaining_min").unwrap_or(0.0),
+            current_price: f64opt(&v, "px").unwrap_or(0.0),
+            open_price: f64opt(&v, "open").unwrap_or(0.0),
+            z_score: f64opt(&v, "z").unwrap_or(0.0),
+            reversion_count: 0,
+        };
+        let cfg = strategy::decision::ZoneConfig::default();
+        let res = strategy::decision::decide_candle_trade(
+            &signal,
+            signal.minutes_elapsed,
+            signal.minutes_remaining,
+            signal.minutes_elapsed + signal.minutes_remaining,
+            f64opt(&v, "up_price").unwrap_or(0.5),
+            f64opt(&v, "down_price").unwrap_or(0.5),
+            signal.current_price,
+            signal.open_price,
+            f64opt(&v, "implied_vol").unwrap_or(0.5),
+            strategy::decision::DEFAULT_MIN_CONFIDENCE,
+            strategy::decision::DEFAULT_MIN_EDGE,
+            true,
+            &cfg,
+            f64opt(&v, "cross_boost").unwrap_or(0.0),
+        );
+        let traded = matches!(res, strategy::decision::DecisionResult::Trade(_));
+        let logged_traded = v.get("traded").and_then(|x| x.as_bool()).unwrap_or(false);
+        if traded != logged_traded {
+            mismatches += 1;
+        }
+    }
+    let mismatch_pct = if total > 0 {
+        100.0 * mismatches as f64 / total as f64
+    } else {
+        0.0
+    };
+    println!("validate-replay: total={total} mismatches={mismatches} ({mismatch_pct:.2}%)");
+    if mismatches > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn f64opt(v: &serde_json::Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(|x| x.as_f64())
 }
