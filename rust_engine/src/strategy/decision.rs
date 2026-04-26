@@ -46,7 +46,7 @@ impl SkipReason {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ZoneConfig {
     pub early_min_confidence: f64,
     pub early_min_z: f64,

@@ -119,7 +119,7 @@ impl TokenBook {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BacktestOrder {
     pub timestamp_s: f64,
     pub condition_id: String, // for resolver linkage
@@ -132,7 +132,7 @@ pub struct BacktestOrder {
     pub maker_fee_rate: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BacktestFill {
     pub order: BacktestOrder,
     pub fill_timestamp_s: f64,

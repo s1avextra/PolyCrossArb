@@ -141,6 +141,18 @@ enum Command {
         /// (e.g. 1) per CLAUDE.md rule 5; full N=num_cpus on a dev box.
         #[arg(long, default_value_t = 0)]
         threads: usize,
+        /// Pause/resume checkpoint dir. Per-hour `<hour>.json` files are
+        /// written after each hour completes; touch `<dir>/PAUSE` (or send
+        /// SIGINT) for a clean exit between hours. Re-run with the same
+        /// `--checkpoint` to resume; pass `--resume` to acknowledge the
+        /// existing state.
+        #[arg(long)]
+        checkpoint: Option<String>,
+        /// Acknowledge an existing checkpoint dir and continue. Without
+        /// this flag, a non-empty checkpoint dir aborts the run to avoid
+        /// silently mixing two runs' results.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
     },
     /// Run the full L2-backtest harness over PMXT v2 archives. Loads candle
     /// markets from Gamma, downloads/streams the requested UTC hours,
@@ -258,6 +270,8 @@ async fn main() {
             also_maker,
             top,
             threads,
+            checkpoint,
+            resume,
         } => {
             let conf = parse_csv_floats(&conf);
             let zs = parse_csv_floats(&z);
@@ -278,6 +292,8 @@ async fn main() {
                 also_maker,
                 top,
                 threads,
+                checkpoint.as_deref(),
+                resume,
             ).await;
         }
         Command::Harness {
@@ -654,6 +670,8 @@ async fn cmd_harness_sweep(
     also_maker: bool,
     top: usize,
     threads: usize,
+    checkpoint: Option<&str>,
+    resume: bool,
 ) {
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
@@ -801,6 +819,55 @@ async fn cmd_harness_sweep(
             if p.exists() { Some(backtest::distill::SHARED_CACHE_DIR.to_string()) } else { None }
         })
         .map(std::path::PathBuf::from);
+    // Checkpoint setup. If --checkpoint <dir> is set:
+    //   - Existing dir + non-empty + no --resume → bail (avoid mixing runs).
+    //   - Existing dir + empty OR --resume passed → use it.
+    //   - Missing dir → create it.
+    // SIGINT handler sets `stop_flag` so the harness exits between hours.
+    let checkpoint_dir = if let Some(p) = checkpoint {
+        let path = std::path::PathBuf::from(p);
+        if path.is_dir() {
+            let has_state = std::fs::read_dir(&path)
+                .map(|it| {
+                    it.flatten().any(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .ends_with(".json")
+                    })
+                })
+                .unwrap_or(false);
+            if has_state && !resume {
+                eprintln!(
+                    "checkpoint dir {} contains existing state; pass --resume to continue, \
+                     or pick a fresh dir to start over.",
+                    path.display(),
+                );
+                std::process::exit(2);
+            }
+        } else if path.exists() {
+            eprintln!("--checkpoint {} exists but isn't a directory", path.display());
+            std::process::exit(2);
+        }
+        Some(path)
+    } else {
+        None
+    };
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let f = stop_flag.clone();
+        tokio::spawn(async move {
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM");
+            let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("install SIGINT");
+            tokio::select! {
+                _ = term.recv() => tracing::warn!("SIGTERM received — sweep will pause after current hour"),
+                _ = int.recv() => tracing::warn!("SIGINT received — sweep will pause after current hour"),
+            }
+            f.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
     let cfg = backtest::harness::HarnessConfig {
         hours,
         universe,
@@ -810,9 +877,18 @@ async fn cmd_harness_sweep(
         latency: backtest::l2_replay::StaticLatencyConfig { insert_ms: latency_ms },
         shared_distilled_dir: shared_dir,
         threads: if threads == 0 { None } else { Some(threads) },
+        checkpoint_dir: checkpoint_dir.clone(),
+        stop_flag: Some(stop_flag.clone()),
     };
 
     println!("\nRunning sweep over {} variants × {} hours…\n", variants.len(), cfg.hours.len());
+    if let Some(d) = &checkpoint_dir {
+        println!(
+            "Checkpoint: {} (touch {}/PAUSE or send SIGINT to pause cleanly between hours)\n",
+            d.display(),
+            d.display(),
+        );
+    }
     match backtest::harness::run_harness(&cfg, &variants).await {
         Ok(runs) => {
             // Sort by PnL descending; trim to top N.
@@ -1041,6 +1117,10 @@ async fn cmd_harness(
         latency: backtest::l2_replay::StaticLatencyConfig { insert_ms: latency_ms },
         shared_distilled_dir: shared_dir,
         threads: if threads == 0 { None } else { Some(threads) },
+        // The default-variants harness is fast; checkpointing is exposed only
+        // on `harness-sweep`. Setting these to None here is intentional.
+        checkpoint_dir: None,
+        stop_flag: None,
     };
 
     let variants = backtest::strategies::default_variants();

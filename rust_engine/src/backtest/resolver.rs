@@ -10,7 +10,7 @@ use crate::backtest::btc_history::BTCHistory;
 use crate::backtest::l2_replay::BacktestFill;
 use crate::strategy::decision::CandleDecision;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedTrade {
     pub fill: BacktestFill,
     pub decision: CandleDecision,
@@ -30,7 +30,7 @@ impl ResolvedTrade {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BacktestResults {
     pub trades: Vec<ResolvedTrade>,
     pub unresolved_fills: Vec<BacktestFill>,

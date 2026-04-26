@@ -11,10 +11,11 @@
 //! [`render_table`].
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 
@@ -297,7 +298,7 @@ impl Strategy for CandleBacktestStrategy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HarnessRun {
     pub variant: StrategyVariant,
     pub results: BacktestResults,
@@ -320,6 +321,19 @@ pub struct HarnessConfig {
     /// pre-rayon behavior bit-for-bit). `Some(n>1)` → cap at `n`.
     /// Honors `RAYON_NUM_THREADS` env var when this is `None`.
     pub threads: Option<usize>,
+    /// Optional pause/resume checkpoint dir. When set:
+    ///   - Existing `<dir>/<hour>.json` files are loaded into the running
+    ///     accumulator and those hours are SKIPPED in this invocation.
+    ///   - After each hour completes, its results are written atomically
+    ///     to `<dir>/<hour>.json` (tmp + rename).
+    ///   - Before starting each hour, the harness checks for `<dir>/PAUSE`.
+    ///     If present, it stops cleanly after writing the previous hour's
+    ///     checkpoint and returns the partial results.
+    pub checkpoint_dir: Option<PathBuf>,
+    /// External stop flag (SIGINT/SIGTERM). Same effect as `<dir>/PAUSE`:
+    /// checked between hours; on set, the harness returns whatever it has
+    /// so far. Persists checkpoints first if `checkpoint_dir` is set.
+    pub stop_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Run every variant over the requested hours. Streams one hour at a time
@@ -333,6 +347,12 @@ pub struct HarnessConfig {
 /// independent of thread count. Output `runs` Vec is in the same order as
 /// the input `variants` Vec regardless of thread count (rayon's
 /// `par_iter().map().collect()` preserves source order).
+///
+/// Pause/resume: when `cfg.checkpoint_dir` is set, per-hour result files
+/// are loaded on entry (skipping those hours) and written atomically as
+/// each hour completes. A `<dir>/PAUSE` sentinel file or a triggered
+/// `cfg.stop_flag` causes a clean exit between hours; partial results
+/// returned cover hours processed so far (including any loaded from disk).
 pub async fn run_harness(
     cfg: &HarnessConfig,
     variants: &[StrategyVariant],
@@ -358,19 +378,63 @@ pub async fn run_harness(
         .as_ref()
         .map(|p| p.current_num_threads())
         .unwrap_or_else(rayon::current_num_threads);
-    tracing::info!(
-        variants = variants.len(),
-        threads = effective_threads,
-        hours = cfg.hours.len(),
-        "harness starting parallel variant fan-out",
-    );
 
     // Per-variant accumulator (merged sequentially after each hour's parallel
     // block). Index-aligned with `variants`.
     let mut variant_state: Vec<BacktestResults> =
         (0..variants.len()).map(|_| BacktestResults::default()).collect();
 
-    for &h in &cfg.hours {
+    // Load any existing per-hour checkpoints. Hours found on disk skip the
+    // replay; their per-variant results are merged into `variant_state`.
+    let mut hours_done: HashSet<DateTime<Utc>> = HashSet::new();
+    if let Some(dir) = &cfg.checkpoint_dir {
+        std::fs::create_dir_all(dir).with_context(|| format!("create checkpoint dir {}", dir.display()))?;
+        let loaded = load_existing_checkpoints(dir, variants)?;
+        for (h, per_variant) in loaded {
+            for (acc, hour_res) in variant_state.iter_mut().zip(per_variant) {
+                acc.trades.extend(hour_res.trades);
+                acc.unresolved_fills.extend(hour_res.unresolved_fills);
+            }
+            hours_done.insert(h);
+        }
+        if !hours_done.is_empty() {
+            tracing::info!(
+                resumed = hours_done.len(),
+                dir = %dir.display(),
+                "resumed from checkpoint",
+            );
+        }
+    }
+
+    let total_hours = cfg.hours.len();
+    let already = hours_done.len();
+    tracing::info!(
+        variants = variants.len(),
+        threads = effective_threads,
+        hours = total_hours,
+        already_done = already,
+        remaining = total_hours.saturating_sub(already),
+        "harness starting parallel variant fan-out",
+    );
+
+    let mut paused_at: Option<DateTime<Utc>> = None;
+    for (i, &h) in cfg.hours.iter().enumerate() {
+        // Pre-hour pause check: PAUSE sentinel OR stop_flag set.
+        if should_pause(cfg) {
+            paused_at = Some(h);
+            tracing::warn!(
+                hour = %h,
+                completed = i,
+                remaining = total_hours - i,
+                "pause requested — exiting cleanly between hours",
+            );
+            break;
+        }
+        if hours_done.contains(&h) {
+            tracing::info!(hour = %h, "skipped (checkpoint exists)");
+            continue;
+        }
+
         loader.download_hour(h, false).await?;
         let load_t0 = std::time::Instant::now();
 
@@ -412,10 +476,6 @@ pub async fn run_harness(
             "L2 events loaded",
         );
 
-        // Run every variant against this hour's events in parallel. The closure
-        // captures &cfg / &windows by shared reference (rayon guarantees the
-        // borrow outlives the parallel scope), and clones the cheap stuff
-        // (StrategyVariant, Arc<BTCHistory>, Arc<Vec<L2Event>>).
         let replay_t0 = std::time::Instant::now();
         let run = |v: &StrategyVariant| -> BacktestResults {
             let fm = build_fill_model(v);
@@ -453,18 +513,36 @@ pub async fn run_harness(
             variants.par_iter().map(run).collect()
         };
 
+        // Persist this hour's per-variant results BEFORE merging — so an
+        // interrupt mid-merge doesn't desync disk vs in-memory state.
+        if let Some(dir) = &cfg.checkpoint_dir {
+            write_hour_checkpoint(dir, h, variants, &per_variant)?;
+        }
+
         // Merge sequentially. Index-aligned with `variants`, so this preserves
         // the input order regardless of thread count.
         for (acc, hour_res) in variant_state.iter_mut().zip(per_variant) {
             acc.trades.extend(hour_res.trades);
             acc.unresolved_fills.extend(hour_res.unresolved_fills);
         }
+        hours_done.insert(h);
         tracing::info!(
             hour = %h,
             replay_ms = replay_t0.elapsed().as_millis() as u64,
             variants = variants.len(),
             threads = effective_threads,
+            done = hours_done.len(),
+            total = total_hours,
             "variants replayed",
+        );
+    }
+
+    if let Some(h) = paused_at {
+        tracing::info!(
+            paused_before = %h,
+            done = hours_done.len(),
+            total = total_hours,
+            "harness paused — re-run with the same --checkpoint to resume",
         );
     }
 
@@ -474,6 +552,111 @@ pub async fn run_harness(
         .zip(variant_state)
         .map(|(variant, results)| HarnessRun { variant, results })
         .collect())
+}
+
+/// Pause sentinel: `<checkpoint_dir>/PAUSE` exists, OR the `stop_flag` was
+/// triggered (typically by a SIGINT handler installed by the CLI).
+fn should_pause(cfg: &HarnessConfig) -> bool {
+    if let Some(flag) = &cfg.stop_flag {
+        if flag.load(Ordering::Relaxed) {
+            return true;
+        }
+    }
+    if let Some(dir) = &cfg.checkpoint_dir {
+        if dir.join("PAUSE").exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Per-hour checkpoint envelope. Each `<dir>/<hour>.json` contains one of
+/// these. The `variant_names` field is a sanity check: on resume we refuse
+/// to load a checkpoint whose variant set doesn't match the current run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HourCheckpoint {
+    hour: DateTime<Utc>,
+    variant_names: Vec<String>,
+    per_variant: Vec<BacktestResults>,
+}
+
+fn checkpoint_filename(hour: DateTime<Utc>) -> String {
+    format!("{}.json", hour.format("%Y-%m-%dT%H"))
+}
+
+/// Atomic write: tmp + rename. Matches the rule-9 multi-tenant convention
+/// (`*.tmp.<pid>` + `rename(2)`).
+fn write_hour_checkpoint(
+    dir: &Path,
+    hour: DateTime<Utc>,
+    variants: &[StrategyVariant],
+    per_variant: &[BacktestResults],
+) -> Result<()> {
+    let envelope = HourCheckpoint {
+        hour,
+        variant_names: variants.iter().map(|v| v.name.clone()).collect(),
+        per_variant: per_variant.to_vec(),
+    };
+    let payload = serde_json::to_vec(&envelope).context("serialize HourCheckpoint")?;
+    let final_path = dir.join(checkpoint_filename(hour));
+    let tmp_path = dir.join(format!(
+        "{}.tmp.{}",
+        checkpoint_filename(hour),
+        std::process::id()
+    ));
+    std::fs::write(&tmp_path, &payload)
+        .with_context(|| format!("write tmp checkpoint {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &final_path)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), final_path.display()))?;
+    Ok(())
+}
+
+/// Read every `<hour>.json` in `dir` and merge into a `(hour → per_variant)`
+/// map. Files whose `variant_names` don't match the current `variants` are
+/// rejected (returns an error) — so resuming with a different grid fails
+/// loudly instead of producing garbage.
+fn load_existing_checkpoints(
+    dir: &Path,
+    variants: &[StrategyVariant],
+) -> Result<BTreeMap<DateTime<Utc>, Vec<BacktestResults>>> {
+    let mut out: BTreeMap<DateTime<Utc>, Vec<BacktestResults>> = BTreeMap::new();
+    let expected_names: Vec<String> = variants.iter().map(|v| v.name.clone()).collect();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(out), // no dir or unreadable → treat as empty
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        if !name.ends_with(".json") || name.contains(".tmp.") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skip unreadable checkpoint");
+                continue;
+            }
+        };
+        let envelope: HourCheckpoint = match serde_json::from_str(&text) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skip malformed checkpoint");
+                continue;
+            }
+        };
+        if envelope.variant_names != expected_names {
+            return Err(anyhow::anyhow!(
+                "checkpoint {} has different variant grid than this run \
+                 ({} variants vs {}); re-run without --resume or pick a fresh --checkpoint dir",
+                path.display(),
+                envelope.variant_names.len(),
+                expected_names.len(),
+            ));
+        }
+        out.insert(envelope.hour, envelope.per_variant);
+    }
+    Ok(out)
 }
 
 /// Build the engine's fill model from a strategy variant. `prefer_maker` →
@@ -617,6 +800,8 @@ mod tests {
             latency: StaticLatencyConfig::default(),
             shared_distilled_dir: None,
             threads: None,
+            checkpoint_dir: None,
+            stop_flag: None,
         };
         (cfg, variants)
     }
@@ -647,5 +832,88 @@ mod tests {
             assert_eq!(s.variant.name, p.variant.name);
             assert_eq!(s.results.n_trades(), p.results.n_trades());
         }
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_atomic() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let variants = vec![
+            StrategyVariant::baseline(),
+            StrategyVariant::loose_smoke(),
+        ];
+        let per_variant = vec![BacktestResults::default(), BacktestResults::default()];
+        let h = chrono::DateTime::parse_from_rfc3339("2026-04-23T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        write_hour_checkpoint(tmp.path(), h, &variants, &per_variant).unwrap();
+
+        // File exists, no leftover tmp
+        let written = tmp.path().join("2026-04-23T05.json");
+        assert!(written.exists(), "atomic write should leave the final file");
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no .tmp file should remain after rename");
+
+        // Reload and verify hour is present
+        let loaded = load_existing_checkpoints(tmp.path(), &variants).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key(&h));
+    }
+
+    #[test]
+    fn checkpoint_rejects_grid_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let written_with = vec![StrategyVariant::baseline(), StrategyVariant::loose_smoke()];
+        let h = chrono::DateTime::parse_from_rfc3339("2026-04-23T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        write_hour_checkpoint(
+            tmp.path(),
+            h,
+            &written_with,
+            &vec![BacktestResults::default(); 2],
+        )
+        .unwrap();
+
+        // Try to load with a different variant set — should fail loudly
+        let resume_with = vec![StrategyVariant::baseline()];
+        let err = load_existing_checkpoints(tmp.path(), &resume_with).unwrap_err();
+        assert!(
+            err.to_string().contains("different variant grid"),
+            "expected grid-mismatch error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_sentinel_short_circuits_remaining_hours() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create the PAUSE sentinel BEFORE running — the harness should bail
+        // at the first hour boundary (no replay, no checkpoint write).
+        std::fs::File::create(tmp.path().join("PAUSE")).unwrap();
+
+        let (mut cfg, variants) = synthetic_cfg();
+        // Give the harness some hypothetical hours so the loop body would
+        // normally run. Without parquets these would error during load, so
+        // pause must short-circuit before any download attempt.
+        cfg.hours = vec![chrono::DateTime::parse_from_rfc3339("2026-04-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)];
+        cfg.checkpoint_dir = Some(tmp.path().to_path_buf());
+
+        let runs = run_harness(&cfg, &variants).await.unwrap();
+        // No hours processed → empty per-variant state.
+        for run in &runs {
+            assert_eq!(run.results.n_trades(), 0);
+        }
+        // No <hour>.json should have been written.
+        let json_files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .collect();
+        assert!(json_files.is_empty(), "PAUSE before any work → no checkpoint files");
     }
 }

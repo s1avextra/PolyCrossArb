@@ -8,7 +8,7 @@ use crate::strategy::decision::ZoneConfig;
 
 /// Tunable knobs the harness varies. The variant name is what shows up in
 /// the report.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StrategyVariant {
     pub name: String,
     pub zone_config: ZoneConfig,
