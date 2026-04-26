@@ -21,8 +21,20 @@ pub struct StrategyVariant {
     pub max_per_market_usd: f64,
     /// Use maker-first fill model instead of one-tick taker.
     pub prefer_maker: bool,
+    /// Probability that a maker order fills before the market moves.
+    /// Calibrated from live Polymarket (3s timeout ≈ 65%); ignored unless
+    /// `prefer_maker` is true.
+    pub maker_fill_prob: f64,
+    /// Optional RNG seed for reproducible maker fills. None → entropy.
+    pub maker_seed: Option<u64>,
+    /// Use the no-slippage Perfect fill model. Sanity baseline only — sets
+    /// an upper bound on possible PnL.
+    pub use_perfect_fill: bool,
     /// Default fee rate for taker fills.
     pub default_fee_rate: f64,
+    /// Maker fee rate. Polymarket pays a rebate (default 0%) but explicit
+    /// for clarity.
+    pub maker_fee_rate: f64,
 }
 
 impl StrategyVariant {
@@ -36,7 +48,11 @@ impl StrategyVariant {
             position_pct: 0.10,
             max_per_market_usd: 20.0,
             prefer_maker: false,
+            maker_fill_prob: 0.65,
+            maker_seed: Some(42),
+            use_perfect_fill: false,
             default_fee_rate: 0.072,
+            maker_fee_rate: 0.0,
         }
     }
 
@@ -94,7 +110,6 @@ impl StrategyVariant {
         Self {
             name: "maker_first".into(),
             prefer_maker: true,
-            default_fee_rate: 0.0,
             ..Self::baseline()
         }
     }
@@ -124,20 +139,22 @@ impl StrategyVariant {
             position_pct: 0.10,
             max_per_market_usd: 20.0,
             prefer_maker: false,
+            maker_fill_prob: 0.65,
+            maker_seed: Some(42),
+            use_perfect_fill: false,
             default_fee_rate: 0.072,
+            maker_fee_rate: 0.0,
         }
     }
 
-    /// Same loose gates as `loose_smoke` but assumes maker fills (0% fee).
-    /// On the 2026-04-26 4-hour run, `loose_smoke` produced 64.6% WR but
-    /// fees ate the edge; this variant tests whether maker pricing flips
-    /// the result to positive. (Optimistic: a real maker route needs a
-    /// fill-rate model, but this tells us if it's worth pursuing.)
+    /// Same loose gates as `loose_smoke` but uses the realistic Maker fill
+    /// model (post-at-touch with `maker_fill_prob` ≈ 65%, taker fallback at
+    /// one-tick adverse + 7.2% taker fee). Meant to test whether maker
+    /// economics turn the strategy edge positive vs taker-only.
     pub fn loose_maker() -> Self {
         Self {
             name: "loose_maker".into(),
             prefer_maker: true,
-            default_fee_rate: 0.0,
             ..Self::loose_smoke()
         }
     }

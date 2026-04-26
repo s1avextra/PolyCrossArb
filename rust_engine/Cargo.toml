@@ -38,6 +38,9 @@ parquet = { version = "53", default-features = false, features = ["arrow", "snap
 arrow-array = "53"
 arrow-schema = "53"
 csv = "1"
+# Compact sidecar cache for filtered events
+bincode = "1"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

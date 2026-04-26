@@ -83,6 +83,41 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         sample: usize,
     },
+    /// Sweep a parameter grid through the full L2-backtest harness. Generates
+    /// cartesian product of confidence × z × edge × ev × {taker, maker} —
+    /// runs every cell against the same hours and ranks by PnL.
+    HarnessSweep {
+        #[arg(long)]
+        start: String,
+        #[arg(long)]
+        end: Option<String>,
+        #[arg(long, default_value_t = 100.0)]
+        bankroll: f64,
+        #[arg(long)]
+        cache_dir: Option<String>,
+        #[arg(long)]
+        btc_csv: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        latency_ms: u64,
+        /// Comma-separated confidence thresholds.
+        #[arg(long, default_value = "0.30,0.40,0.50,0.60")]
+        conf: String,
+        /// Comma-separated z-score thresholds.
+        #[arg(long, default_value = "0.20,0.50,1.00")]
+        z: String,
+        /// Comma-separated edge thresholds.
+        #[arg(long, default_value = "0.00,0.03,0.07")]
+        edge: String,
+        /// Comma-separated EV buffers (negative disables the EV gate).
+        #[arg(long, default_value = "-1.0,0.05")]
+        ev_buffer: String,
+        /// Include both maker and taker fill model variants per cell.
+        #[arg(long, default_value_t = true)]
+        also_maker: bool,
+        /// Show top N variants in the report.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
     /// Run the full L2-backtest harness over PMXT v2 archives. Loads candle
     /// markets from Gamma, downloads/streams the requested UTC hours,
     /// replays them through each strategy variant, resolves against the
@@ -178,6 +213,40 @@ async fn main() {
         }
         Command::PmxtDownload { start, end, cache_dir } => {
             cmd_pmxt_download(&start, end.as_deref(), cache_dir.as_deref()).await;
+        }
+        Command::HarnessSweep {
+            start,
+            end,
+            bankroll,
+            cache_dir,
+            btc_csv,
+            latency_ms,
+            conf,
+            z,
+            edge,
+            ev_buffer,
+            also_maker,
+            top,
+        } => {
+            let conf = parse_csv_floats(&conf);
+            let zs = parse_csv_floats(&z);
+            let edges = parse_csv_floats(&edge);
+            let evs = parse_csv_floats(&ev_buffer);
+            cmd_harness_sweep(
+                &settings,
+                &start,
+                end.as_deref(),
+                bankroll,
+                cache_dir.as_deref(),
+                btc_csv.as_deref(),
+                latency_ms,
+                conf,
+                zs,
+                edges,
+                evs,
+                also_maker,
+                top,
+            ).await;
         }
         Command::Harness {
             start,
@@ -418,6 +487,206 @@ async fn cmd_pmxt_info(hour: &str, cache_dir: Option<&str>, sample: usize) {
         }
         Err(e) => {
             eprintln!("pmxt-info failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_csv_floats(s: &str) -> Vec<f64> {
+    s.split(',')
+        .filter_map(|p| p.trim().parse::<f64>().ok())
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_harness_sweep(
+    settings: &config::Settings,
+    start: &str,
+    end: Option<&str>,
+    bankroll: f64,
+    cache_dir: Option<&str>,
+    btc_csv: Option<&str>,
+    latency_ms: u64,
+    conf: Vec<f64>,
+    z: Vec<f64>,
+    edge: Vec<f64>,
+    ev_buffer: Vec<f64>,
+    also_maker: bool,
+    top: usize,
+) {
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+
+    let start_dt: DateTime<Utc> = match DateTime::parse_from_rfc3339(start) {
+        Ok(d) => d.with_timezone(&Utc),
+        Err(e) => {
+            eprintln!("--start must be RFC3339: {e}");
+            std::process::exit(2);
+        }
+    };
+    let end_dt = match end {
+        Some(e) => match DateTime::parse_from_rfc3339(e) {
+            Ok(d) => d.with_timezone(&Utc),
+            Err(err) => {
+                eprintln!("--end must be RFC3339: {err}");
+                std::process::exit(2);
+            }
+        },
+        None => start_dt,
+    };
+    let mut hours = Vec::new();
+    let mut cur = start_dt;
+    while cur <= end_dt {
+        hours.push(cur);
+        cur = cur + ChronoDuration::hours(1);
+    }
+
+    // Build the variant grid.
+    let grid = backtest::sweep::SweepGrid {
+        base: backtest::strategies::StrategyVariant::baseline(),
+        conf,
+        z,
+        edge,
+        ev_buffer,
+        also_maker,
+    };
+    let variants = grid.variants();
+    if variants.is_empty() {
+        eprintln!("empty parameter grid (check --conf/--z/--edge/--ev-buffer)");
+        std::process::exit(2);
+    }
+    tracing::info!(variants = variants.len(), "sweep grid built");
+
+    // Universe + tape (same as cmd_harness)
+    let cache_dir_path = cache_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(
+                std::env::var("PMXT_V2_CACHE_DIR")
+                    .unwrap_or_else(|_| backtest::pmxt::DEFAULT_CACHE_DIR.to_string()),
+            )
+        });
+    let loader = backtest::pmxt::PMXTv2Loader::new(&cache_dir_path);
+    for &h in &hours {
+        if let Err(e) = loader.download_hour(h, false).await {
+            eprintln!("download {} failed: {e}", h);
+            std::process::exit(1);
+        }
+    }
+    let mut all_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for &h in &hours {
+        match loader.distinct_condition_ids(h) {
+            Ok(s) => all_cids.extend(s),
+            Err(e) => {
+                eprintln!("read distinct cids for {}: {e}", h);
+                std::process::exit(1);
+            }
+        }
+    }
+    let cache_dir_path_for_meta = cache_dir_path.clone();
+    let gamma_cache_path = cache_dir_path_for_meta.join("gamma_market_cache.json");
+    let mut cached_markets: std::collections::BTreeMap<String, data::models::Market> =
+        match std::fs::read_to_string(&gamma_cache_path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => Default::default(),
+        };
+    let cid_vec: Vec<String> = all_cids
+        .iter()
+        .filter(|c| !cached_markets.contains_key(*c))
+        .cloned()
+        .collect();
+    if !cid_vec.is_empty() {
+        tracing::info!(missing = cid_vec.len(), cached = cached_markets.len(), "Gamma fetch");
+        let gamma = data::gamma::GammaClient::new(&settings.poly_gamma_url);
+        let new_markets = match gamma.fetch_markets_by_condition_ids(&cid_vec).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Gamma lookup failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        for m in new_markets {
+            cached_markets.insert(m.condition_id.clone(), m);
+        }
+        if let Ok(s) = serde_json::to_string(&cached_markets) {
+            let _ = std::fs::write(&gamma_cache_path, s);
+        }
+    }
+    let markets: Vec<data::models::Market> = cached_markets.values().cloned().collect();
+
+    let mut contracts = data::scanner::scan_candle_markets_for_backtest(&markets, 0.0);
+    contracts.retain(|c| c.asset == "BTC");
+    let start_ts = start_dt.timestamp() as f64;
+    let end_ts = end_dt.timestamp() as f64 + 3600.0;
+    contracts.retain(|c| {
+        let close_t = chrono::DateTime::parse_from_rfc3339(&c.end_date)
+            .map(|d| d.timestamp() as f64)
+            .unwrap_or(0.0);
+        let window_minutes = live::window::estimate_window_minutes(&c.window_description);
+        let window_minutes = if window_minutes > 0.0 { window_minutes } else { 60.0 };
+        let open_t = close_t - window_minutes * 60.0;
+        close_t > start_ts && open_t < end_ts
+    });
+    let universe = backtest::harness::CandleUniverse { contracts };
+    if universe.contracts.is_empty() {
+        eprintln!("no candle contracts in archive window");
+        std::process::exit(1);
+    }
+    tracing::info!(contracts = universe.contracts.len(), "harness universe loaded");
+
+    // BTC tape
+    let mut btc = backtest::btc_history::BTCHistory::new();
+    if let Some(p) = btc_csv {
+        btc.load_csv(p).ok();
+    } else {
+        let pad_ms = 3_600_000;
+        let start_ms = start_dt.timestamp_millis() - pad_ms;
+        let end_ms = end_dt.timestamp_millis() + pad_ms;
+        match btc.load_from_binance(start_ms, end_ms, "BTCUSDT", "1s").await {
+            Ok(n) if n > 100 => tracing::info!(rows = n, interval = "1s", "BTC klines"),
+            _ => {
+                btc = backtest::btc_history::BTCHistory::new();
+                if let Err(e) = btc.load_from_binance(start_ms, end_ms, "BTCUSDT", "1m").await {
+                    eprintln!("Binance fetch failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    let cfg = backtest::harness::HarnessConfig {
+        hours,
+        universe,
+        btc_history: btc,
+        bankroll_usd: bankroll,
+        cache_dir: cache_dir_path,
+        latency: backtest::l2_replay::StaticLatencyConfig { insert_ms: latency_ms },
+    };
+
+    println!("\nRunning sweep over {} variants × {} hours…\n", variants.len(), cfg.hours.len());
+    match backtest::harness::run_harness(&cfg, &variants).await {
+        Ok(runs) => {
+            // Sort by PnL descending; trim to top N.
+            let mut sorted = runs;
+            sorted.sort_by(|a, b| {
+                b.results
+                    .total_pnl()
+                    .partial_cmp(&a.results.total_pnl())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // Filter out variants with zero trades (no signal under those gates)
+            // and report the top N positive variants.
+            let positive: Vec<_> = sorted.iter().filter(|r| r.results.n_trades() > 0).cloned().collect();
+            let limit = top.min(positive.len());
+            println!("Top {} variants by PnL (variants with ≥1 trade):\n", limit);
+            println!("{}", backtest::harness::render_table(&positive[..limit]));
+            let zero_count = sorted.iter().filter(|r| r.results.n_trades() == 0).count();
+            println!(
+                "\n{} of {} variants produced 0 trades (gates too strict for the universe).",
+                zero_count, sorted.len(),
+            );
+        }
+        Err(e) => {
+            eprintln!("sweep failed: {e}");
             std::process::exit(1);
         }
     }

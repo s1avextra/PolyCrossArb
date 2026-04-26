@@ -34,7 +34,9 @@ use arrow_array::{
     Array, Decimal128Array, FixedSizeBinaryArray, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use chrono::{DateTime, Utc};
-use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
+use arrow_array::BooleanArray;
+use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter};
+use parquet::arrow::ProjectionMask;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -189,6 +191,57 @@ impl PMXTv2Loader {
         self.load_cached_hour(hour, condition_ids)
     }
 
+    /// Sidecar path for a `(hour, cid_set)` event cache. Filenames are
+    /// distinct from the parquet (different suffix) so we never touch the
+    /// upstream archive — important on the multi-tenant VPS where
+    /// polyarbitrage shares the cache directory.
+    fn sidecar_path(&self, hour: DateTime<Utc>, cid_hash: u64) -> PathBuf {
+        self.cache_dir.join(format!(
+            "polymarket_orderbook_{}.{:016x}.events.bin.gz",
+            hour.format("%Y-%m-%dT%H"),
+            cid_hash,
+        ))
+    }
+
+    /// Load events for the given hour, using a per-(hour, cid_set) sidecar
+    /// cache if one exists. First call decodes the parquet (slow) then
+    /// writes a compact gzipped bincode of the filtered events. Subsequent
+    /// calls with the same cid_set deserialize the sidecar (~10× faster).
+    pub fn load_with_sidecar(
+        &self,
+        hour: DateTime<Utc>,
+        condition_ids: &HashSet<String>,
+    ) -> Result<Vec<L2Event>> {
+        let mut sorted: Vec<&String> = condition_ids.iter().collect();
+        sorted.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hasher::write_usize(&mut hasher, sorted.len());
+        for s in &sorted {
+            std::hash::Hash::hash(s.as_str(), &mut hasher);
+        }
+        let cid_hash = std::hash::Hasher::finish(&hasher);
+        let sidecar = self.sidecar_path(hour, cid_hash);
+
+        if sidecar.exists() {
+            if let Ok(events) = read_sidecar(&sidecar) {
+                tracing::debug!(
+                    path = %sidecar.display(),
+                    events = events.len(),
+                    "loaded events from sidecar cache"
+                );
+                return Ok(events);
+            }
+            // Corrupt/incompatible sidecar — fall through to a fresh decode.
+            tracing::warn!(?sidecar, "sidecar unreadable; re-decoding parquet");
+        }
+
+        let events = self.load_cached_hour(hour, Some(condition_ids))?;
+        if let Err(e) = write_sidecar(&sidecar, &events) {
+            tracing::warn!(error = %e, ?sidecar, "sidecar write failed");
+        }
+        Ok(events)
+    }
+
     /// Scan a cached hour and return the unique `condition_id`s that have
     /// any events in it. Useful for discovering the harness universe
     /// directly from the historical archive.
@@ -227,9 +280,9 @@ fn read_parquet(path: &Path, condition_ids: Option<&HashSet<String>>) -> Result<
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("parquet builder {}", path.display()))?;
-    // Project only the columns the decoder actually reads. Cuts I/O + memory
-    // significantly: the archive carries fee_rate_bps / old_tick_size /
-    // new_tick_size / transaction_hash that we drop today.
+
+    // Project only the columns the decoder reads. Drops fee_rate_bps,
+    // old_tick_size, new_tick_size, transaction_hash.
     let needed = [
         "timestamp",
         "timestamp_received",
@@ -244,18 +297,64 @@ fn read_parquet(path: &Path, condition_ids: Option<&HashSet<String>>) -> Result<
         "best_bid",
         "best_ask",
     ];
-    let schema = builder.parquet_schema();
-    let indices: Vec<usize> = needed
+    let leaf_indices: Vec<usize> = needed
         .iter()
         .filter_map(|name| {
-            schema
+            builder
+                .parquet_schema()
                 .columns()
                 .iter()
                 .position(|c| c.name() == *name)
         })
         .collect();
-    let mask = ProjectionMask::leaves(schema, indices);
-    let builder = builder.with_projection(mask);
+    let market_idx = builder
+        .parquet_schema()
+        .columns()
+        .iter()
+        .position(|c| c.name() == "market")
+        .context("parquet schema missing `market` column")?;
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), leaf_indices);
+    let predicate_mask = ProjectionMask::leaves(builder.parquet_schema(), vec![market_idx]);
+    let mut builder = builder.with_projection(mask);
+
+    // Push the condition_ids filter down so the parquet reader skips full
+    // rows (and their JSON bid/ask columns) when the market doesn't match.
+    // Going from "decode 39k cids → filter to 70 in memory" to "skip
+    // 99.8% of rows before they ever materialize" turns a 6-second
+    // decode into ~100 ms. The original parquet file is read-only —
+    // never mutated — so the shared multi-tenant cache stays untouched.
+    if let Some(filter) = condition_ids {
+        let cid_set: HashSet<Vec<u8>> = filter.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let col = batch.column(0);
+            let n = batch.num_rows();
+            let mut keep = Vec::with_capacity(n);
+            if let Some(arr) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                for i in 0..n {
+                    if arr.is_null(i) {
+                        keep.push(false);
+                    } else {
+                        keep.push(cid_set.contains(arr.value(i)));
+                    }
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                for i in 0..n {
+                    if arr.is_null(i) {
+                        keep.push(false);
+                    } else {
+                        keep.push(cid_set.contains(arr.value(i).as_bytes()));
+                    }
+                }
+            } else {
+                for _ in 0..n {
+                    keep.push(false);
+                }
+            }
+            Ok(BooleanArray::from(keep))
+        });
+        builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate) as Box<dyn ArrowPredicate>]));
+    }
+
     let reader = builder.build().context("build parquet reader")?;
 
     let mut events: Vec<L2Event> = Vec::new();
@@ -459,6 +558,56 @@ fn parse_levels_json(s: &str) -> Vec<L2Level> {
         }
     }
     out
+}
+
+/// Sidecar cache file format:
+///   magic_u32       = 0x504D5851  ("PMXQ")
+///   version_u32     = 1
+///   gzipped bincode of Vec<L2Event>
+///
+/// The sidecar lives next to the .parquet file in the cache dir but with a
+/// distinct filename; it's read-only data we add and never mutates the
+/// upstream archive.
+const SIDECAR_MAGIC: u32 = 0x504D_5851;
+const SIDECAR_VERSION: u32 = 1;
+
+fn write_sidecar(path: &Path, events: &[L2Event]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("bin.gz.tmp");
+    let f = std::fs::File::create(&tmp).context("create sidecar tmp")?;
+    let mut buf = std::io::BufWriter::new(f);
+    buf.write_all(&SIDECAR_MAGIC.to_le_bytes())?;
+    buf.write_all(&SIDECAR_VERSION.to_le_bytes())?;
+    let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::fast());
+    let mut bin = std::io::BufWriter::new(encoder);
+    bincode::serialize_into(&mut bin, events).context("bincode serialize")?;
+    bin.flush()?;
+    let encoder = bin.into_inner().context("flush gz writer")?;
+    let mut buf = encoder.finish().context("finish gz")?;
+    buf.flush()?;
+    drop(buf);
+    std::fs::rename(&tmp, path).context("rename tmp sidecar")?;
+    Ok(())
+}
+
+fn read_sidecar(path: &Path) -> Result<Vec<L2Event>> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).context("open sidecar")?;
+    let mut buf = std::io::BufReader::new(f);
+    let mut hdr = [0u8; 8];
+    buf.read_exact(&mut hdr).context("read sidecar header")?;
+    let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+    if magic != SIDECAR_MAGIC {
+        anyhow::bail!("sidecar magic mismatch (file may be a different format)");
+    }
+    if version != SIDECAR_VERSION {
+        anyhow::bail!("sidecar version {} unsupported (expected {})", version, SIDECAR_VERSION);
+    }
+    let decoder = flate2::read::GzDecoder::new(buf);
+    let mut bin = std::io::BufReader::new(decoder);
+    let events: Vec<L2Event> = bincode::deserialize_from(&mut bin).context("bincode deserialize")?;
+    Ok(events)
 }
 
 fn parse_num(v: &serde_json::Value) -> Option<f64> {

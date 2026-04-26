@@ -17,9 +17,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::backtest::btc_history::BTCHistory;
-use crate::backtest::fill_model::OneTickTaker;
+use crate::backtest::fill_model::{Maker, OneTickTaker, Perfect};
 use crate::backtest::l2_replay::{
-    BacktestOrder, L2BacktestEngine, StaticLatencyConfig, Strategy, TokenBook,
+    BacktestOrder, FillModel, L2BacktestEngine, StaticLatencyConfig, Strategy, TokenBook,
 };
 use crate::backtest::pmxt::{L2Event, PMXTv2Loader};
 use crate::backtest::resolver::{resolve_fills, BacktestResults, CandleWindow};
@@ -290,7 +290,7 @@ impl Strategy for CandleBacktestStrategy {
             order_type: "market".into(),
             limit_price: None,
             fee_rate: self.variant.default_fee_rate,
-            maker_fee_rate: 0.0,
+            maker_fee_rate: self.variant.maker_fee_rate,
         }]
     }
 }
@@ -330,17 +330,20 @@ pub async fn run_harness(
 
     for &h in &cfg.hours {
         loader.download_hour(h, false).await?;
-        let mut events = loader.load_cached_hour(h, Some(&token_filter))?;
+        let load_t0 = std::time::Instant::now();
+        let mut events = loader.load_with_sidecar(h, &token_filter)?;
         events.sort_by(|a, b| a.timestamp_s.partial_cmp(&b.timestamp_s).unwrap_or(std::cmp::Ordering::Equal));
         tracing::info!(
             hour = %h,
             events = events.len(),
             cids = token_filter.len(),
+            elapsed_ms = load_t0.elapsed().as_millis() as u64,
             "L2 events loaded",
         );
 
         for (v, agg) in variant_state.iter_mut() {
-            let mut engine = L2BacktestEngine::new(OneTickTaker::default(), cfg.latency);
+            let fm = build_fill_model(v);
+            let mut engine = L2BacktestEngine::new(fm, cfg.latency);
             let mut strategy = CandleBacktestStrategy::new(
                 v.clone(),
                 &cfg.universe,
@@ -373,6 +376,23 @@ pub async fn run_harness(
         .into_iter()
         .map(|(variant, results)| HarnessRun { variant, results })
         .collect())
+}
+
+/// Build the engine's fill model from a strategy variant. `prefer_maker` →
+/// probabilistic Maker (with taker fallback); otherwise OneTickTaker.
+/// Perfect / BookWalk are reserved for future variants.
+fn build_fill_model(v: &StrategyVariant) -> FillModel {
+    if v.prefer_maker {
+        FillModel::Maker(Maker::new(
+            v.maker_fill_prob,
+            crate::backtest::fill_model::DEFAULT_TICK,
+            v.maker_seed,
+        ))
+    } else if v.use_perfect_fill {
+        FillModel::Perfect(Perfect)
+    } else {
+        FillModel::OneTickTaker(OneTickTaker::default())
+    }
 }
 
 pub fn render_table(runs: &[HarnessRun]) -> String {

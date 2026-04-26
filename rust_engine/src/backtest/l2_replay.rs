@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::backtest::fill_model::{FillReason, FillResult, OneTickTaker, OrderType, Side};
+use crate::backtest::fill_model::{FillReason, FillResult, Maker, OneTickTaker, OrderType, Perfect, Side};
 use crate::backtest::pmxt::{L2Event, L2EventBody};
 use crate::execution::fees::polymarket_fee;
 
@@ -159,8 +159,47 @@ pub trait Strategy {
     ) -> Vec<BacktestOrder>;
 }
 
+/// Pluggable fill model. Each variant of this enum is called from the
+/// backtest engine when an order's latency window has elapsed.
+pub enum FillModel {
+    /// Touch + 1 tick adverse. Default taker behavior.
+    OneTickTaker(OneTickTaker),
+    /// Probabilistic maker: with `fill_prob` we post inside the spread
+    /// (1-tick improvement, 0% fee); else fall through to one-tick taker.
+    /// Maker fills use `maker_fee_rate` from the order; taker fallbacks use
+    /// `fee_rate`. fill_prob is calibrated from live data — Polymarket
+    /// candle 3s timeout was ~65% historically.
+    Maker(Maker),
+    /// Touch fill, no slippage. Sanity baseline only — not realistic.
+    Perfect(Perfect),
+}
+
+impl FillModel {
+    pub fn fill(
+        &mut self,
+        side: Side,
+        size: f64,
+        book: &TokenBook,
+        order_type: OrderType,
+        limit_price: Option<f64>,
+    ) -> FillResult {
+        match self {
+            FillModel::OneTickTaker(m) => m.fill(
+                side,
+                size,
+                book.best_bid,
+                book.best_ask,
+                order_type,
+                limit_price,
+            ),
+            FillModel::Maker(m) => m.fill(side, size, book.best_bid, book.best_ask),
+            FillModel::Perfect(m) => m.fill(side, size, book.best_bid, book.best_ask),
+        }
+    }
+}
+
 pub struct L2BacktestEngine {
-    fill_model: OneTickTaker,
+    fill_model: FillModel,
     latency: StaticLatencyConfig,
     history_window_seconds: f64,
 
@@ -172,7 +211,7 @@ pub struct L2BacktestEngine {
 }
 
 impl L2BacktestEngine {
-    pub fn new(fill_model: OneTickTaker, latency: StaticLatencyConfig) -> Self {
+    pub fn new(fill_model: FillModel, latency: StaticLatencyConfig) -> Self {
         Self {
             fill_model,
             latency,
@@ -309,8 +348,7 @@ impl L2BacktestEngine {
             let result: FillResult = self.fill_model.fill(
                 side,
                 order.size,
-                book.best_bid,
-                book.best_ask,
+                &book,
                 order_type,
                 order.limit_price,
             );
@@ -429,7 +467,7 @@ mod tests {
 
     #[test]
     fn empty_replay_produces_no_fills() {
-        let mut e = L2BacktestEngine::new(OneTickTaker::default(), StaticLatencyConfig::default());
+        let mut e = L2BacktestEngine::new(FillModel::OneTickTaker(OneTickTaker::default()), StaticLatencyConfig::default());
         let mut s = NoopStrategy;
         e.replay(std::iter::empty::<L2Event>(), &mut s, 0.072);
         assert_eq!(e.fills.len(), 0);
@@ -437,7 +475,7 @@ mod tests {
 
     #[test]
     fn book_snapshot_updates_top_of_book() {
-        let mut e = L2BacktestEngine::new(OneTickTaker::default(), StaticLatencyConfig::default());
+        let mut e = L2BacktestEngine::new(FillModel::OneTickTaker(OneTickTaker::default()), StaticLatencyConfig::default());
         let mut s = NoopStrategy;
         e.replay(vec![snap_event("t", 1.0, 0.50, 0.52)], &mut s, 0.072);
         let book = e.books.get("t").unwrap();
@@ -476,7 +514,7 @@ mod tests {
 
     #[test]
     fn order_fires_after_latency_window() {
-        let mut e = L2BacktestEngine::new(OneTickTaker::default(), StaticLatencyConfig { insert_ms: 50 });
+        let mut e = L2BacktestEngine::new(FillModel::OneTickTaker(OneTickTaker::default()), StaticLatencyConfig { insert_ms: 50 });
         let mut s = OneShotBuy { fired: false };
         let events = vec![
             snap_event("t", 1.0, 0.50, 0.52),  // strategy fires here (ts=1.0)
