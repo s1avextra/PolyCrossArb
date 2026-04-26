@@ -63,6 +63,25 @@ enum Command {
     Ctf { condition_id: String },
     /// Validate a paper session JSONL replays clean against the decision function.
     ValidateReplay { path: String },
+    /// Distill a parquet hour into the shared candles-only JSONL.gz format
+    /// (v1 schema; see docs/cross_bot_distilled_cache_response.md). Output
+    /// is shareable with polyarbitrage on the multi-tenant VPS.
+    Distill {
+        /// Path to the source parquet (e.g. polymarket_orderbook_2026-04-26T08.parquet).
+        #[arg(long)]
+        input: String,
+        /// Output path. If omitted, derived from --input + the v1 naming.
+        #[arg(long)]
+        output: Option<String>,
+        /// Path to a file containing candle condition_ids, one per line OR
+        /// comma-separated. If omitted, the binary auto-discovers via Gamma.
+        #[arg(long)]
+        candle_cids: Option<String>,
+        /// Override the hour for auto-discovery (defaults to parsing the
+        /// hour out of the parquet filename).
+        #[arg(long)]
+        hour: Option<String>,
+    },
     /// Pre-download PMXT v2 archives for a UTC hour range so subsequent
     /// `harness` runs are offline-fast.
     PmxtDownload {
@@ -213,6 +232,9 @@ async fn main() {
         }
         Command::PmxtDownload { start, end, cache_dir } => {
             cmd_pmxt_download(&start, end.as_deref(), cache_dir.as_deref()).await;
+        }
+        Command::Distill { input, output, candle_cids, hour } => {
+            cmd_distill(&settings, &input, output.as_deref(), candle_cids.as_deref(), hour.as_deref()).await;
         }
         Command::HarnessSweep {
             start,
@@ -418,6 +440,113 @@ async fn cmd_validate_replay(path: &str) {
     println!("validate-replay: total={total} mismatches={mismatches} ({mismatch_pct:.2}%)");
     if mismatches > 0 {
         std::process::exit(1);
+    }
+}
+
+async fn cmd_distill(
+    settings: &config::Settings,
+    input: &str,
+    output: Option<&str>,
+    candle_cids_path: Option<&str>,
+    hour_override: Option<&str>,
+) {
+    use chrono::DateTime;
+    let in_path = std::path::PathBuf::from(input);
+    if !in_path.exists() {
+        eprintln!("input parquet not found: {}", in_path.display());
+        std::process::exit(1);
+    }
+
+    // Derive hour from the filename or --hour override.
+    let hour = match hour_override {
+        Some(s) => match DateTime::parse_from_rfc3339(s) {
+            Ok(d) => d.with_timezone(&chrono::Utc),
+            Err(e) => {
+                eprintln!("--hour: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => {
+            let stem = in_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            // expects polymarket_orderbook_YYYY-MM-DDTHH.parquet
+            let h = stem
+                .strip_prefix("polymarket_orderbook_")
+                .and_then(|s| s.strip_suffix(".parquet"))
+                .unwrap_or("");
+            match chrono::NaiveDateTime::parse_from_str(
+                &format!("{h}:00:00"),
+                "%Y-%m-%dT%H:%M:%S",
+            ) {
+                Ok(naive) => naive.and_utc(),
+                Err(_) => {
+                    eprintln!("could not derive hour from filename; pass --hour");
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
+
+    // Build the candle-cid set: explicit file or auto-discover via Gamma.
+    let cids: std::collections::HashSet<String> = if let Some(p) = candle_cids_path {
+        let text = std::fs::read_to_string(p).unwrap_or_else(|e| {
+            eprintln!("read --candle-cids {p}: {e}");
+            std::process::exit(1);
+        });
+        text.split(|c| c == ',' || c == '\n' || c == ' ')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        tracing::info!("auto-discovering candle cids via Gamma + scanner regex");
+        let gamma = data::gamma::GammaClient::new(&settings.poly_gamma_url);
+        // Pull a wide window around the hour so we catch markets that
+        // closed during it (or are still open).
+        let max_hours = 24.0 * 30.0;
+        let markets = match gamma.fetch_markets_by_end_date(max_hours, 0.0).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Gamma fetch failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        let candles = data::scanner::scan_candle_markets_for_backtest(&markets, 0.0);
+        candles
+            .into_iter()
+            .map(|c| c.market.condition_id)
+            .collect()
+    };
+    tracing::info!(cids = cids.len(), "candle universe loaded for distill");
+
+    let out_path = match output {
+        Some(s) => std::path::PathBuf::from(s),
+        None => {
+            let dir = in_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            backtest::distill::shared_cache_path_for_hour(dir, hour)
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    match backtest::distill::distill_parquet_to_jsonl(&in_path, &cids, &out_path) {
+        Ok(stats) => {
+            let elapsed = t0.elapsed();
+            println!(
+                "distilled {} events ({} book / {} chg / {} trade) -> {} ({} bytes raw JSONL, gzipped on disk) in {:.2}s",
+                stats.total(),
+                stats.book_events,
+                stats.change_events,
+                stats.trade_events,
+                out_path.display(),
+                stats.bytes_written,
+                elapsed.as_secs_f64(),
+            );
+        }
+        Err(e) => {
+            eprintln!("distill failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -653,6 +782,13 @@ async fn cmd_harness_sweep(
         }
     }
 
+    let shared_dir = std::env::var("PMXT_DISTILLED_DIR")
+        .ok()
+        .or_else(|| {
+            let p = std::path::PathBuf::from(backtest::distill::SHARED_CACHE_DIR);
+            if p.exists() { Some(backtest::distill::SHARED_CACHE_DIR.to_string()) } else { None }
+        })
+        .map(std::path::PathBuf::from);
     let cfg = backtest::harness::HarnessConfig {
         hours,
         universe,
@@ -660,6 +796,7 @@ async fn cmd_harness_sweep(
         bankroll_usd: bankroll,
         cache_dir: cache_dir_path,
         latency: backtest::l2_replay::StaticLatencyConfig { insert_ms: latency_ms },
+        shared_distilled_dir: shared_dir,
     };
 
     println!("\nRunning sweep over {} variants × {} hours…\n", variants.len(), cfg.hours.len());
@@ -874,6 +1011,13 @@ async fn cmd_harness(
         std::process::exit(1);
     }
 
+    let shared_dir = std::env::var("PMXT_DISTILLED_DIR")
+        .ok()
+        .or_else(|| {
+            let p = std::path::PathBuf::from(backtest::distill::SHARED_CACHE_DIR);
+            if p.exists() { Some(backtest::distill::SHARED_CACHE_DIR.to_string()) } else { None }
+        })
+        .map(std::path::PathBuf::from);
     let cfg = backtest::harness::HarnessConfig {
         hours,
         universe,
@@ -881,6 +1025,7 @@ async fn cmd_harness(
         bankroll_usd: bankroll,
         cache_dir: cache_dir_path,
         latency: backtest::l2_replay::StaticLatencyConfig { insert_ms: latency_ms },
+        shared_distilled_dir: shared_dir,
     };
 
     let variants = backtest::strategies::default_variants();

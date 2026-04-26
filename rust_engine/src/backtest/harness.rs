@@ -308,6 +308,11 @@ pub struct HarnessConfig {
     pub bankroll_usd: f64,
     pub cache_dir: PathBuf,
     pub latency: StaticLatencyConfig,
+    /// Optional shared distilled-cache directory. When set, the harness
+    /// checks `<dir>/<hour>.v1.candles.jsonl.gz` BEFORE the per-tenant
+    /// sidecar and the parquet. The shared-cache writer is `polymomentum-
+    /// engine distill`. See cross_bot_distilled_cache_response.md.
+    pub shared_distilled_dir: Option<PathBuf>,
 }
 
 /// Run every variant over the requested hours. Streams one hour at a time
@@ -331,13 +336,37 @@ pub async fn run_harness(
     for &h in &cfg.hours {
         loader.download_hour(h, false).await?;
         let load_t0 = std::time::Instant::now();
-        let mut events = loader.load_with_sidecar(h, &token_filter)?;
+
+        // Reader fallback chain: shared distilled → per-tenant sidecar → parquet.
+        let mut events: Vec<L2Event> = Vec::new();
+        let mut source = "parquet";
+        if let Some(shared_dir) = &cfg.shared_distilled_dir {
+            let path = crate::backtest::distill::shared_cache_path_for_hour(shared_dir, h);
+            if path.exists() {
+                match crate::backtest::distill::read_distilled(&path) {
+                    Ok((mut shared_events, _)) => {
+                        // Shared cache contains every candle market for the hour;
+                        // post-filter to our universe.
+                        shared_events.retain(|e| token_filter.contains(&e.market_id));
+                        events = shared_events;
+                        source = "shared_distilled";
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?path, "shared distilled cache unreadable; falling back");
+                    }
+                }
+            }
+        }
+        if events.is_empty() {
+            events = loader.load_with_sidecar(h, &token_filter)?;
+        }
         events.sort_by(|a, b| a.timestamp_s.partial_cmp(&b.timestamp_s).unwrap_or(std::cmp::Ordering::Equal));
         tracing::info!(
             hour = %h,
             events = events.len(),
             cids = token_filter.len(),
             elapsed_ms = load_t0.elapsed().as_millis() as u64,
+            source,
             "L2 events loaded",
         );
 
