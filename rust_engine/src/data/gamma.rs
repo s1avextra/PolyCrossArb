@@ -61,6 +61,38 @@ impl GammaClient {
         Err(last_err.unwrap_or_else(|| anyhow!("Gamma request failed without specific error")))
     }
 
+    /// Fetch up to `limit` markets matching the given condition_ids.
+    /// Gamma's `condition_ids` parameter is repeated once per ID (Rails-style
+    /// array param). Gamma defaults to `closed=false` so we walk both pages
+    /// to surface resolved markets (the harness needs them).
+    pub async fn fetch_markets_by_condition_ids(
+        &self,
+        condition_ids: &[String],
+    ) -> Result<Vec<Market>> {
+        const BATCH: usize = 50;
+        let mut out: Vec<Market> = Vec::new();
+        for chunk in condition_ids.chunks(BATCH) {
+            for closed in ["true", "false"] {
+                let mut params: Vec<(&str, String)> = chunk
+                    .iter()
+                    .map(|cid| ("condition_ids", cid.clone()))
+                    .collect();
+                params.push(("limit", BATCH.to_string()));
+                params.push(("closed", closed.to_string()));
+                let v = self.get_with_retry(GAMMA_MARKETS, &params).await?;
+                let items = unwrap_market_list(v);
+                for raw in &items {
+                    if let Some(m) = parse_gamma_market(raw) {
+                        out.push(m);
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.condition_id.cmp(&b.condition_id));
+        out.dedup_by(|a, b| a.condition_id == b.condition_id);
+        Ok(out)
+    }
+
     /// Fetch markets sorted by endDate ascending — the fast path for candle
     /// discovery. Stops paginating once the last page's endDate exceeds
     /// `now + max_hours`. Filters out markets with degenerate prices /

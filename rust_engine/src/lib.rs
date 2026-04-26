@@ -13,6 +13,7 @@
 //! - `polymarket_ws`, `exchange`, `price_state` — market data plumbing
 //! - `clob`, `signing`   — EIP-712-signed CLOB direct order placement (live mode)
 
+pub mod backtest;
 pub mod clob;
 pub mod config;
 pub mod data;
@@ -26,5 +27,6 @@ pub mod price_state;
 pub mod risk;
 pub mod signing;
 pub mod strategy;
+pub mod sweep;
 
 pub use fair_value::norm_cdf;

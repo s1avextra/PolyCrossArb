@@ -66,11 +66,30 @@ pub fn scan_candle_markets(
     max_hours: f64,
     min_liquidity: f64,
 ) -> Vec<CandleContract> {
+    scan_candle_markets_inner(markets, max_hours, min_liquidity, /*include_resolved=*/ false)
+}
+
+/// Backtest variant: also accepts already-resolved candles. The harness needs
+/// these because every market it touches is in the past; the live scanner
+/// rejects `hours_left ≤ 0` to avoid trading dead markets.
+pub fn scan_candle_markets_for_backtest(
+    markets: &[Market],
+    min_liquidity: f64,
+) -> Vec<CandleContract> {
+    scan_candle_markets_inner(markets, f64::INFINITY, min_liquidity, /*include_resolved=*/ true)
+}
+
+fn scan_candle_markets_inner(
+    markets: &[Market],
+    max_hours: f64,
+    min_liquidity: f64,
+    include_resolved: bool,
+) -> Vec<CandleContract> {
     let now = Utc::now();
     let mut contracts = Vec::new();
 
     for m in markets {
-        if !m.active || m.closed {
+        if !include_resolved && (!m.active || m.closed) {
             continue;
         }
         let Some(caps) = CANDLE_RE.captures(&m.question) else { continue };
@@ -102,7 +121,7 @@ pub fn scan_candle_markets(
             continue;
         };
         let hours_left = (end - now).num_seconds() as f64 / 3600.0;
-        if hours_left <= 0.0 || hours_left > max_hours {
+        if !include_resolved && (hours_left <= 0.0 || hours_left > max_hours) {
             continue;
         }
 
@@ -129,7 +148,12 @@ pub fn scan_candle_markets(
         a.hours_left.partial_cmp(&b.hours_left).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    tracing::info!(count = contracts.len(), max_hours, "candle scanner");
+    tracing::info!(
+        count = contracts.len(),
+        max_hours,
+        include_resolved,
+        "candle scanner"
+    );
     contracts
 }
 
