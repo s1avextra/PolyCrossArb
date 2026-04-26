@@ -99,6 +99,20 @@ pub struct CandleBacktestStrategy {
     pub decisions: Vec<CandleDecision>,
     /// Per-condition_id flag so we only enter once per market.
     traded: HashSet<String>,
+    /// Last timestamp we fed into the detector — throttle add_tick to once
+    /// per second to match live cadence (otherwise the 5k-tick deque rolls
+    /// over in seconds at ~870 events/s and we lose window history).
+    last_tick_ts_s: f64,
+    // Diagnostic counters.
+    pub events_seen: u64,
+    pub events_for_known_token: u64,
+    pub skipped_resolved: u64,
+    pub skipped_too_early: u64,
+    pub skipped_no_btc: u64,
+    pub skipped_no_signal: u64,
+    pub skipped_decision: u64,
+    pub skipped_wrong_side: u64,
+    pub skip_reasons: BTreeMap<String, u64>,
 }
 
 impl CandleBacktestStrategy {
@@ -120,6 +134,16 @@ impl CandleBacktestStrategy {
             btc_history,
             decisions: Vec::new(),
             traded: HashSet::new(),
+            last_tick_ts_s: 0.0,
+            events_seen: 0,
+            events_for_known_token: 0,
+            skipped_resolved: 0,
+            skipped_too_early: 0,
+            skipped_no_btc: 0,
+            skipped_no_signal: 0,
+            skipped_decision: 0,
+            skipped_wrong_side: 0,
+            skip_reasons: BTreeMap::new(),
         }
     }
 }
@@ -132,9 +156,11 @@ impl Strategy for CandleBacktestStrategy {
         book: &TokenBook,
         _history: &BTreeMap<String, Vec<(f64, f64)>>,
     ) -> Vec<BacktestOrder> {
+        self.events_seen += 1;
         let Some(contract) = self.universe_by_token.get(token_id).cloned() else {
             return Vec::new();
         };
+        self.events_for_known_token += 1;
         let cid = contract.market.condition_id.clone();
         if self.traded.contains(&cid) {
             return Vec::new();
@@ -149,23 +175,31 @@ impl Strategy for CandleBacktestStrategy {
         let open_ts_s = close - window_minutes * 60.0;
         let minutes_remaining = (close - timestamp_s) / 60.0;
         if minutes_remaining <= 0.083 || minutes_remaining > 30.0 {
+            self.skipped_resolved += 1;
             return Vec::new();
         }
         let minutes_elapsed = window_minutes - minutes_remaining;
         if minutes_elapsed < 0.5 {
+            self.skipped_too_early += 1;
             return Vec::new();
         }
 
-        // Maintain BTC tick history for the momentum detector.
+        // Maintain BTC tick history for the momentum detector. Throttle to
+        // 1 Hz — the live runtime adds one tick per cycle (~2 Hz) too.
         let btc = self.btc_history.price_at_seconds(timestamp_s);
         if btc <= 0.0 {
+            self.skipped_no_btc += 1;
             return Vec::new();
         }
-        self.momentum.add_tick(btc, Some(timestamp_s));
+        if timestamp_s - self.last_tick_ts_s >= 1.0 {
+            self.momentum.add_tick(btc, Some(timestamp_s));
+            self.last_tick_ts_s = timestamp_s;
+        }
 
         if self.momentum.get_open_price(&cid).is_none() {
             let open_btc = self.btc_history.price_at_seconds(open_ts_s);
             if open_btc <= 0.0 {
+                self.skipped_no_btc += 1;
                 return Vec::new();
             }
             self.momentum.set_window_open(&cid, open_btc);
@@ -179,7 +213,10 @@ impl Strategy for CandleBacktestStrategy {
             Some(timestamp_s),
         ) {
             Some(s) => s,
-            None => return Vec::new(),
+            None => {
+                self.skipped_no_signal += 1;
+                return Vec::new();
+            }
         };
 
         // Use the live book's current best ask for the up/down side prices.
@@ -215,8 +252,14 @@ impl Strategy for CandleBacktestStrategy {
             &self.variant.zone_config,
             0.0,
         );
-        let DecisionResult::Trade(decision) = res else {
-            return Vec::new();
+        let decision = match res {
+            DecisionResult::Trade(d) => d,
+            DecisionResult::Skip(skip) => {
+                self.skipped_decision += 1;
+                let key = format!("{}_{}", skip.reason, skip.zone);
+                *self.skip_reasons.entry(key).or_insert(0) += 1;
+                return Vec::new();
+            }
         };
 
         let traded_token = if decision.direction == "up" {
@@ -225,8 +268,7 @@ impl Strategy for CandleBacktestStrategy {
             contract.down_token_id.clone()
         };
         if traded_token != token_id {
-            // We only fire when the book that just ticked is the side we want
-            // to enter. Otherwise wait for the relevant token's update.
+            self.skipped_wrong_side += 1;
             return Vec::new();
         }
         self.traded.insert(cid.clone());
@@ -285,6 +327,11 @@ pub async fn run_harness(
         events.extend(evs);
     }
     events.sort_by(|a, b| a.timestamp_s.partial_cmp(&b.timestamp_s).unwrap_or(std::cmp::Ordering::Equal));
+    tracing::info!(
+        events = events.len(),
+        cids = token_filter.len(),
+        "L2 events loaded for universe",
+    );
 
     let windows = cfg.universe.windows();
 
@@ -298,6 +345,26 @@ pub async fn run_harness(
             cfg.btc_history.clone(),
         );
         engine.replay(events.iter().cloned(), &mut strategy, v.default_fee_rate);
+        let mut top_skips: Vec<(&String, &u64)> = strategy.skip_reasons.iter().collect();
+        top_skips.sort_by(|a, b| b.1.cmp(a.1));
+        let top: Vec<String> = top_skips
+            .iter()
+            .take(5)
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        tracing::info!(
+            variant = %v.name,
+            events_seen = strategy.events_seen,
+            events_for_known_token = strategy.events_for_known_token,
+            skipped_resolved = strategy.skipped_resolved,
+            skipped_too_early = strategy.skipped_too_early,
+            skipped_no_btc = strategy.skipped_no_btc,
+            skipped_no_signal = strategy.skipped_no_signal,
+            skipped_decision = strategy.skipped_decision,
+            skipped_wrong_side = strategy.skipped_wrong_side,
+            top_skips = top.join(" | "),
+            "strategy diagnostic",
+        );
         let decisions = strategy.decisions.clone();
         let res = resolve_fills(&engine.fills, &decisions, &windows, &cfg.btc_history);
         runs.push(HarnessRun { variant: v.clone(), results: res });

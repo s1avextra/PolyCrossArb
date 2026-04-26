@@ -98,11 +98,41 @@ impl StrategyVariant {
             ..Self::baseline()
         }
     }
+
+    /// Very loose confidence/z thresholds — forces trades to fire so we can
+    /// verify the harness wiring + resolver. Don't use this for production
+    /// numbers; it'll over-fire on noise.
+    pub fn loose_smoke() -> Self {
+        let mut cfg = ZoneConfig::default();
+        cfg.early_min_confidence = 0.15;
+        cfg.early_min_z = 0.10;
+        cfg.early_min_edge = 0.0;
+        cfg.late_min_confidence = 0.15;
+        cfg.late_min_z = 0.10;
+        cfg.late_min_edge = 0.0;
+        cfg.terminal_min_confidence = 0.15;
+        cfg.terminal_min_z = 0.10;
+        cfg.terminal_min_edge = 0.0;
+        cfg.primary_min_z = 0.10;
+        cfg.min_ev_buffer = -1.0;
+        Self {
+            name: "loose_smoke".into(),
+            zone_config: cfg,
+            skip_dead_zone: false,
+            min_confidence: 0.15,
+            min_edge: 0.0,
+            position_pct: 0.10,
+            max_per_market_usd: 20.0,
+            prefer_maker: false,
+            default_fee_rate: 0.072,
+        }
+    }
 }
 
 /// Default sweep set for the harness.
 pub fn default_variants() -> Vec<StrategyVariant> {
     vec![
+        StrategyVariant::loose_smoke(),
         StrategyVariant::baseline(),
         StrategyVariant::terminal_only(),
         StrategyVariant::aggressive_terminal(),
