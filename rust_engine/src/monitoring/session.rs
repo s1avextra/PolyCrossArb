@@ -36,8 +36,6 @@ struct Counters {
 
 pub struct SessionMonitor {
     session_id: String,
-    log_dir: PathBuf,
-    events_path: PathBuf,
     summary_path: PathBuf,
     file: Mutex<std::fs::File>,
     start_time: f64,
@@ -63,21 +61,11 @@ impl SessionMonitor {
         tracing::info!(?events_path, "session monitor started");
         Ok(Self {
             session_id,
-            log_dir,
-            events_path,
             summary_path,
             file: Mutex::new(file),
             start_time,
             counters: Mutex::new(Counters::default()),
         })
-    }
-
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    pub fn events_path(&self) -> &PathBuf {
-        &self.events_path
     }
 
     fn write_event(&self, category: &str, event_type: &str, mut data: Value) {
@@ -102,10 +90,6 @@ impl SessionMonitor {
                 let _ = f.flush();
             }
         }
-    }
-
-    pub fn record(&self, category: &str, event_type: &str, data: Value) {
-        self.write_event(category, event_type, data);
     }
 
     // ── Order lifecycle ────────────────────────────────────────────
@@ -139,19 +123,6 @@ impl SessionMonitor {
                 "reason": short(reason, 100),
                 "price": round_n(price, 4),
                 "size": round_n(size, 2),
-            }),
-        );
-    }
-
-    pub fn record_order_cancelled(&self, order_id: &str, filled_before_cancel: f64, reason: &str) {
-        self.counters.lock().unwrap().cancel_count += 1;
-        self.write_event(
-            "order",
-            "cancelled",
-            json!({
-                "order_id": short(order_id, 16),
-                "filled_before_cancel": round_n(filled_before_cancel, 2),
-                "reason": short(reason, 100),
             }),
         );
     }
@@ -329,40 +300,10 @@ impl SessionMonitor {
         );
     }
 
-    pub fn record_reconnect(&self, source: &str, attempt: u32) {
-        self.write_event(
-            "system",
-            "reconnect",
-            json!({"source": source, "attempt": attempt}),
-        );
-    }
-
-    pub fn record_api_call(&self, endpoint: &str, latency_ms: f64, status: u16, error: &str) {
-        let mut c = self.counters.lock().unwrap();
-        c.api_latencies.push(latency_ms);
-        if !error.is_empty() {
-            c.errors.push(json!({
-                "endpoint": short(endpoint, 40),
-                "error": short(error, 100),
-                "ts": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0),
-            }));
-        }
-        drop(c);
-        self.write_event(
-            "system",
-            "api_call",
-            json!({
-                "endpoint": short(endpoint, 40),
-                "latency_ms": round_n(latency_ms, 1),
-                "status": status,
-                "error": short(error, 100),
-            }),
-        );
-    }
-
     pub fn save_summary(&self) -> Result<()> {
         let summary = self.get_summary();
         std::fs::write(&self.summary_path, serde_json::to_string_pretty(&summary)?)?;
+        tracing::info!(session_id = %self.session_id, "session summary saved");
         Ok(())
     }
 
@@ -431,9 +372,6 @@ impl SessionMonitor {
         })
     }
 
-    pub fn log_dir(&self) -> &PathBuf {
-        &self.log_dir
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -520,9 +458,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let m = SessionMonitor::open(tmp.path()).unwrap();
         m.record_signal_skip("cidabcdefg", "low_confidence");
-        let path = m.events_path().clone();
         drop(m);
-        let body = std::fs::read_to_string(path).unwrap();
+        // Pick the single session file the open call produced.
+        let entry = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("session_")
+            })
+            .expect("session file");
+        let body = std::fs::read_to_string(entry.path()).unwrap();
         assert!(body.contains("\"reason\":\"low_confidence\""));
         assert!(body.contains("\"cat\":\"signal\""));
     }

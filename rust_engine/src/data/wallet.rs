@@ -52,10 +52,6 @@ impl WalletReader {
         Ok(Self { rpc_url: rpc_url.into(), http, address })
     }
 
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-
     async fn balance_of(&self, token: &str) -> Result<u128> {
         let addr = self.address.trim_start_matches("0x").to_lowercase();
         let padded = format!("{:0>64}", addr);

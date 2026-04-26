@@ -212,30 +212,8 @@ pub async fn okx_feed(state: Arc<RwLock<PriceState>>) {
     .await;
 }
 
-pub async fn mexc_feed(state: Arc<RwLock<PriceState>>) {
-    run_ws_feed(
-        WsCfg {
-            name: "MEXC",
-            url: "wss://wbs.mexc.com/ws",
-            subscribe: Some(
-                r#"{"method":"SUBSCRIPTION","params":["spot@public.miniTicker.v3.api@BTCUSDT@UTC+8"]}"#,
-            ),
-            // MEXC Spot V3 uses uppercase {"method":"PING"} (different from futures).
-            ping: Some((Duration::from_secs(20), r#"{"method":"PING"}"#)),
-        },
-        move |text| {
-            let s = state.clone();
-            async move {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(price) = v["d"]["c"].as_str().and_then(|s| s.parse::<f64>().ok()) {
-                        s.write().await.update("mexc", price);
-                    }
-                }
-            }
-        },
-    )
-    .await;
-}
+// MEXC was removed: it reconnects every ~75s and produces latency spikes.
+// 3 BTC sources (Binance, Bybit, OKX) + Deribit IV is sufficient.
 
 // ── ETH/SOL multi-asset feeds ───────────────────────────────────
 // Binance combined stream for ETH + SOL — single connection, lower overhead.

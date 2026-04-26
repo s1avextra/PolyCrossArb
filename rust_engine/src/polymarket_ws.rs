@@ -45,36 +45,6 @@ pub struct TokenBookState {
     pub last_update_us: u64,
 }
 
-impl TokenBookState {
-    pub fn vwap(&self, side: BookSide, size: f64) -> Option<f64> {
-        let levels = match side {
-            BookSide::Ask => &self.asks,
-            BookSide::Bid => &self.bids,
-        };
-        let mut remaining = size;
-        let mut cost = 0.0;
-        for lvl in levels {
-            let fill = remaining.min(lvl.size);
-            cost += fill * lvl.price;
-            remaining -= fill;
-            if remaining <= 0.0 {
-                break;
-            }
-        }
-        if remaining > 0.0 {
-            None
-        } else {
-            Some(cost / size)
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BookSide {
-    Bid,
-    Ask,
-}
-
 pub type SharedBookState = Arc<RwLock<HashMap<String, TokenBookState>>>;
 
 pub fn new_shared_book() -> SharedBookState {
@@ -366,17 +336,4 @@ mod tests {
         assert!(s.asks.is_empty());
     }
 
-    #[test]
-    fn vwap_fills_or_returns_none() {
-        let mut s = TokenBookState::default();
-        s.asks = vec![
-            BookLevel { price: 0.5, size: 100.0 },
-            BookLevel { price: 0.6, size: 50.0 },
-        ];
-        let v = s.vwap(BookSide::Ask, 100.0).unwrap();
-        assert!((v - 0.5).abs() < 1e-9);
-        let v2 = s.vwap(BookSide::Ask, 130.0).unwrap();
-        assert!((v2 - ((0.5 * 100.0 + 0.6 * 30.0) / 130.0)).abs() < 1e-9);
-        assert!(s.vwap(BookSide::Ask, 200.0).is_none());
-    }
 }

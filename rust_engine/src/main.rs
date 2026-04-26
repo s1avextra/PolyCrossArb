@@ -1,25 +1,21 @@
 //! polymomentum-engine: unified Rust binary.
 //!
 //! Subcommands:
-//!   live       — main runtime (paper/live)
-//!   harness    — backtest A/B harness
-//!   scan       — one-shot Gamma + scanner smoke test
-//!   wallet     — print wallet balances
-//!   ctf        — read CTF resolution for a condition_id
-//!   validate-replay <session.jsonl> — replay validator
+//!   live                              — main runtime (paper/live)
+//!   scan                              — Gamma + scanner smoke test
+//!   wallet                            — print wallet balances
+//!   ctf <condition_id>                — read on-chain CTF resolution
+//!   validate-replay <session.jsonl>   — replay-validator (parity check vs decision function)
 //!
-//! Environment-driven configuration (matches the Python `.env`).
+//! Environment-driven configuration. See `src/config.rs` for the full list of
+//! variables; the runtime reads `.env` from the working directory if present.
 
 mod clob;
 mod config;
 mod data;
-mod debug;
-mod edge;
 mod exchange;
 mod execution;
 mod fair_value;
-mod ipc;
-mod latency;
 mod live;
 mod monitoring;
 mod polymarket_ws;
@@ -92,7 +88,7 @@ async fn main() {
             let pipeline = live::pipeline::Pipeline::new(settings.clone(), m).await;
             match pipeline {
                 Ok(p) => {
-                    install_signal_handlers(p.handles().stop.clone());
+                    install_signal_handlers(p.stop_token());
                     if let Err(e) = p.run().await {
                         tracing::error!(error = %e, "pipeline exited with error");
                         std::process::exit(1);
@@ -140,7 +136,7 @@ fn init_tracing(level: &str) {
 }
 
 async fn cmd_scan(s: &config::Settings, max_hours: f64, min_liquidity: f64) {
-    let client = data::gamma::GammaClient::new(&s.poly_gamma_url, &s.poly_base_url);
+    let client = data::gamma::GammaClient::new(&s.poly_gamma_url);
     match client.fetch_markets_by_end_date(max_hours, min_liquidity).await {
         Ok(markets) => {
             let contracts =

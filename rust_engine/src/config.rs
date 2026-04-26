@@ -6,6 +6,10 @@
 use std::env;
 
 #[derive(Debug, Clone)]
+// Some fields are read by future-phase code paths or surfaced as public
+// config knobs (Kelly fraction, alert_required, etc.) even though the
+// current pipeline does not branch on them. Silence the dead-field warnings.
+#[allow(dead_code)]
 pub struct Settings {
     pub poly_api_key: String,
     pub poly_api_secret: String,

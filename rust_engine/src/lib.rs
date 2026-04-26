@@ -1,18 +1,24 @@
 //! PolyMomentum engine library.
 //!
-//! Phase 1 layout: foundation modules (config, data, strategy) are exposed here.
-//! Live runtime, risk, monitoring, and backtest will land in subsequent phases.
+//! Single-binary Rust trading engine for Polymarket Up/Down crypto candle
+//! markets. Modules:
+//!
+//! - `config`            — env-driven settings
+//! - `data::{gamma, scanner, ctf, wallet, models}`
+//! - `strategy::{momentum, decision}` (+ `fair_value` BS pricer)
+//! - `execution::fees`   — Polymarket binary fee formula
+//! - `risk::manager`     — SQLite RiskManager (matches the Python state.db schema)
+//! - `monitoring::{session, alerter}` — JSONL writer + Slack webhook
+//! - `live::pipeline`    — main runtime: cycle loop, paper resolution, oracle verification
+//! - `polymarket_ws`, `exchange`, `price_state` — market data plumbing
+//! - `clob`, `signing`   — EIP-712-signed CLOB direct order placement (live mode)
 
 pub mod clob;
 pub mod config;
 pub mod data;
-pub mod debug;
-pub mod edge;
 pub mod exchange;
 pub mod execution;
 pub mod fair_value;
-pub mod ipc;
-pub mod latency;
 pub mod live;
 pub mod monitoring;
 pub mod polymarket_ws;

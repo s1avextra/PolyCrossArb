@@ -49,7 +49,6 @@ pub struct RiskConfig {
     pub exposure_ratio: f64,
     pub max_per_market_ratio: f64,
     pub max_per_market_override: f64,
-    pub cooldown_seconds: f64,
 }
 
 impl Default for RiskConfig {
@@ -59,7 +58,6 @@ impl Default for RiskConfig {
             exposure_ratio: 0.80,
             max_per_market_ratio: 0.20,
             max_per_market_override: 20.0,
-            cooldown_seconds: 120.0,
         }
     }
 }
@@ -107,11 +105,6 @@ impl RiskManager {
         (i.cfg.initial_bankroll + i.total_pnl).max(0.0)
     }
 
-    pub async fn max_total_exposure(&self) -> f64 {
-        let i = self.inner.lock().await;
-        (i.cfg.initial_bankroll + i.total_pnl).max(0.0) * i.cfg.exposure_ratio
-    }
-
     pub async fn max_per_market(&self) -> f64 {
         let i = self.inner.lock().await;
         let bk = (i.cfg.initial_bankroll + i.total_pnl).max(0.0);
@@ -131,12 +124,10 @@ impl RiskManager {
         (max - exp).max(0.0)
     }
 
+    /// Realized P&L since the bankroll baseline. Used by tests + monitoring.
+    #[allow(dead_code)]
     pub async fn total_pnl(&self) -> f64 {
         self.inner.lock().await.total_pnl
-    }
-
-    pub async fn total_fees_paid(&self) -> f64 {
-        self.inner.lock().await.total_fees_paid
     }
 
     pub async fn record_pnl(&self, amount: f64) -> Result<()> {
@@ -150,14 +141,6 @@ impl RiskManager {
     pub async fn record_fees(&self, amount: f64) {
         let mut i = self.inner.lock().await;
         i.total_fees_paid += amount;
-    }
-
-    pub async fn cooldown_remaining(&self, event_id: &str, now_s: f64) -> f64 {
-        let i = self.inner.lock().await;
-        let Some(&last) = i.last_trade_time.get(event_id) else {
-            return 0.0;
-        };
-        (i.cfg.cooldown_seconds - (now_s - last)).max(0.0)
     }
 
     pub async fn record_trade(&self, record: TradeRecord) -> Result<()> {

@@ -1,17 +1,17 @@
 #!/bin/bash
 # PolyMomentum healthcheck — invoked by polymomentum-healthcheck.timer.
-# Checks: services up, HTTP /health, disk, kill switch present, recent
-# trade activity, circuit breaker state, alerter cooldown.
+# Checks: service up, kill switch, breaker, last-trade staleness, disk pressure.
 set -uo pipefail
 
 APP_DIR="${POLYMOMENTUM_DIR:-/opt/polymomentum}"
-SERVICES="${POLYMOMENTUM_SERVICES:-polymomentum-candle polymomentum-rust}"
+SERVICE="${POLYMOMENTUM_SERVICE:-polymomentum-engine}"
 WEBHOOK_URL="${ALERT_WEBHOOK_URL:-}"
 KILL_FILE="${KILL_FILE:-/tmp/polymomentum/KILL}"
-STATE_DB="${STATE_DB:-$APP_DIR/logs/state.db}"
+STATE_DB="${STATE_DB:-$APP_DIR/logs/candle/state.db}"
 INACTIVE_HOURS="${INACTIVE_HOURS:-2}"
+LOGS_LIMIT_MB="${LOGS_LIMIT_MB:-2048}"
 
-# Track per-category cooldowns so we don't spam.
+# Per-category cooldown so we don't spam.
 COOLDOWN_DIR="${COOLDOWN_DIR:-/var/tmp/polymomentum-healthcheck}"
 mkdir -p "$COOLDOWN_DIR"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-1800}"
@@ -39,38 +39,28 @@ alert() {
     fi
 }
 
-# 1. Service liveness — restart and alert if any service is dead.
-for svc in $SERVICES; do
-    if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-        alert "service_down" "$svc inactive — restarting"
-        systemctl restart "$svc" 2>/dev/null || true
-    fi
-done
-
-# 2. HTTP /health endpoint (if the bot exposes one).
-# `-w "%{http_code}"` already prints "000" on connection failure, so the
-# previous `|| echo "000"` was concatenating two zeros into "000000" and
-# tripping the alert every cycle when no /health endpoint exists.
-HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health 2>/dev/null)
-HTTP="${HTTP:-000}"
-if [ "$HTTP" != "200" ] && [ "$HTTP" != "000" ]; then
-    alert "http_health" "endpoint returned $HTTP"
+# 1. Service liveness — restart and alert if dead.
+if ! systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+    alert "service_down" "$SERVICE inactive — restarting"
+    systemctl restart "$SERVICE" 2>/dev/null || true
 fi
 
-# 3. Disk free.
+# 2. Disk free.
 DISK=$(df "$APP_DIR" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
 if [ -n "$DISK" ] && [ "$DISK" -gt 90 ]; then
     alert "disk_full" "disk usage ${DISK}% on $APP_DIR"
 fi
 
-# 4. Kill switch — if present, *something* halted trading.
+# 3. Kill switch.
 if [ -f "$KILL_FILE" ]; then
     alert "kill_switch" "kill switch active at $KILL_FILE"
 fi
 
-# 5. State DB sanity — circuit breaker, last trade, paper position count.
+# 4. State DB sanity — circuit breaker, last trade.
 if [ -f "$STATE_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
-    DB_OUT=$(sqlite3 "$STATE_DB" "SELECT 'breaker=' || COALESCE((SELECT value FROM meta WHERE key='candle_breaker_tripped'), '0'); SELECT 'ts=' || COALESCE((SELECT MAX(timestamp) FROM trades), '0');" 2>/dev/null || echo "")
+    DB_OUT=$(sqlite3 "$STATE_DB" \
+        "SELECT 'breaker=' || COALESCE((SELECT value FROM meta WHERE key='candle_breaker_tripped'), '0'); \
+         SELECT 'ts=' || COALESCE((SELECT MAX(timestamp) FROM trades), '0');" 2>/dev/null || echo "")
     BREAKER=$(echo "$DB_OUT" | sed -n 's/^breaker=//p')
     LAST_TRADE_TS=$(echo "$DB_OUT" | sed -n 's/^ts=//p')
     if [ "$BREAKER" = "1" ]; then
@@ -89,9 +79,8 @@ if [ -f "$STATE_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
     fi
 fi
 
-# 6. Disk-pressure on logs/.
+# 5. Disk-pressure on logs/.
 LOGS_SIZE=$(du -sm "$APP_DIR/logs" 2>/dev/null | awk '{print $1}')
-LOGS_LIMIT_MB="${LOGS_LIMIT_MB:-2048}"
 if [ -n "$LOGS_SIZE" ] && [ "$LOGS_SIZE" -gt "$LOGS_LIMIT_MB" ]; then
     alert "logs_full" "logs/ at ${LOGS_SIZE}MB > ${LOGS_LIMIT_MB}MB cap — rotate or trim"
 fi

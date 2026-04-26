@@ -61,16 +61,6 @@ pub struct CandleContract {
     pub asset: String,
 }
 
-impl CandleContract {
-    pub fn spread(&self) -> f64 {
-        (self.up_price + self.down_price - 1.0).abs()
-    }
-
-    pub fn minutes_left(&self) -> f64 {
-        self.hours_left * 60.0
-    }
-}
-
 pub fn scan_candle_markets(
     markets: &[Market],
     max_hours: f64,
@@ -161,8 +151,8 @@ mod tests {
             question: question.into(),
             slug: "x".into(),
             outcomes: vec![
-                Outcome { token_id: "u".into(), name: "Up".into(), price: 0.5, order_book: None },
-                Outcome { token_id: "d".into(), name: "Down".into(), price: 0.5, order_book: None },
+                Outcome { token_id: "u".into(), name: "Up".into(), price: 0.5 },
+                Outcome { token_id: "d".into(), name: "Down".into(), price: 0.5 },
             ],
             tags: vec![],
             category: String::new(),

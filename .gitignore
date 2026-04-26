@@ -1,12 +1,5 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-.venv/
 .env
 *.log
-.pytest_cache/
 logs/
 snapshots/
 snapshots*/
@@ -18,3 +11,4 @@ state.db
 rust_engine/target/
 /data/
 .claude/
+.DS_Store

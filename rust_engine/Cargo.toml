@@ -11,34 +11,27 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "native-tls"] }
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
-# EIP-712 order signing
+# EIP-712 order signing (k256 + sha3 + keccak)
 k256 = { version = "0.13", features = ["ecdsa-core", "sha256"] }
 sha3 = "0.10"
-# HMAC-SHA256 request auth
+# HMAC-SHA256 request auth for the CLOB POST headers
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
-# UDS IPC
-rmp-serde = "1"
-rand = "0.8"
 hex = "0.4"
+rand = "0.8"
 # State persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Structured logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
 # CLI parsing
 clap = { version = "4", features = ["derive", "env"] }
-# Concurrent maps
-dashmap = "6"
 # Regex for candle question parsing
 regex = "1"
-# Math utilities
+# Lazy statics
 once_cell = "1"
 # Error handling
-thiserror = "2"
 anyhow = "1"
 
 [dev-dependencies]
@@ -52,7 +45,3 @@ codegen-units = 1
 [[bin]]
 name = "polymomentum-engine"
 path = "src/main.rs"
-
-[[bin]]
-name = "polymomentum-legacy"
-path = "src/legacy_main.rs"

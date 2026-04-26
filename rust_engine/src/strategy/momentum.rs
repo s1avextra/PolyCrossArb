@@ -9,41 +9,6 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolatilityRegime {
-    Low,
-    Normal,
-    High,
-    Extreme,
-}
-
-impl VolatilityRegime {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            VolatilityRegime::Low => "low",
-            VolatilityRegime::Normal => "normal",
-            VolatilityRegime::High => "high",
-            VolatilityRegime::Extreme => "extreme",
-        }
-    }
-}
-
-pub fn classify_vol_regime(short_vol: f64, baseline_vol: f64) -> VolatilityRegime {
-    if baseline_vol <= 0.0 || short_vol <= 0.0 {
-        return VolatilityRegime::Normal;
-    }
-    let ratio = short_vol / baseline_vol;
-    if ratio > 2.5 {
-        VolatilityRegime::Extreme
-    } else if ratio > 1.5 {
-        VolatilityRegime::High
-    } else if ratio < 0.5 {
-        VolatilityRegime::Low
-    } else {
-        VolatilityRegime::Normal
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MomentumSignal {
     pub direction: String,
@@ -127,15 +92,6 @@ impl MomentumDetector {
         }
         let v = (self.slow_var.max(0.0) * SECONDS_PER_YEAR).sqrt();
         v.clamp(self.cfg.floor_vol, 5.0)
-    }
-
-    pub fn vol_ratio(&self) -> f64 {
-        let slow = self.slow_realized_vol();
-        if slow <= 0.0 {
-            1.0
-        } else {
-            self.realized_vol() / slow
-        }
     }
 
     pub fn set_realized_vol(&mut self, vol: f64) {

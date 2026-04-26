@@ -30,7 +30,6 @@ pub struct PaperFill {
     pub fill_price: f64,
     pub shares: f64,
     pub fee: f64,
-    pub fee_rate: f64,
 }
 
 pub fn simulate_paper_fill(
@@ -50,11 +49,11 @@ pub fn simulate_paper_fill(
     let slipped = slipped.clamp(0.01, 0.99);
     let shares = position_usd / slipped;
     let fee = polymarket_fee(shares, slipped, fee_rate);
+    let _ = fee_rate;
     Some(PaperFill {
         fill_price: slipped,
         shares,
         fee,
-        fee_rate,
     })
 }
 

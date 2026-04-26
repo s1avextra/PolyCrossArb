@@ -1,109 +1,121 @@
 # PolyMomentum
 
-Single-strategy bot trading **"Up or Down" 5/15-min crypto candle markets on Polymarket**. Multi-exchange momentum signal → BS-binary fair-value mispricing detection → CLOB execution.
+Single-strategy bot trading **"Up or Down" 5/15-min crypto candle markets on Polymarket**, written in Rust. Multi-exchange momentum signal → BS-binary fair-value mispricing → CLOB execution.
 
-> **Status (2026-04-25):** Paper mode running 24/7 on a shared VPS. Post-audit backtests show break-even — terminal-zone-only is the one sub-strategy with positive bias. **No live trades have been placed.** Wallet is funded ($6.03 USDC.e + ~5.37 POL) but only as a tip in the water.
+> **Status (2026-04-26):** Rust port complete. The Python implementation has been removed. Paper mode is production-ready and reaches 0.4-0.9 ms per cycle on a single binary. Live execution is wired through EIP-712 signed CLOB orders but gated behind `--i-understand-live`. Wallet ($6.03 USDC.e + ~5.37 POL) untouched throughout the port.
 
 ## What it does
 
 For each active candle window:
 
-1. **Subscribe** to 8-exchange spot WS feeds (Binance, Bybit, OKX, Coinbase, Bitget, HTX, Gate.io, Kraken) for the underlying asset (BTC primary; ETH/SOL alts).
-2. **Detect momentum** via `MomentumDetector`: z-score of the move from window-open against EWMA fast/slow realized vol, plus consistency.
-3. **Compute BS fair value** of the binary "above strike" using observed implied vol from Deribit + window time-to-expiry.
-4. **Compare to market** (top of book on the candle's YES/NO Polymarket tokens). Mispricing > threshold + zone-conditional confidence/edge gates → trade.
-5. **Hold to resolution** (window close), then mark won/lost vs our BTC tape AND cross-check against Polymarket's CCIX oracle.
+1. **Subscribe** to Binance, Bybit, OKX (BTC) plus Binance/Bybit (ETH+SOL) spot WS feeds; pull Deribit IV every 60 s.
+2. **Subscribe** to Polymarket's `/ws/market` book channel for every active candle's YES/NO tokens; resubscribe automatically when the contract scanner refreshes.
+3. **Detect momentum** via `MomentumDetector`: z-score of the move from window-open against EWMA fast/slow realized vol, weighted with consistency + reversion penalty.
+4. **Compute BS fair value** of the binary "above strike" using observed Deribit IV + window time-to-expiry.
+5. **Decide** through `decide_candle_trade`: 4-zone gates (early / primary / late / terminal) with independent confidence/z/edge thresholds, dead-zone filter, entry-price EV gate, and an `edge_cap` brake against stale-data signals (relaxed in terminal zone).
+6. **Hold to resolution**, mark won/lost vs our BTC tape, and cross-check against Polymarket's on-chain CTF resolution (UMA's optimistic oracle).
 
-Zone gates split the window into **early / primary / late / terminal** bands with independent thresholds. The post-audit reality is that **only terminal-zone (last 5%) entries showed profit** in our backtests; the other zones are break-even or losing.
+Zone gates split the window into bands with independent thresholds. The post-audit reality is that **only terminal-zone (last 5%) entries showed profit** in our backtests; the other zones are break-even or losing.
 
-## What's running
+## Layout
 
 ```
-VPS (193.24.234.202, alias `vps`):
-  /opt/polymomentum/current → releases/2026-04-25T110627Z
-  
-  systemd:
-    polymomentum-rust.service         (Rust latency engine, WS feeds, CLOB signing)
-    polymomentum-candle.service       (Python pipeline, --mode paper)
-    polymomentum-healthcheck.timer    (every 60s)
-
-  Coexistence caps (multibot host shared with adgts + polyarbitrage):
-    CPUQuota=80%  MemoryMax=512M  TasksMax=256  per unit
+PolyMomentum/
+├── rust_engine/             # the entire bot
+│   ├── src/
+│   │   ├── main.rs          # clap subcommand dispatch
+│   │   ├── lib.rs           # module re-exports
+│   │   ├── config.rs        # env-driven Settings
+│   │   ├── data/            # gamma client, scanner, ctf reader, wallet, models
+│   │   ├── strategy/        # momentum detector, decide_candle_trade
+│   │   ├── fair_value.rs    # Black-Scholes binary pricer
+│   │   ├── execution/fees.rs
+│   │   ├── risk/manager.rs  # SQLite RiskManager (state.db)
+│   │   ├── monitoring/      # JSONL session writer + Slack alerter
+│   │   ├── live/            # cycle loop, paper resolver, oracle verifier, breaker
+│   │   ├── polymarket_ws.rs # full L2 book WS feed
+│   │   ├── exchange.rs      # multi-exchange spot WS aggregator
+│   │   ├── price_state.rs
+│   │   ├── clob.rs          # CLOB direct order placement (live mode)
+│   │   └── signing.rs       # EIP-712 order signing
+│   └── Cargo.toml
+├── deploy/                  # Rust-only deploy + systemd
+├── docs/                    # docs (RUST_PORT_PLAN.md, peer-bot notes)
+└── data/                    # local cache (gitignored)
 ```
 
-See [memory/project_state.md](https://github.com/s1avextra/PolyMomentum/blob/main/.claude/projects/-Users-ttoomm-Documents-PolyMomentum/memory/project_state.md) — wait, that's gitignored. The handoff doc lives at `~/.claude/projects/-Users-ttoomm-Documents-PolyMomentum/memory/project_state.md` on the operator's machine.
+## Subcommands
+
+```bash
+polymomentum-engine live --mode paper           # main runtime (default)
+polymomentum-engine live --mode live --i-understand-live   # real money
+polymomentum-engine scan                        # Gamma + scanner smoke test
+polymomentum-engine wallet                      # USDC.e + POL balances
+polymomentum-engine ctf <condition_id>          # on-chain CTF resolution read
+polymomentum-engine validate-replay <session.jsonl>   # parity check
+```
 
 ## Operational commands
 
 ```bash
 # Health
-ssh vps 'systemctl is-active polymomentum-rust polymomentum-candle adgts polyarbitrage'
+ssh vps 'systemctl is-active polymomentum-engine adgts polyarbitrage'
 
-# Live cycle log (cycle_ms, price_staleness_ms, top_skips, trade count)
-ssh vps 'journalctl -u polymomentum-candle -f -n 5 | grep candle.cycle'
+# Live cycle log
+ssh vps 'journalctl -u polymomentum-engine -f -n 5 | grep candle.cycle'
 
 # Trade tape
-ssh vps 'journalctl -u polymomentum-candle | grep -E "candle.trade.paper|candle.resolved"'
+ssh vps 'journalctl -u polymomentum-engine | grep -E "candle.trade|candle.resolved"'
 
 # Kill switch (halts trading within ~100ms)
 ssh vps 'touch /tmp/polymomentum/KILL'
-ssh vps 'rm /tmp/polymomentum/KILL && systemctl restart polymomentum-candle'
+# resume:
+ssh vps 'rm /tmp/polymomentum/KILL && \
+         sqlite3 /opt/polymomentum/logs/candle/state.db \
+                 "DELETE FROM meta WHERE key=\"candle_breaker_tripped\"" && \
+         systemctl restart polymomentum-engine'
 
-# Deploy
-bash deploy/deploy.sh vps           # Python only (~10s)
-bash deploy/deploy.sh vps --rust    # also rebuild Rust binary (~2.5min)
+# Deploy (build, ship, restart) — paper mode default
+bash deploy/deploy.sh vps --enable-service --mode paper
 
-# Rollback
-ssh vps '/opt/polymomentum/current/deploy/rollback.sh'
+# Switch to live (real money) without redeploying
+ssh vps 'sudo sed -i "s/--mode paper/--mode live --i-understand-live/" \
+            /etc/systemd/system/polymomentum-engine.service && \
+         sudo systemctl daemon-reload && sudo systemctl restart polymomentum-engine'
 ```
 
 ## Replay-grade data collection
 
-Paper-mode design goal: paper run logs replayable through the backtest harness producing **identical PnL**, AND paper fills representative of live fills. As of `19b82b8`:
+Paper-mode design goal: paper run logs replayable through the same decision function, with **identical PnL**, AND paper fills representative of live fills.
 
-- **Per-evaluation JSONL** (`logs/sessions/session_*.jsonl`) — `cat=signal type=evaluation` events fire on every contract evaluation (trade or skip), with full state: open price, current price, z-score, confidence, EWMA fast/slow vol, cross-asset boost, top of book, decision zone, fair value, edge, traded flag, skip reason + detail.
-- **Cycle latency** — `cycle_ms` + `price_staleness_ms` per cycle so we can calibrate the backtest's static-latency assumption.
-- **Polymarket oracle cross-check** — `cat=oracle type=resolution` events compare our BTC-tape resolution to Polymarket's actual settlement (their CCIX index). Disagreement = real strategy risk we now quantify.
-- **Persistent state** (`f61ff0a`): `logs/` and `data/` are symlinked to `/opt/polymomentum/{logs,data}` shared dirs, so SQLite + JSONL + CSV survive deploys.
+- **Per-evaluation JSONL** (`/opt/polymomentum/logs/sessions/session_*.jsonl`) — `cat=signal type=evaluation` events fire on every contract evaluation (trade or skip), with full state: open price, current price, z-score, confidence, EWMA fast/slow vol, cross-asset boost, top of book, decision zone, fair value, edge, traded flag, skip reason + detail.
+- **CTF oracle cross-check** — `cat=oracle type=resolution` events compare our BTC-tape resolution to Polymarket's CCIX-driven settlement, read directly from the on-chain `ConditionalTokens` contract via `eth_call`.
+- **Persistent state** — SQLite at `/opt/polymomentum/logs/candle/state.db` survives deploys; `paper_positions`, `oracle_pending`, `meta`, `trades`, `state` tables.
 
-Validate a paper session against the backtest:
+Validate a paper session against the decision function:
+
 ```bash
-uv run python scripts/validate_paper_replay.py logs/sessions/session_*.jsonl
+polymomentum-engine validate-replay /opt/polymomentum/logs/sessions/session_<ts>.jsonl
 ```
-Exit 0 = clean, 1 = decision drift detected.
 
-## Critical files
-
-| | |
-|---|---|
-| Live entry | `scripts/run_production.py --mode paper\|live` |
-| Backtest harness | `scripts/run_strategy_harness.py` |
-| Replay validator | `scripts/validate_paper_replay.py` |
-| Live runtime | `src/polymomentum/crypto/candle_pipeline.py` |
-| Pure decision (live + backtest) | `src/polymomentum/crypto/decision.py` |
-| Momentum + EWMA vol | `src/polymomentum/crypto/momentum.py` |
-| BS pricer | `src/polymomentum/crypto/fair_value.py` |
-| Multi-exchange WS aggregator | `src/polymomentum/crypto/price_feed.py` |
-| Polymarket fee formula | `src/polymomentum/execution/fees.py` |
-| L2 backtest engine | `src/polymomentum/backtest/l2_replay.py` |
-| Rust latency engine | `rust_engine/src/main.rs`, `rust_engine/src/exchange.rs` |
+Exit 0 = clean, 1 = decision drift.
 
 ## Tests
 
 ```bash
-uv sync --all-extras              # one-time install of dev + execution extras
-uv run pytest -q                  # 117 passed, 2 skipped
-cd rust_engine && cargo test      # 14 passed
+cd rust_engine
+cargo test                # 51 unit tests
+cargo build --release     # ./target/release/polymomentum-engine
 ```
 
 ## Multibot etiquette
 
-PolyMomentum shares the VPS with two other bots: **adgts** (XRP/USDT futures grid, port 9092) and **polyarbitrage** (port 127.0.0.1:9090). Don't touch their `/opt/<name>`, `/etc/<name>`, or systemd units. Coexistence caps applied via systemd drop-ins. Use `nice -n 10 cargo build --release` for Rust builds. See [docs/cross_bot_note_mexc_hardening.md](docs/cross_bot_note_mexc_hardening.md) for the cross-Claude coordination protocol.
+PolyMomentum shares the VPS (`193.24.234.202`, alias `vps`) with **adgts** (XRP/USDT futures grid, port 9092) and **polyarbitrage** (port 127.0.0.1:9090). Don't touch their `/opt/<name>`, `/etc/<name>`, or systemd units. Coexistence caps applied via `polymomentum-engine.service`: `CPUQuota=80%`, `MemoryMax=512M`, `TasksMax=256`. Use `nice -n 10 cargo build --release` for builds on the VPS. See [docs/cross_bot_note_mexc_hardening.md](docs/cross_bot_note_mexc_hardening.md) for the cross-Claude coordination protocol.
 
 ## Strategy reality check
 
-Post-audit (after fixing 4 lookahead/precision bugs): backtests show **break-even to losing** across baseline, ewma_15min, regime variants. The terminal-zone-only sub-strategy had +$7.66 on 13 trades in one window — promising but tiny sample. **Going live with capital today would be premature.** The current play is to collect 24h+ of replay-grade paper data, then iterate (entry-price filter, terminal-only deployment, more backtest windows) before flipping any live switch.
+Post-audit (after fixing 4 lookahead/precision bugs in 2026-04-25): backtests showed **break-even to losing** across baseline, ewma_15min, regime variants. The terminal-zone-only sub-strategy had +$7.66 on 13 trades in one window — promising but tiny sample. **Going live with capital today would be premature.** The current play is to collect 24h+ of Rust paper data, then iterate before flipping any live switch.
 
 ---
 
-*Repository renamed from PolyCrossArb → PolyMomentum on 2026-04-13 when the cross-arb and weather strategies were deleted (-10,225 LOC).*
+*Repository renamed from PolyCrossArb → PolyMomentum on 2026-04-13 when the cross-arb and weather strategies were deleted. Python implementation removed on 2026-04-26 after the Rust port reached production-ready paper mode.*

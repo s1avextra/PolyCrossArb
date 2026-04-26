@@ -281,23 +281,6 @@ impl ClobClient {
         }
     }
 
-    /// Get average order placement latency in microseconds
-    pub fn avg_latency_us(&self) -> u64 {
-        if self.latencies.is_empty() {
-            return 0;
-        }
-        self.latencies.iter().sum::<u64>() / self.latencies.len() as u64
-    }
-
-    /// Get p99 order placement latency
-    pub fn p99_latency_us(&self) -> u64 {
-        if self.latencies.is_empty() {
-            return 0;
-        }
-        let mut sorted = self.latencies.clone();
-        sorted.sort();
-        sorted[sorted.len() * 99 / 100]
-    }
 }
 
 /// Shared CLOB client wrapped for async access

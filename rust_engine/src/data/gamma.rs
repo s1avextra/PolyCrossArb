@@ -1,6 +1,8 @@
-//! Polymarket Gamma + CLOB REST client.
+//! Polymarket Gamma REST client (market discovery).
 //!
-//! Gamma: market metadata. CLOB: prices and order books.
+//! The CLOB REST endpoints (`/book`, `/midpoint`) used to live here, but the
+//! pipeline now reads books off the WebSocket feed in `polymarket_ws.rs`,
+//! so REST book/midpoint queries were removed during the cleanup audit.
 
 use std::time::Duration;
 
@@ -8,41 +10,32 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::data::models::{Market, OrderBook, OrderBookLevel, Outcome};
+use crate::data::models::{Market, Outcome};
 
 const GAMMA_MARKETS: &str = "/markets";
-const CLOB_BOOK: &str = "/book";
-const CLOB_MIDPOINT: &str = "/midpoint";
 
 #[derive(Clone)]
 pub struct GammaClient {
     gamma_url: String,
-    clob_url: String,
     http: Client,
     max_retries: u32,
 }
 
 impl GammaClient {
-    pub fn new(gamma_url: impl Into<String>, clob_url: impl Into<String>) -> Self {
+    pub fn new(gamma_url: impl Into<String>) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client builds");
         Self {
             gamma_url: gamma_url.into().trim_end_matches('/').to_string(),
-            clob_url: clob_url.into().trim_end_matches('/').to_string(),
             http,
             max_retries: 3,
         }
     }
 
-    async fn get_with_retry(
-        &self,
-        base_url: &str,
-        path: &str,
-        params: &[(&str, String)],
-    ) -> Result<Value> {
-        let url = format!("{base_url}{path}");
+    async fn get_with_retry(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
+        let url = format!("{}{path}", self.gamma_url);
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..self.max_retries {
             let resp = self.http.get(&url).query(params).send().await;
@@ -68,39 +61,10 @@ impl GammaClient {
         Err(last_err.unwrap_or_else(|| anyhow!("Gamma request failed without specific error")))
     }
 
-    /// Fetch one page of markets (Gamma /markets).
-    pub async fn fetch_markets_page(
-        &self,
-        limit: u32,
-        offset: u32,
-        active: bool,
-        closed: bool,
-    ) -> Result<Vec<Value>> {
-        let params = vec![
-            ("limit", limit.to_string()),
-            ("offset", offset.to_string()),
-            ("active", active.to_string()),
-            ("closed", closed.to_string()),
-        ];
-        let v = self.get_with_retry(&self.gamma_url, GAMMA_MARKETS, &params).await?;
-        Ok(unwrap_market_list(v))
-    }
-
-    /// Fetch a single market by condition_id.
-    pub async fn fetch_market_by_condition_id(&self, condition_id: &str) -> Result<Option<Market>> {
-        if condition_id.is_empty() {
-            return Ok(None);
-        }
-        let params = vec![
-            ("condition_ids", condition_id.to_string()),
-            ("limit", "1".to_string()),
-        ];
-        let v = self.get_with_retry(&self.gamma_url, GAMMA_MARKETS, &params).await?;
-        let items = unwrap_market_list(v);
-        Ok(items.into_iter().next().and_then(|m| parse_gamma_market(&m)))
-    }
-
-    /// Fetch markets sorted by endDate ascending — fast path for candle discovery.
+    /// Fetch markets sorted by endDate ascending — the fast path for candle
+    /// discovery. Stops paginating once the last page's endDate exceeds
+    /// `now + max_hours`. Filters out markets with degenerate prices /
+    /// missing tokens / liquidity below `min_liquidity`.
     pub async fn fetch_markets_by_end_date(
         &self,
         max_hours: f64,
@@ -121,7 +85,7 @@ impl GammaClient {
                 ("order", "endDate".to_string()),
                 ("ascending", "true".to_string()),
             ];
-            let v = self.get_with_retry(&self.gamma_url, GAMMA_MARKETS, &params).await?;
+            let v = self.get_with_retry(GAMMA_MARKETS, &params).await?;
             let items = unwrap_market_list(v);
             if items.is_empty() {
                 break;
@@ -162,51 +126,6 @@ impl GammaClient {
 
         tracing::info!(count = all.len(), max_hours, "Gamma markets-by-endDate fetched");
         Ok(all)
-    }
-
-    /// Fetch CLOB order book for a token.
-    pub async fn fetch_order_book(&self, token_id: &str) -> Result<OrderBook> {
-        let params = vec![("token_id", token_id.to_string())];
-        let v = self.get_with_retry(&self.clob_url, CLOB_BOOK, &params).await?;
-        let mut bids: Vec<OrderBookLevel> = v
-            .get("bids")
-            .and_then(|b| b.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| {
-                        let p = x.get("price").and_then(parse_f64)?;
-                        let s = x.get("size").and_then(parse_f64)?;
-                        Some(OrderBookLevel { price: p, size: s })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut asks: Vec<OrderBookLevel> = v
-            .get("asks")
-            .and_then(|b| b.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| {
-                        let p = x.get("price").and_then(parse_f64)?;
-                        let s = x.get("size").and_then(parse_f64)?;
-                        Some(OrderBookLevel { price: p, size: s })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-        asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(OrderBook { bids, asks })
-    }
-
-    /// Fetch midpoint price for a token.
-    pub async fn fetch_midpoint(&self, token_id: &str) -> Option<f64> {
-        let params = vec![("token_id", token_id.to_string())];
-        let v = self
-            .get_with_retry(&self.clob_url, CLOB_MIDPOINT, &params)
-            .await
-            .ok()?;
-        v.get("mid").and_then(parse_f64)
     }
 }
 
@@ -292,7 +211,6 @@ pub fn parse_gamma_market(raw: &Value) -> Option<Market> {
             token_id: token_ids.get(i).cloned().unwrap_or_default(),
             name: name.clone(),
             price: outcome_prices.get(i).copied().unwrap_or(0.0),
-            order_book: None,
         })
         .collect();
 

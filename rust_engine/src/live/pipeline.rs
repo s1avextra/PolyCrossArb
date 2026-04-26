@@ -59,11 +59,6 @@ impl Mode {
     }
 }
 
-pub struct PipelineHandles {
-    pub stop: Arc<Notify>,
-    pub price_state: Arc<RwLock<PriceState>>,
-    pub book_state: SharedBookState,
-}
 
 #[derive(Debug, Clone)]
 struct PaperPosition {
@@ -180,7 +175,6 @@ impl Pipeline {
         };
         let risk_cfg = RiskConfig {
             initial_bankroll: bankroll,
-            cooldown_seconds: settings.cooldown_seconds,
             max_per_market_override: settings.max_position_per_market_usd,
             ..Default::default()
         };
@@ -188,7 +182,7 @@ impl Pipeline {
 
         let monitor = Arc::new(SessionMonitor::open(&settings.session_log_dir)?);
         let alerter = Alerter::new(std::env::var("SLACK_WEBHOOK_URL").ok());
-        let gamma = GammaClient::new(&settings.poly_gamma_url, &settings.poly_base_url);
+        let gamma = GammaClient::new(&settings.poly_gamma_url);
         let ctf = CtfReader::new(&settings.polygon_rpc_url);
         let zone_config = ZoneConfig::from_settings(&settings);
         let breaker_cfg = BreakerConfig {
@@ -277,12 +271,9 @@ impl Pipeline {
         Ok(p)
     }
 
-    pub fn handles(&self) -> PipelineHandles {
-        PipelineHandles {
-            stop: self.stop.clone(),
-            price_state: self.price_state.clone(),
-            book_state: self.book_state.clone(),
-        }
+    /// Hand back the cancellation token so a signal handler can request shutdown.
+    pub fn stop_token(&self) -> Arc<Notify> {
+        self.stop.clone()
     }
 
     pub async fn run(self: &Arc<Self>) -> Result<()> {
