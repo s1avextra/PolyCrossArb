@@ -1058,7 +1058,17 @@ class CandlePipeline:
         position = min(position, self._risk.max_per_market)
         position = min(position, self._risk.available_capital)
 
-        if position < 1.0:  # Polymarket rejects orders below $1
+        # Polymarket's order book minimum is $1. At sub-$10 bankroll the
+        # 10% target falls below this; floor to $1 (the Polymarket
+        # minimum) so the strategy can actually run on a small wallet.
+        # This means trades at sub-$10 bankroll exceed the 10% rule —
+        # accepted as a startup-phase exception. Once paper PnL or live
+        # capital pushes effective bankroll past $10, the 10% rule
+        # naturally takes over.
+        if 0 < position < 1.0 and self._risk.available_capital >= 1.0:
+            position = 1.0
+
+        if position < 1.0:  # truly can't trade — no available capital
             return
 
         if market_price <= 0.01 or market_price >= 0.99:
