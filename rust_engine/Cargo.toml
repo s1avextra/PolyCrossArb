@@ -41,6 +41,9 @@ csv = "1"
 # Compact sidecar cache for filtered events
 bincode = "1"
 flate2 = "1"
+# Work-stealing parallel iteration for the per-variant backtest fan-out
+rayon = "1"
+num_cpus = "1"
 
 [dev-dependencies]
 tempfile = "3"

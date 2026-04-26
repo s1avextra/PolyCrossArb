@@ -136,6 +136,11 @@ enum Command {
         /// Show top N variants in the report.
         #[arg(long, default_value_t = 20)]
         top: usize,
+        /// Variant-fan-out thread count. 0 → rayon's default (num_cpus, also
+        /// honors `RAYON_NUM_THREADS`). 1 → serial. Use small N on the VPS
+        /// (e.g. 1) per CLAUDE.md rule 5; full N=num_cpus on a dev box.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
     /// Run the full L2-backtest harness over PMXT v2 archives. Loads candle
     /// markets from Gamma, downloads/streams the requested UTC hours,
@@ -161,6 +166,9 @@ enum Command {
         /// Insert latency in ms (strategy → fill).
         #[arg(long, default_value_t = 50)]
         latency_ms: u64,
+        /// Variant-fan-out thread count (see harness-sweep --threads).
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
     /// Replay one or more captured session JSONLs through a grid of strategy
     /// variants and report synthetic P&L per variant.
@@ -249,6 +257,7 @@ async fn main() {
             ev_buffer,
             also_maker,
             top,
+            threads,
         } => {
             let conf = parse_csv_floats(&conf);
             let zs = parse_csv_floats(&z);
@@ -268,6 +277,7 @@ async fn main() {
                 evs,
                 also_maker,
                 top,
+                threads,
             ).await;
         }
         Command::Harness {
@@ -277,8 +287,9 @@ async fn main() {
             cache_dir,
             btc_csv,
             latency_ms,
+            threads,
         } => {
-            cmd_harness(&settings, &start, end.as_deref(), bankroll, cache_dir.as_deref(), btc_csv.as_deref(), latency_ms).await;
+            cmd_harness(&settings, &start, end.as_deref(), bankroll, cache_dir.as_deref(), btc_csv.as_deref(), latency_ms, threads).await;
         }
         Command::SelfTest => {
             println!("self-test: this binary's tests run via `cargo test`. ok.");
@@ -642,6 +653,7 @@ async fn cmd_harness_sweep(
     ev_buffer: Vec<f64>,
     also_maker: bool,
     top: usize,
+    threads: usize,
 ) {
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
@@ -792,11 +804,12 @@ async fn cmd_harness_sweep(
     let cfg = backtest::harness::HarnessConfig {
         hours,
         universe,
-        btc_history: btc,
+        btc_history: std::sync::Arc::new(btc),
         bankroll_usd: bankroll,
         cache_dir: cache_dir_path,
         latency: backtest::l2_replay::StaticLatencyConfig { insert_ms: latency_ms },
         shared_distilled_dir: shared_dir,
+        threads: if threads == 0 { None } else { Some(threads) },
     };
 
     println!("\nRunning sweep over {} variants × {} hours…\n", variants.len(), cfg.hours.len());
@@ -838,6 +851,7 @@ async fn cmd_harness(
     cache_dir: Option<&str>,
     btc_csv: Option<&str>,
     latency_ms: u64,
+    threads: usize,
 ) {
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
@@ -1021,11 +1035,12 @@ async fn cmd_harness(
     let cfg = backtest::harness::HarnessConfig {
         hours,
         universe,
-        btc_history: btc,
+        btc_history: std::sync::Arc::new(btc),
         bankroll_usd: bankroll,
         cache_dir: cache_dir_path,
         latency: backtest::l2_replay::StaticLatencyConfig { insert_ms: latency_ms },
         shared_distilled_dir: shared_dir,
+        threads: if threads == 0 { None } else { Some(threads) },
     };
 
     let variants = backtest::strategies::default_variants();

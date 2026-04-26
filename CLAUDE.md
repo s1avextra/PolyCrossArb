@@ -76,20 +76,22 @@ candles cache (`/opt/shared/pmxt_v2_distilled_candles/`) are owned by the
 2. **Never read another tenant's private dirs.** `/opt/polyarbitrage/*`, `/etc/polyarbitrage/*`, their wallet — off-limits. Same the other way for `/opt/polymomentum/*`. Cross-bot coordination goes through `/opt/shared/cross_bot_notes/` only.
 3. **Never run two `cargo build --release` concurrently** on the VPS. The box is 2-core; two release builds OOM. Use `nice -n 10 cargo build --release` so peer bot work stays responsive.
 4. **Never concurrently scan the same parquet hour from two processes.** Parquet predicate pushdown is single-threaded per file (pyarrow + arrow-rs). Stage your pipeline so each parquet is read at most once per pass.
+5. **CPU-intensive work runs on a dev box, not the VPS.** Sweeps, harness runs, parameter searches — anything that saturates CPU for >30 s — runs on a 10+ core dev box; results/artifacts get exported to the shared dir or rsync'd to `/opt/polymomentum/`. The VPS is for live runtime, the parquet downloader, and one-off `distill` invocations only. Two-core VPS + a 144-variant sweep starves peer live runtimes (missed ticks, alerter falls behind). Finalized 2026-04-27.
 
 ### Conventions
 
-5. **Always filter at the parquet level.** Use `RowFilter` (Rust `parquet` crate) or `pyarrow.dataset.scanner(filter=…, columns=[…])`. Each hour file is ~330–460 MB compressed, ~700 MB uncompressed, ~86 M rows — full loads will OOM the 2-core box.
-6. **Provide a `--delete-after-process`-style flag** for one-shot backfills so callers can choose to keep or drop the parquet. Pre-existing files (rule 1) stay regardless.
-7. **Provide a distilled-cache flag** (or env var) for any sweep that re-reads the same window. PolyMomentum's flag: `--cache-dir <dir>` for the per-tenant sidecar (`*.events.bin.gz`), and `PMXT_DISTILLED_DIR` env var or auto-detect of `/opt/shared/pmxt_v2_distilled_candles/` for the cross-bot cache.
-8. **Atomic-rename writes for every shared file.** Write to `*.tmp.<pid>` then `rename(2)`. No lockfiles — they bite us on shared volumes.
+6. **Always filter at the parquet level.** Use `RowFilter` (Rust `parquet` crate) or `pyarrow.dataset.scanner(filter=…, columns=[…])`. Each hour file is ~330–460 MB compressed, ~700 MB uncompressed, ~86 M rows — full loads will OOM the 2-core box.
+7. **Provide a `--delete-after-process`-style flag** for one-shot backfills so callers can choose to keep or drop the parquet. Pre-existing files (rule 1) stay regardless.
+8. **Provide a distilled-cache flag** (or env var) for any sweep that re-reads the same window. PolyMomentum's flag: `--cache-dir <dir>` for the per-tenant sidecar (`*.events.bin.gz`), and `PMXT_DISTILLED_DIR` env var or auto-detect of `/opt/shared/pmxt_v2_distilled_candles/` for the cross-bot cache.
+9. **Atomic-rename writes for every shared file.** Write to `*.tmp.<pid>` then `rename(2)`. No lockfiles — they bite us on shared volumes. Concurrent writers on the same `<hour>.v1.*` file are safe because both produce byte-identical content for the same input parquet + cid list (verified by byte-diff sanity test); the second writer's rename clobbers identical bytes.
+10. **Iterate parquets in row-group / batch order — never pre-sort or buffer.** Both writers must emit events in parquet-native order so the byte-diff sanity test passes. If the schema needs sorting in the future, bump the filename's schema tag (`v1` → `v2`) — never reorder in place.
 
 ### Shared distilled candles cache
 
 - Path: `/opt/shared/pmxt_v2_distilled_candles/<hour>.v1.candles.jsonl.gz`
-- Schema v1: see `docs/cross_bot_distilled_cache_response.md` (event types `book`, `chg`, `trade`; numeric strings on price/size; f64 elsewhere)
+- **Schema v1: FROZEN as of 2026-04-27.** See `docs/cross_bot_protocol_v1_finalized.md` and `docs/cross_bot_distilled_cache_response.md`. Event types `book` + `chg` + `trade`. Numeric strings (zero-padded to parquet decimal scale) on price/size; f64 (shortest-round-trip) elsewhere. Trade `tx` field omitted when null (never serialized as `"tx": null`).
 - Writer: `polymomentum-engine distill --input <parquet> [--candle-cids <file>] [--output <path>]`
-- Reader contract: missing | corrupt | schema-mismatch → fall back to the per-tenant sidecar, then to a parquet RowFilter scan.
+- Reader contract: missing | corrupt | schema-mismatch → fall back to the per-tenant sidecar, then to a parquet RowFilter scan. Reader skips malformed JSONL lines with a warning.
 - Candle universe: see `docs/candle_universe.md` (regex + 11 supported assets) — both bots must agree on this set so byte-diff tests pass.
 
 ### Coordination notes directory

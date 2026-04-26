@@ -12,9 +12,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use rayon::prelude::*;
 
 use crate::backtest::btc_history::BTCHistory;
 use crate::backtest::fill_model::{Maker, OneTickTaker, Perfect};
@@ -95,7 +97,7 @@ pub struct CandleBacktestStrategy {
     universe_by_token: BTreeMap<String, CandleContract>,
     momentum: MomentumDetector,
     bankroll_usd: f64,
-    btc_history: BTCHistory,
+    btc_history: Arc<BTCHistory>,
     pub decisions: Vec<CandleDecision>,
     /// Per-condition_id flag so we only enter once per market.
     traded: HashSet<String>,
@@ -120,7 +122,7 @@ impl CandleBacktestStrategy {
         variant: StrategyVariant,
         universe: &CandleUniverse,
         bankroll_usd: f64,
-        btc_history: BTCHistory,
+        btc_history: Arc<BTCHistory>,
     ) -> Self {
         let mom_cfg = MomentumConfig {
             noise_z_threshold: 0.3,
@@ -304,7 +306,7 @@ pub struct HarnessRun {
 pub struct HarnessConfig {
     pub hours: Vec<DateTime<Utc>>,
     pub universe: CandleUniverse,
-    pub btc_history: BTCHistory,
+    pub btc_history: Arc<BTCHistory>,
     pub bankroll_usd: f64,
     pub cache_dir: PathBuf,
     pub latency: StaticLatencyConfig,
@@ -313,11 +315,24 @@ pub struct HarnessConfig {
     /// sidecar and the parquet. The shared-cache writer is `polymomentum-
     /// engine distill`. See cross_bot_distilled_cache_response.md.
     pub shared_distilled_dir: Option<PathBuf>,
+    /// Variant-fan-out parallelism. `None` → use rayon's global pool
+    /// (defaults to `num_cpus`). `Some(1)` → serial (matches the
+    /// pre-rayon behavior bit-for-bit). `Some(n>1)` → cap at `n`.
+    /// Honors `RAYON_NUM_THREADS` env var when this is `None`.
+    pub threads: Option<usize>,
 }
 
 /// Run every variant over the requested hours. Streams one hour at a time
-/// (the parquet expansion is huge — ~500 MB / hour in memory) and merges
-/// the per-hour fills into one BacktestResults per variant.
+/// (the parquet expansion is huge — ~500 MB / hour in memory). For each
+/// hour, all variants replay in parallel against a shared `Arc<Vec<L2Event>>`
+/// — variant-fan-out is the natural unit of parallelism since each variant
+/// is independent (its own engine, strategy, RNG seed). Per-variant
+/// `BacktestResults` are then merged sequentially.
+///
+/// Determinism: each variant has its own `maker_seed`, so results are
+/// independent of thread count. Output `runs` Vec is in the same order as
+/// the input `variants` Vec regardless of thread count (rayon's
+/// `par_iter().map().collect()` preserves source order).
 pub async fn run_harness(
     cfg: &HarnessConfig,
     variants: &[StrategyVariant],
@@ -326,29 +341,49 @@ pub async fn run_harness(
     let token_filter = cfg.universe.condition_id_set();
     let windows = cfg.universe.windows();
 
-    // Per-variant accumulator. Each variant holds its own fills + decisions
-    // because we replay each variant independently per hour and merge.
-    let mut variant_state: Vec<(StrategyVariant, BacktestResults)> = variants
-        .iter()
-        .map(|v| (v.clone(), BacktestResults::default()))
-        .collect();
+    // Optional bounded rayon pool. `None` → use the global pool (which respects
+    // `RAYON_NUM_THREADS` env var; default is num_cpus). `Some(n)` → build a
+    // local pool with exactly n threads.
+    let local_pool = match cfg.threads {
+        Some(n) if n > 0 => Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|i| format!("harness-{i}"))
+                .build()
+                .map_err(|e| anyhow::anyhow!("rayon ThreadPoolBuilder: {e}"))?,
+        ),
+        _ => None,
+    };
+    let effective_threads = local_pool
+        .as_ref()
+        .map(|p| p.current_num_threads())
+        .unwrap_or_else(rayon::current_num_threads);
+    tracing::info!(
+        variants = variants.len(),
+        threads = effective_threads,
+        hours = cfg.hours.len(),
+        "harness starting parallel variant fan-out",
+    );
+
+    // Per-variant accumulator (merged sequentially after each hour's parallel
+    // block). Index-aligned with `variants`.
+    let mut variant_state: Vec<BacktestResults> =
+        (0..variants.len()).map(|_| BacktestResults::default()).collect();
 
     for &h in &cfg.hours {
         loader.download_hour(h, false).await?;
         let load_t0 = std::time::Instant::now();
 
         // Reader fallback chain: shared distilled → per-tenant sidecar → parquet.
-        let mut events: Vec<L2Event> = Vec::new();
+        let mut events_vec: Vec<L2Event> = Vec::new();
         let mut source = "parquet";
         if let Some(shared_dir) = &cfg.shared_distilled_dir {
             let path = crate::backtest::distill::shared_cache_path_for_hour(shared_dir, h);
             if path.exists() {
                 match crate::backtest::distill::read_distilled(&path) {
                     Ok((mut shared_events, _)) => {
-                        // Shared cache contains every candle market for the hour;
-                        // post-filter to our universe.
                         shared_events.retain(|e| token_filter.contains(&e.market_id));
-                        events = shared_events;
+                        events_vec = shared_events;
                         source = "shared_distilled";
                     }
                     Err(e) => {
@@ -357,10 +392,17 @@ pub async fn run_harness(
                 }
             }
         }
-        if events.is_empty() {
-            events = loader.load_with_sidecar(h, &token_filter)?;
+        if events_vec.is_empty() {
+            events_vec = loader.load_with_sidecar(h, &token_filter)?;
         }
-        events.sort_by(|a, b| a.timestamp_s.partial_cmp(&b.timestamp_s).unwrap_or(std::cmp::Ordering::Equal));
+        events_vec.sort_by(|a, b| {
+            a.timestamp_s
+                .partial_cmp(&b.timestamp_s)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // Wrap in Arc so all variant tasks share the same buffer (no per-task
+        // copy of the ~16 MB event vector).
+        let events: Arc<Vec<L2Event>> = Arc::new(events_vec);
         tracing::info!(
             hour = %h,
             events = events.len(),
@@ -370,21 +412,30 @@ pub async fn run_harness(
             "L2 events loaded",
         );
 
-        for (v, agg) in variant_state.iter_mut() {
+        // Run every variant against this hour's events in parallel. The closure
+        // captures &cfg / &windows by shared reference (rayon guarantees the
+        // borrow outlives the parallel scope), and clones the cheap stuff
+        // (StrategyVariant, Arc<BTCHistory>, Arc<Vec<L2Event>>).
+        let replay_t0 = std::time::Instant::now();
+        let run = |v: &StrategyVariant| -> BacktestResults {
             let fm = build_fill_model(v);
             let mut engine = L2BacktestEngine::new(fm, cfg.latency);
             let mut strategy = CandleBacktestStrategy::new(
                 v.clone(),
                 &cfg.universe,
                 cfg.bankroll_usd,
-                cfg.btc_history.clone(),
+                Arc::clone(&cfg.btc_history),
             );
             engine.replay(events.iter().cloned(), &mut strategy, v.default_fee_rate);
 
             let mut top_skips: Vec<(&String, &u64)> = strategy.skip_reasons.iter().collect();
             top_skips.sort_by(|a, b| b.1.cmp(a.1));
-            let top: Vec<String> = top_skips.iter().take(5).map(|(k, v)| format!("{k}={v}")).collect();
-            tracing::info!(
+            let top: Vec<String> = top_skips
+                .iter()
+                .take(5)
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            tracing::debug!(
                 variant = %v.name,
                 hour = %h,
                 events_seen = strategy.events_seen,
@@ -393,16 +444,34 @@ pub async fn run_harness(
                 "strategy diagnostic",
             );
 
-            let decisions = strategy.decisions.clone();
-            let hour_res = resolve_fills(&engine.fills, &decisions, &windows, &cfg.btc_history);
-            // Merge into variant's accumulator
-            agg.trades.extend(hour_res.trades);
-            agg.unresolved_fills.extend(hour_res.unresolved_fills);
+            let decisions = strategy.decisions;
+            resolve_fills(&engine.fills, &decisions, &windows, &cfg.btc_history)
+        };
+        let per_variant: Vec<BacktestResults> = if let Some(pool) = &local_pool {
+            pool.install(|| variants.par_iter().map(run).collect())
+        } else {
+            variants.par_iter().map(run).collect()
+        };
+
+        // Merge sequentially. Index-aligned with `variants`, so this preserves
+        // the input order regardless of thread count.
+        for (acc, hour_res) in variant_state.iter_mut().zip(per_variant) {
+            acc.trades.extend(hour_res.trades);
+            acc.unresolved_fills.extend(hour_res.unresolved_fills);
         }
+        tracing::info!(
+            hour = %h,
+            replay_ms = replay_t0.elapsed().as_millis() as u64,
+            variants = variants.len(),
+            threads = effective_threads,
+            "variants replayed",
+        );
     }
 
-    Ok(variant_state
-        .into_iter()
+    Ok(variants
+        .iter()
+        .cloned()
+        .zip(variant_state)
         .map(|(variant, results)| HarnessRun { variant, results })
         .collect())
 }
@@ -486,4 +555,97 @@ pub fn render_zone_breakdown(runs: &[HarnessRun]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backtest::strategies::StrategyVariant;
+    use crate::data::models::{Market, Outcome};
+    use crate::data::scanner::CandleContract;
+
+    /// Build a tiny synthetic universe + history for the parallel-vs-serial
+    /// determinism test. We don't need the harness to find any trades — we
+    /// just need it to run end-to-end and produce per-variant results we can
+    /// compare across thread counts.
+    fn synthetic_cfg() -> (HarnessConfig, Vec<StrategyVariant>) {
+        let contract = CandleContract {
+            market: Market {
+                condition_id: "0xabc".into(),
+                question: "BTC Up or Down - test".into(),
+                end_date: "2026-04-26T08:30:00Z".into(),
+                outcomes: vec![
+                    Outcome { name: "Up".into(), price: 0.5, token_id: "1".into() },
+                    Outcome { name: "Down".into(), price: 0.5, token_id: "2".into() },
+                ],
+                ..Default::default()
+            },
+            asset: "BTC".into(),
+            window_description: "8:00AM-8:30AM ET".into(),
+            up_token_id: "1".into(),
+            down_token_id: "2".into(),
+            end_date: "2026-04-26T08:30:00Z".into(),
+            hours_left: 0.0,
+            up_price: 0.5,
+            down_price: 0.5,
+            volume: 0.0,
+            liquidity: 0.0,
+        };
+        let universe = CandleUniverse { contracts: vec![contract] };
+
+        let mut btc = BTCHistory::default();
+        // 60 evenly spaced 1-second ticks around the synthetic window.
+        let base_ms = 1745654400000_i64; // 2026-04-26T08:00:00Z
+        for i in 0..1800 {
+            btc.timestamps_ms.push(base_ms + i * 1000);
+            btc.prices.push(50000.0 + (i as f64).sin() * 10.0);
+        }
+
+        let variants = vec![
+            StrategyVariant::baseline(),
+            StrategyVariant::loose_smoke(),
+            StrategyVariant::loose_maker(),
+        ];
+
+        let cfg = HarnessConfig {
+            hours: vec![],  // empty hours -> the loop is a no-op, but the parallel
+                            // setup code still runs (pool build, universe prep).
+            universe,
+            btc_history: Arc::new(btc),
+            bankroll_usd: 100.0,
+            cache_dir: PathBuf::from("/tmp"),
+            latency: StaticLatencyConfig::default(),
+            shared_distilled_dir: None,
+            threads: None,
+        };
+        (cfg, variants)
+    }
+
+    #[tokio::test]
+    async fn empty_hours_returns_empty_state_per_variant() {
+        let (cfg, variants) = synthetic_cfg();
+        let runs = run_harness(&cfg, &variants).await.unwrap();
+        assert_eq!(runs.len(), variants.len());
+        // Order preserved: variant[i] in == variant[i] out.
+        for (run, v) in runs.iter().zip(&variants) {
+            assert_eq!(run.variant.name, v.name);
+            assert_eq!(run.results.n_trades(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_count_does_not_change_output_order() {
+        // Same synthetic cfg; verify result order is variant-stable for both
+        // serial (threads=1) and parallel (threads=4).
+        let (mut cfg, variants) = synthetic_cfg();
+        cfg.threads = Some(1);
+        let serial = run_harness(&cfg, &variants).await.unwrap();
+        cfg.threads = Some(4);
+        let parallel = run_harness(&cfg, &variants).await.unwrap();
+        assert_eq!(serial.len(), parallel.len());
+        for (s, p) in serial.iter().zip(&parallel) {
+            assert_eq!(s.variant.name, p.variant.name);
+            assert_eq!(s.results.n_trades(), p.results.n_trades());
+        }
+    }
 }
