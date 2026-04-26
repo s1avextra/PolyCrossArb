@@ -93,6 +93,13 @@ class ZoneConfig:
     min_price: float = DEFAULT_MIN_PRICE
     max_price: float = DEFAULT_MAX_PRICE
     edge_cap: float = DEFAULT_EDGE_CAP
+    # Entry-price EV filter: skip trades where confidence ≤ market_price
+    # by less than this buffer. For a binary at fill price p, break-even
+    # win rate is approximately p × (1 + fee_rate × (1-p)) — at p=0.5 with
+    # 7.2% fee that's 51.8%, at p=0.8 it's 81.2%. The buffer covers fees,
+    # slippage, and confidence over-estimation. Default 0.05 = 5 pp.
+    # Set to a negative number (e.g. -1.0) to disable.
+    min_ev_buffer: float = 0.05
 
 
 # Singleton default — avoids constructing a fresh ZoneConfig() per call
@@ -205,6 +212,22 @@ def decide_candle_trade(
             detail=f"{market_price:.2f}",
         )
 
+    # ── Entry-price EV filter ───────────────────────────────────
+    # Mechanically ensure positive expected value. For a binary at
+    # fill p with win probability WR:
+    #   E[pnl/$] = WR × (1−p)/p − (1−WR) − fee
+    # Setting E[pnl/$] ≥ 0 and using confidence as our WR estimate:
+    #   confidence ≥ p × (1 + fee × (1−p))
+    # We approximate this with confidence ≥ p + buffer where buffer
+    # covers fees + slippage + confidence over-estimation noise.
+    # Default 5pp; configurable. Set buffer < 0 to disable.
+    if signal.confidence < market_price + cfg.min_ev_buffer:
+        return SkipReason(
+            reason="negative_ev",
+            zone=zone,
+            detail=f"conf={signal.confidence:.2f}<price={market_price:.2f}+{cfg.min_ev_buffer:.2f}",
+        )
+
     # ── YES+NO mispricing (free arb overlay) ────────────────────
     yes_no_vig = up_price + down_price - 1.0
 
@@ -274,4 +297,5 @@ def zone_config_from_settings() -> ZoneConfig:
         min_price=settings.candle_min_price,
         max_price=settings.candle_max_price,
         edge_cap=settings.candle_edge_cap,
+        min_ev_buffer=settings.candle_min_ev_buffer,
     )

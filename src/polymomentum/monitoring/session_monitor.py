@@ -314,6 +314,11 @@ class SessionMonitor:
         # Volatility state used in BS fair value
         realized_vol: float,
         slow_realized_vol: float,
+        # Implied vol passed to decide_candle_trade (the BS input, NOT the
+        # detector's realized vol — these can diverge when settings.candle_*
+        # uses live IV from Deribit vs the detector's EWMA. Logging this
+        # closes the validator's last replay gap.
+        implied_vol: float,
         # Cross-asset boost (0.0 if N/A)
         cross_asset_boost: float,
         # Book state at decision time
@@ -339,20 +344,23 @@ class SessionMonitor:
             "ts_ms": int(timestamp_ms),
             "cid": contract_id[:16],
             "asset": asset,
-            # signal
+            # signal — 4-decimal precision so replay reproduces zone-boundary
+            # decisions exactly (validator caught 0.17% mismatch rate from
+            # 2-decimal rounding flipping elapsed_pct across zone borders)
             "open": round(open_price, 4),
             "px": round(current_price, 4),
             "chg": round(price_change, 4),
-            "chg_pct": round(price_change_pct, 5),
-            "cons": round(consistency, 3),
-            "z": round(z_score, 3),
-            "conf": round(confidence, 3),
-            "elapsed_min": round(minutes_elapsed, 2),
-            "remaining_min": round(minutes_remaining, 2),
+            "chg_pct": round(price_change_pct, 6),
+            "cons": round(consistency, 4),
+            "z": round(z_score, 4),
+            "conf": round(confidence, 4),
+            "elapsed_min": round(minutes_elapsed, 4),
+            "remaining_min": round(minutes_remaining, 4),
             "dir": direction,
             # vol state
             "vol_fast": round(realized_vol, 4),
             "vol_slow": round(slow_realized_vol, 4),
+            "implied_vol": round(implied_vol, 4),
             "cross_boost": round(cross_asset_boost, 4),
             # book at decision (top of book; full L2 not yet captured live)
             "up_price": round(up_price, 4),

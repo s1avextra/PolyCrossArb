@@ -202,6 +202,61 @@ def test_price_above_max_skipped() -> None:
     assert res.reason == "price_out_of_range"
 
 
+def test_negative_ev_skipped_when_confidence_below_market_price() -> None:
+    """If confidence < market_price + buffer, expected value is negative.
+
+    Mirrors yesterday's Trade #2: bot fired UP at fill $0.797 with 61%
+    confidence — break-even WR for that price is ~80%, so the trade had
+    ~20pp negative EV. Filter must catch this.
+
+    Uses terminal zone (elapsed >= 95%) where 0.55 confidence floor
+    applies, so 0.61 conf passes the primary gate and we reach the EV
+    filter. Then 0.61 < 0.795 + 0.05 → skip with negative_ev.
+    """
+    sig = make_signal(direction="up", confidence=0.61, z_score=1.0,
+                      minutes_elapsed=4.85, minutes_remaining=0.15)
+    res = call_decide(
+        sig,
+        up_price=0.795, down_price=0.205,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.85, minutes_remaining=0.15, window_minutes=5.0,
+    )
+    assert isinstance(res, SkipReason)
+    assert res.reason == "negative_ev"
+
+
+def test_positive_ev_passes_filter() -> None:
+    """Confidence comfortably above market price + buffer should pass."""
+    sig = make_signal(direction="up", confidence=0.70, z_score=1.5,
+                      minutes_elapsed=4.85, minutes_remaining=0.15)
+    res = call_decide(
+        sig,
+        up_price=0.45, down_price=0.55,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.85, minutes_remaining=0.15, window_minutes=5.0,
+    )
+    # 0.70 > 0.45 + 0.05 — easily clears EV filter
+    assert isinstance(res, CandleDecision)
+
+
+def test_ev_filter_disabled_with_negative_buffer() -> None:
+    """Setting min_ev_buffer < 0 disables the filter (allows negative-EV trades)."""
+    sig = make_signal(direction="up", confidence=0.61, z_score=1.0,
+                      minutes_elapsed=4.85, minutes_remaining=0.15)
+    cfg = ZoneConfig(min_ev_buffer=-1.0)
+    res = call_decide(
+        sig,
+        up_price=0.795, down_price=0.205,
+        btc_price=60_005.0, open_btc=60_000.0,
+        minutes_elapsed=4.85, minutes_remaining=0.15, window_minutes=5.0,
+        zone_config=cfg,
+    )
+    # No longer skipped for negative_ev. Could be a CandleDecision or some
+    # other skip reason (edge, etc.) — just NOT negative_ev.
+    if isinstance(res, SkipReason):
+        assert res.reason != "negative_ev"
+
+
 def test_edge_cap_skips_stale_signals() -> None:
     # Massive BTC move (huge edge) should look like stale data and skip
     sig = make_signal(
@@ -527,10 +582,13 @@ def test_cross_asset_boost_zero_has_no_effect() -> None:
 def test_cross_asset_boost_has_confidence_floor() -> None:
     """Even with maximum boost, confidence threshold doesn't drop below 0.40."""
     sig = make_signal(direction="up", confidence=0.42, z_score=2.0)
+    # up_price=0.30 keeps EV filter happy (conf 0.42 > price 0.30 + buffer 0.05).
+    # The test's purpose is the cross-asset boost confidence floor —
+    # EV filter is orthogonal.
     res = decide_candle_trade(
         signal=sig,
         minutes_elapsed=3.0, minutes_remaining=2.0, window_minutes=5.0,
-        up_price=0.40, down_price=0.60,
+        up_price=0.30, down_price=0.70,
         btc_price=60_005.0, open_btc=60_000.0,
         implied_vol=0.50,
         min_confidence=0.60, min_edge=0.03,

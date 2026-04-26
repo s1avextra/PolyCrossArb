@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     candle_max_price: float = 0.90
     candle_edge_cap: float = 0.25
     candle_skip_dead_zone: bool = True
+    # Entry-price EV filter — skip if confidence ≤ market_price + buffer.
+    # See decision.py:ZoneConfig.min_ev_buffer for the math derivation.
+    # Set to a negative value to disable.
+    candle_min_ev_buffer: float = 0.05
 
     # ── Momentum noise filter ────────────────────────────────────
     # z-scores below this threshold get 60% confidence penalty.

@@ -81,11 +81,9 @@ def replay_evaluation(ev: dict) -> tuple[bool, str]:
     # eval log directly, but elapsed + remaining give it back exactly.
     window_minutes = ev["elapsed_min"] + ev["remaining_min"]
 
-    # implied_vol: live used price_feed.implied_volatility at decision time.
-    # We logged vol_fast (realized_vol). The decision function uses
-    # implied_vol for BS pricing — these can differ. For replay validity
-    # we need to log implied_vol at decision time too. Until that lands,
-    # accept vol_fast as a best-effort proxy and flag this in the report.
+    # implied_vol: prefer the real value logged at decision time. Falls
+    # back to vol_fast for backwards compat with sessions logged before
+    # the implied_vol field was added.
     decision = decide_candle_trade(
         signal=signal,
         minutes_elapsed=ev["elapsed_min"],
@@ -95,7 +93,7 @@ def replay_evaluation(ev: dict) -> tuple[bool, str]:
         down_price=ev["down_price"],
         btc_price=ev["px"],
         open_btc=ev["open"],
-        implied_vol=ev["vol_fast"],
+        implied_vol=ev.get("implied_vol", ev["vol_fast"]),
         # The live thresholds came from CandlePipeline init — they're
         # fixed at 0.60 confidence / 7% edge in our default deploy.
         # If you ran with custom thresholds you'd need to thread them
