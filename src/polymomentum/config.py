@@ -58,7 +58,22 @@ class Settings(BaseSettings):
     # Lower to 0.15 to allow trades on ~$15 moves in flat markets.
     candle_noise_z_threshold: float = 0.3
 
+    # ── Position sizing ──────────────────────────────────────────
+    # Per-trade position as a fraction of effective bankroll. Default
+    # 10% sits between quarter and half Kelly for our typical edge
+    # profile (60% conf / 50% edge over fair → Kelly ≈ 25%). At 10%,
+    # a 5-loss streak ≈ 50% drawdown — survivable. At 20%, the same
+    # streak wipes the bankroll. Top Polymarket candle traders (e.g.
+    # @stingo43, $388k cumulative profit over 3,852 trades) cluster
+    # most positions under $50 even with substantial bankroll —
+    # high-volume small-position compounding beats large concentrated
+    # bets when edges are small and books are thin.
+    candle_position_pct: float = 0.10
+
     # ── Volatility regime sizing ─────────────────────────────────
+    # Vol multipliers stack on top of candle_position_pct. Capped by
+    # max_position_per_market_usd ($20 default), so EXTREME vol on a
+    # $1k bankroll still tops out at $20/trade, not $40.
     candle_vol_high_multiplier: float = 1.5
     candle_vol_extreme_multiplier: float = 2.0
 

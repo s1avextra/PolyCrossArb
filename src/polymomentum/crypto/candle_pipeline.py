@@ -1023,27 +1023,29 @@ class CandlePipeline:
         zone: str = "late",
     ):
         """Execute a candle trade."""
-        # Position sizing: $1 steps based on bankroll
-        #   $5-14   → $1/trade
-        #   $15-29  → $2/trade
-        #   $30-49  → $3/trade
-        #   $50-99  → $5/trade
-        #   $100+   → $10/trade (capped by max_per_market)
+        # Position sizing: smooth percentage of effective bankroll, not
+        # bucketed. Bucketed logic (the previous $5-14→$1, $15-29→$2, ...
+        # ladder) had two problems: (1) step jumps where a one-cent
+        # bankroll change moved exposure from 7% to 13%, and (2) at
+        # $100+ bankroll it locked at $10/trade with no further scaling.
+        #
+        # New: 10% of effective_bankroll, hard-capped at
+        # max_per_market ($20 default). At <$10 bankroll the 10% target
+        # falls below Polymarket's $1 minimum and we skip — bot waits
+        # until bankroll grows or the operator tops up.
+        #
+        # Why 10% (vs 20% or Kelly-25%): at our typical edge profile
+        # (60% conf, 50% edge over fair) full Kelly ≈ 25%. 10% sits
+        # between quarter and half Kelly — meaningful exposure without
+        # full-bankroll wipeout from a 5-loss streak. Top Polymarket
+        # candle traders cluster their positions under $50 even with
+        # large bankrolls; high-volume small-position compounding beats
+        # large concentrated bets when edges are small and books thin.
         bankroll = self._risk.effective_bankroll
-        if bankroll < 15:
-            position = 1.0
-        elif bankroll < 30:
-            position = 2.0
-        elif bankroll < 50:
-            position = 3.0
-        elif bankroll < 100:
-            position = 5.0
-        else:
-            position = min(10.0, self._risk.max_per_market)
+        position = bankroll * settings.candle_position_pct
 
         # ── Volatility regime sizing ────────────────────────────────
         # During HIGH/EXTREME vol, MM lag widens → more edge per trade.
-        # Scale position up to capture the opportunity.
         short_vol = self._price_feed.short_term_vol(window_seconds=900.0)
         baseline_vol = self._price_feed.volatility
         vol_regime = classify_vol_regime(short_vol, baseline_vol)
@@ -1052,7 +1054,8 @@ class CandlePipeline:
         elif vol_regime == VolatilityRegime.EXTREME:
             position *= settings.candle_vol_extreme_multiplier
 
-        # Cap by available capital (prevent overcommitting across concurrent trades)
+        # Hard ceilings: per-market $ cap, then total-exposure cap
+        position = min(position, self._risk.max_per_market)
         position = min(position, self._risk.available_capital)
 
         if position < 1.0:  # Polymarket rejects orders below $1

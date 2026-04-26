@@ -46,11 +46,19 @@ async def main(mode: str, bankroll: float | None, duration: int | None = None):
     balances = get_wallet_balances()
     on_chain = balances["usdc_e"]
 
-    # Determine starting bankroll:
-    #   --bankroll flag > on-chain balance > config fallback
+    # Determine starting bankroll. Priority:
+    #   1. --bankroll CLI flag (explicit operator override)
+    #   2. Paper mode: BANKROLL_USD config when set (paper PnL shouldn't
+    #      depend on real wallet balance fluctuations)
+    #   3. Live mode: on-chain USDC.e balance (don't trade money you
+    #      don't have)
+    #   4. Final fallback: config BANKROLL_USD (or wallet detection)
     if bankroll is not None:
         starting = bankroll
         source = "cli flag"
+    elif mode == "paper" and settings.bankroll_usd > 0:
+        starting = settings.bankroll_usd
+        source = "BANKROLL_USD config (paper)"
     elif on_chain > 0:
         starting = on_chain
         source = "on-chain USDC.e"
