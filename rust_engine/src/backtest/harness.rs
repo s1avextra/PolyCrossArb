@@ -310,66 +310,69 @@ pub struct HarnessConfig {
     pub latency: StaticLatencyConfig,
 }
 
-/// Run every variant over the requested hours. Loads PMXT data once per
-/// hour from the cache (or downloads it if missing).
+/// Run every variant over the requested hours. Streams one hour at a time
+/// (the parquet expansion is huge — ~500 MB / hour in memory) and merges
+/// the per-hour fills into one BacktestResults per variant.
 pub async fn run_harness(
     cfg: &HarnessConfig,
     variants: &[StrategyVariant],
 ) -> Result<Vec<HarnessRun>> {
     let loader = PMXTv2Loader::new(&cfg.cache_dir);
     let token_filter = cfg.universe.condition_id_set();
-
-    // Pre-load all events once and reuse across variants.
-    let mut events: Vec<L2Event> = Vec::new();
-    for &h in &cfg.hours {
-        loader.download_hour(h, false).await?;
-        let evs = loader.load_cached_hour(h, Some(&token_filter))?;
-        events.extend(evs);
-    }
-    events.sort_by(|a, b| a.timestamp_s.partial_cmp(&b.timestamp_s).unwrap_or(std::cmp::Ordering::Equal));
-    tracing::info!(
-        events = events.len(),
-        cids = token_filter.len(),
-        "L2 events loaded for universe",
-    );
-
     let windows = cfg.universe.windows();
 
-    let mut runs = Vec::with_capacity(variants.len());
-    for v in variants {
-        let mut engine = L2BacktestEngine::new(OneTickTaker::default(), cfg.latency);
-        let mut strategy = CandleBacktestStrategy::new(
-            v.clone(),
-            &cfg.universe,
-            cfg.bankroll_usd,
-            cfg.btc_history.clone(),
-        );
-        engine.replay(events.iter().cloned(), &mut strategy, v.default_fee_rate);
-        let mut top_skips: Vec<(&String, &u64)> = strategy.skip_reasons.iter().collect();
-        top_skips.sort_by(|a, b| b.1.cmp(a.1));
-        let top: Vec<String> = top_skips
-            .iter()
-            .take(5)
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+    // Per-variant accumulator. Each variant holds its own fills + decisions
+    // because we replay each variant independently per hour and merge.
+    let mut variant_state: Vec<(StrategyVariant, BacktestResults)> = variants
+        .iter()
+        .map(|v| (v.clone(), BacktestResults::default()))
+        .collect();
+
+    for &h in &cfg.hours {
+        loader.download_hour(h, false).await?;
+        let mut events = loader.load_cached_hour(h, Some(&token_filter))?;
+        events.sort_by(|a, b| a.timestamp_s.partial_cmp(&b.timestamp_s).unwrap_or(std::cmp::Ordering::Equal));
         tracing::info!(
-            variant = %v.name,
-            events_seen = strategy.events_seen,
-            events_for_known_token = strategy.events_for_known_token,
-            skipped_resolved = strategy.skipped_resolved,
-            skipped_too_early = strategy.skipped_too_early,
-            skipped_no_btc = strategy.skipped_no_btc,
-            skipped_no_signal = strategy.skipped_no_signal,
-            skipped_decision = strategy.skipped_decision,
-            skipped_wrong_side = strategy.skipped_wrong_side,
-            top_skips = top.join(" | "),
-            "strategy diagnostic",
+            hour = %h,
+            events = events.len(),
+            cids = token_filter.len(),
+            "L2 events loaded",
         );
-        let decisions = strategy.decisions.clone();
-        let res = resolve_fills(&engine.fills, &decisions, &windows, &cfg.btc_history);
-        runs.push(HarnessRun { variant: v.clone(), results: res });
+
+        for (v, agg) in variant_state.iter_mut() {
+            let mut engine = L2BacktestEngine::new(OneTickTaker::default(), cfg.latency);
+            let mut strategy = CandleBacktestStrategy::new(
+                v.clone(),
+                &cfg.universe,
+                cfg.bankroll_usd,
+                cfg.btc_history.clone(),
+            );
+            engine.replay(events.iter().cloned(), &mut strategy, v.default_fee_rate);
+
+            let mut top_skips: Vec<(&String, &u64)> = strategy.skip_reasons.iter().collect();
+            top_skips.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = top_skips.iter().take(5).map(|(k, v)| format!("{k}={v}")).collect();
+            tracing::info!(
+                variant = %v.name,
+                hour = %h,
+                events_seen = strategy.events_seen,
+                skipped_decision = strategy.skipped_decision,
+                top_skips = top.join(" | "),
+                "strategy diagnostic",
+            );
+
+            let decisions = strategy.decisions.clone();
+            let hour_res = resolve_fills(&engine.fills, &decisions, &windows, &cfg.btc_history);
+            // Merge into variant's accumulator
+            agg.trades.extend(hour_res.trades);
+            agg.unresolved_fills.extend(hour_res.unresolved_fills);
+        }
     }
-    Ok(runs)
+
+    Ok(variant_state
+        .into_iter()
+        .map(|(variant, results)| HarnessRun { variant, results })
+        .collect())
 }
 
 pub fn render_table(runs: &[HarnessRun]) -> String {
@@ -398,6 +401,40 @@ pub fn render_table(runs: &[HarnessRun]) -> String {
             r.results.total_fees(),
         )
         .unwrap();
+    }
+    out
+}
+
+pub fn render_zone_breakdown(runs: &[HarnessRun]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut sorted = runs.to_vec();
+    sorted.sort_by(|a, b| b.results.total_pnl().partial_cmp(&a.results.total_pnl()).unwrap_or(std::cmp::Ordering::Equal));
+    for r in &sorted {
+        let zones = r.results.by_zone();
+        if zones.is_empty() {
+            continue;
+        }
+        writeln!(&mut out, "\n{} — by zone", r.variant.name).unwrap();
+        writeln!(
+            &mut out,
+            "  {:<10} {:>7} {:>7} {:>7} {:>7} {:>9}",
+            "zone", "trades", "wins", "losses", "WR%", "PnL"
+        )
+        .unwrap();
+        for (zone, stats) in &zones {
+            writeln!(
+                &mut out,
+                "  {:<10} {:>7} {:>7} {:>7} {:>6.1}% {:>+8.2}",
+                zone,
+                stats.trades,
+                stats.wins,
+                stats.losses,
+                100.0 * stats.win_rate(),
+                stats.pnl
+            )
+            .unwrap();
+        }
     }
     out
 }

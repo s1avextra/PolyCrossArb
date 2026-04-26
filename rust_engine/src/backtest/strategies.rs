@@ -127,12 +127,27 @@ impl StrategyVariant {
             default_fee_rate: 0.072,
         }
     }
+
+    /// Same loose gates as `loose_smoke` but assumes maker fills (0% fee).
+    /// On the 2026-04-26 4-hour run, `loose_smoke` produced 64.6% WR but
+    /// fees ate the edge; this variant tests whether maker pricing flips
+    /// the result to positive. (Optimistic: a real maker route needs a
+    /// fill-rate model, but this tells us if it's worth pursuing.)
+    pub fn loose_maker() -> Self {
+        Self {
+            name: "loose_maker".into(),
+            prefer_maker: true,
+            default_fee_rate: 0.0,
+            ..Self::loose_smoke()
+        }
+    }
 }
 
 /// Default sweep set for the harness.
 pub fn default_variants() -> Vec<StrategyVariant> {
     vec![
         StrategyVariant::loose_smoke(),
+        StrategyVariant::loose_maker(),
         StrategyVariant::baseline(),
         StrategyVariant::terminal_only(),
         StrategyVariant::aggressive_terminal(),

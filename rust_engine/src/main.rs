@@ -625,6 +625,7 @@ async fn cmd_harness(
                 end = end.unwrap_or(start),
             );
             println!("{}", backtest::harness::render_table(&runs));
+            println!("{}", backtest::harness::render_zone_breakdown(&runs));
         }
         Err(e) => {
             eprintln!("harness failed: {e}");
