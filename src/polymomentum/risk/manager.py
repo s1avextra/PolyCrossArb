@@ -383,6 +383,10 @@ class RiskManager:
                 contract_id TEXT PRIMARY KEY,
                 payload     TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS oracle_pending (
+                contract_id TEXT PRIMARY KEY,
+                payload     TEXT NOT NULL
+            );
         """)
         con.close()
 
@@ -441,6 +445,48 @@ class RiskManager:
             out: dict[str, dict] = {}
             for cid, payload in con.execute(
                 "SELECT contract_id, payload FROM paper_positions"
+            ):
+                try:
+                    out[cid] = json.loads(payload)
+                except Exception:
+                    continue
+            return out
+        finally:
+            con.close()
+
+    # ── Oracle verification persistence (CTF cross-check queue) ──
+
+    def save_oracle_pending(self, pending: dict[str, dict]) -> None:
+        """Replace stored oracle-pending entries with the given dict.
+
+        Persists the queue of resolutions awaiting Polymarket CTF
+        cross-check, so verification survives restarts and circuit-breaker
+        halts. Without this, any breaker trip during the UMA settlement
+        window (~7-30 min after candle close) loses the entire pending
+        queue.
+        """
+        con = self._db()
+        try:
+            con.execute("BEGIN")
+            con.execute("DELETE FROM oracle_pending")
+            for cid, entry in pending.items():
+                con.execute(
+                    "INSERT INTO oracle_pending (contract_id, payload) VALUES (?, ?)",
+                    (cid, json.dumps(entry)),
+                )
+            con.commit()
+        except Exception:
+            con.rollback()
+            log.exception("Failed to save oracle pending")
+        finally:
+            con.close()
+
+    def load_oracle_pending(self) -> dict[str, dict]:
+        con = self._db()
+        try:
+            out: dict[str, dict] = {}
+            for cid, payload in con.execute(
+                "SELECT contract_id, payload FROM oracle_pending"
             ):
                 try:
                     out[cid] = json.loads(payload)

@@ -134,6 +134,10 @@ class CandlePipeline:
             if stored_pp:
                 self._paper_positions.update(stored_pp)
                 log.info("candle.paper_positions.restored", n=len(stored_pp))
+            stored_op = self._risk.load_oracle_pending()
+            if stored_op:
+                self._oracle_pending.update(stored_op)
+                log.info("candle.oracle_pending.restored", n=len(stored_op))
         except Exception:
             log.exception("candle.state_restore_failed")
 
@@ -414,8 +418,9 @@ class CandlePipeline:
                 )
 
                 # Queue for Polymarket oracle cross-check (handled by
-                # _oracle_verification_loop). Lets us measure how often
-                # our BTC tape disagrees with Polymarket's CCIX oracle.
+                # _oracle_verification_loop reading the CTF contract
+                # directly via eth_call). Lets us measure how often our
+                # BTC tape disagrees with Polymarket's CCIX oracle.
                 self._oracle_pending[cid] = {
                     "our_actual": actual_direction,
                     "our_open_btc": open_btc,
@@ -423,6 +428,10 @@ class CandlePipeline:
                     "end_time": pos["end_time"],
                     "attempts": 0,
                 }
+                try:
+                    self._risk.save_oracle_pending(self._oracle_pending)
+                except Exception:
+                    log.exception("candle.oracle.persist_failed")
 
                 log.info(
                     "candle.resolved",
@@ -461,67 +470,61 @@ class CandlePipeline:
                 self.stop()
 
     async def _oracle_verification_loop(self):
-        """Cross-check our paper resolutions against Polymarket's oracle.
+        """Cross-check our paper resolutions against Polymarket's on-chain oracle.
 
-        Polymarket resolves crypto candles using CoinDesk's CCIX BTC index;
-        we resolve with our 8-exchange aggregate. Disagreement = real
-        strategy risk (a paper "win" by our tape can be a Polymarket
-        "loss"). This loop polls Gamma every 60s for each pending
-        verification, comparing outcomePrices to our_actual.
+        Polymarket resolves crypto candles via UMA's optimistic oracle, which
+        writes the outcome to the Gnosis ConditionalTokens (CTF) contract on
+        Polygon. We read that contract directly via eth_call — authoritative,
+        no Gamma indexing lag, available within ~7-30 min of candle close
+        (UMA dispute window).
 
-        A market is considered "verified" once `closed=true` AND
-        outcomePrices contains a 1.0/0.0 split. Gives up after 30
-        attempts (~30 minutes) — the candle should resolve well within
-        that window.
+        We resolve with our 8-exchange BTC aggregate; Polymarket settles
+        via CoinDesk's CCIX index. Disagreement is real strategy risk that
+        was previously invisible — the prior Gamma-poll implementation gave
+        up after 30 min and missed nearly every settlement.
+
+        Pending entries are persisted to SQLite so verification survives
+        restarts and circuit-breaker halts.
         """
+        from polymomentum.data.ctf import get_resolution
+
         POLL_INTERVAL_S = 60
-        MAX_ATTEMPTS = 30
+        # MAX_ATTEMPTS = 120 -> 2hr coverage. UMA settlement is usually within
+        # 30 min but can drag on disputed markets. CTF reads are cheap (single
+        # eth_call to Infura), so be generous.
+        MAX_ATTEMPTS = 120
+
         while self._running:
             await asyncio.sleep(POLL_INTERVAL_S)
             if not self._oracle_pending:
                 continue
+
+            persist_after = False
 
             for cid in list(self._oracle_pending.keys()):
                 pending = self._oracle_pending[cid]
                 pending["attempts"] += 1
 
                 try:
-                    market = await self._client.fetch_market_by_condition_id(cid)
+                    winner, numerators = await asyncio.to_thread(get_resolution, cid)
                 except Exception:
-                    log.exception("candle.oracle.fetch_failed", cid=cid[:16])
+                    log.exception("candle.oracle.ctf_read_failed", cid=cid[:16])
                     if pending["attempts"] >= MAX_ATTEMPTS:
                         del self._oracle_pending[cid]
+                        persist_after = True
                     continue
 
-                if market is None:
+                if winner is None:
+                    # Not yet resolved on-chain; keep polling.
                     if pending["attempts"] >= MAX_ATTEMPTS:
                         log.warning("candle.oracle.gave_up",
                                     cid=cid[:16],
                                     attempts=pending["attempts"])
                         del self._oracle_pending[cid]
+                        persist_after = True
                     continue
 
-                # Has Polymarket actually resolved? outcomePrices == [1,0]
-                # or [0,1] indicates resolved; otherwise still trading.
-                prices = [o.price for o in market.outcomes]
-                resolved = (
-                    market.closed
-                    and len(prices) >= 2
-                    and {round(p) for p in prices} == {0, 1}
-                )
-                if not resolved:
-                    if pending["attempts"] >= MAX_ATTEMPTS:
-                        log.warning("candle.oracle.gave_up",
-                                    cid=cid[:16],
-                                    attempts=pending["attempts"],
-                                    closed=market.closed,
-                                    prices=prices)
-                        del self._oracle_pending[cid]
-                    continue
-
-                # outcomes[0] is "Up" / "Yes"; price 1.0 means it won.
-                polymarket_actual = "up" if prices[0] >= 0.5 else "down"
-                agreed = polymarket_actual == pending["our_actual"]
+                agreed = winner == pending["our_actual"]
                 delay_s = time.time() - pending["end_time"]
 
                 self._monitor.record_oracle_resolution(
@@ -529,9 +532,9 @@ class CandlePipeline:
                     our_actual=pending["our_actual"],
                     our_open_btc=pending["our_open_btc"],
                     our_close_btc=pending["our_close_btc"],
-                    polymarket_actual=polymarket_actual,
-                    polymarket_outcome_prices=prices,
-                    polymarket_closed=market.closed,
+                    polymarket_actual=winner,
+                    polymarket_outcome_prices=numerators,
+                    polymarket_closed=True,
                     agreed=agreed,
                     delay_s=delay_s,
                 )
@@ -540,16 +543,23 @@ class CandlePipeline:
                     log.warning("candle.oracle.disagreement",
                                 cid=cid[:16],
                                 ours=pending["our_actual"],
-                                polymarket=polymarket_actual,
+                                polymarket=winner,
                                 our_open=pending["our_open_btc"],
                                 our_close=pending["our_close_btc"])
                 else:
                     log.info("candle.oracle.agreed",
                              cid=cid[:16],
-                             actual=polymarket_actual,
+                             actual=winner,
                              delay_s=f"{delay_s:.0f}")
 
                 del self._oracle_pending[cid]
+                persist_after = True
+
+            if persist_after:
+                try:
+                    self._risk.save_oracle_pending(self._oracle_pending)
+                except Exception:
+                    log.exception("candle.oracle.persist_failed")
 
     async def _monitoring_loop(self):
         """Record price feed and risk state every 15 seconds."""
